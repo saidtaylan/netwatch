@@ -18,6 +18,45 @@ Bu belge, netwatch projesinin günlük güncellemelerini ve teknik detaylarını
 
 ## 2026-05-11
 
+- [backend] [altyapi] **Phase 13 Step 3–4 tamamlandı: Candidate set derivation + 3-tier zone-aware prober selection.**
+
+  Step 3: `LocalTargetProvider` interface — engine cluster paketine import dependency yaratmadan kendi local target inventory'sini deklare ediyor. `Manager.SetLocalTargetProvider(p)` ile bağlanır. `Manager.CandidatesFor(targetID)` aşağıdaki birleşimden lex-sıralı listeyi döner:
+  1. Mevcut `peerStates[node][targetID]` kaydı olan **alive** node'lar (gossip'ten türetildi, ek mesaj yok)
+  2. Local node — eğer `LocalTargetProvider.LocalTargets()` targetID'yi içeriyorsa (bootstrap chicken-and-egg çözümü; ilk state broadcast atılmadan da görünür)
+
+  Dead/left node'lar `memberlist.StateAlive` filtresiyle dışarıda bırakılıyor.
+
+  Step 4: `Manager.SelectProbers(targetID)` — `effectiveReplicationFactor()` adet prober döner. Candidate sayısı factor'dan azsa hepsi seçilir (legacy davranış); fazlaysa `hashCandidateOrder` (FNV-32a) ile deterministic sıralama yapılır ve `zoneAwarePick` üç katmanlı seçimle prober subset'i belirler:
+  - **Tier 1 (zone diversity):** her unique zone'dan birer node (failure domain redundancy)
+  - **Tier 2 (zone repeat):** Tier-1 bittiyse zone-tagged repeat — zone-less'ten önce
+  - **Tier 3 (zone-less fallback):** sadece zone-tagged tükendiğinde
+
+  `Manager.IsLocalProber(targetID)` — Engine'in Step 6'da probe loop'u başlatıp başlatmayacağına karar verirken kullanacağı kapı.
+
+  Test override mekanizması: `testAliveOverride` ve `testZoneOverride` field'ları + `SetTestAliveSet`/`SetTestZones` exported test helper'ları — unit testler memberlist instance'ı kurmadan multi-node davranışı simüle edebiliyor.
+
+  - **Oluşturuldu**: `internal/cluster/probers.go` — `LocalTargetProvider` interface, `SetLocalTargetProvider`, `aliveSet`, `CandidatesFor`, `hashCandidateOrder`, `zoneAwarePick` (3-tier), `SelectProbers`, `IsLocalProber`
+  - **Değiştirildi**: `internal/cluster/cluster.go` — `Manager.localTargetProvider` field; `Manager.testAliveOverride` + `testZoneOverride` test field'ları; `zoneOf()` test override path eklendi
+  - **Değiştirildi**: `internal/cluster/testhelpers.go` — `SetTestAliveSet(names...)`, `SetTestZones(map)` helper'ları
+  - **Oluşturuldu**: `internal/cluster/phase13_probers_test.go` — 25 unit test: candidate derivation (peer-only, local-only, dedupe, dead filter, sorted), hash order (deterministic, full rotation, empty), zone picker (full diversity, repeat-beats-zoneless, zoneless-skipped, zoneless-fallback, all-zoneless, factor-overflow, zero-factor, empty), SelectProbers (all-when-below, 100x deterministic, factor-respected, zone integration), IsLocalProber (true/false/unknown). Tüm 5 node'da self-identification toplam **2** (factor=2) — yani exactly-once invariant doğrulandı.
+
+  Davranış değiştirici hâlâ yok: bu fonksiyonlar henüz `runCheck`/`startProbeLoop` tarafından çağrılmıyor. Engine entegrasyonu Step 6'da yapılacak.
+
+---
+
+- [backend] [altyapi] **Phase 13 Step 1–2 tamamlandı: Zone + ProbeReplicationFactor config alanları + memberlist NodeMeta üzerinden zone propagation.**
+
+  Step 1: `cluster.Config` artık iki yeni opsiyonel alan taşıyor — `Zone` (operatörün el yazısı; hostname'den türetme yok) ve `ProbeReplicationFactor` (default 3, `effectiveReplicationFactor()` helper'ı tek noktada tanımlar). Validation negatif factor'ü reddediyor, zero "default kullan" anlamına geliyor, zone serbest. Cluster disabled olduğunda tüm bu kontroller atlanıyor (eski davranış birebir korunuyor).
+
+  Step 2: `gossipDelegate.NodeMeta` artık `{Node, Zone}` JSON döndürüyor. Memberlist bu metadata'yı kendi içinde tüm üyelere otomatik dağıtıyor — ek gossip mesaj tipi yok, ek bandwidth yok. Overflow korumalı: Zone limit'i aşarsa sadece `{Node}` döner, o da fitmezse nil. `Manager.zoneOf(nodeName)` — memberlist `Node.Meta` üzerinden zone okur; local node için cfg'den fast path (ilk NodeMeta cycle tamamlanmadan da doğru cevap).
+
+  Tüm bunlar **davranış değiştirici değil**: operatör config yazmadığı sürece cluster eski şekilde çalışmaya devam eder.
+
+  - **Değiştirildi**: `internal/cluster/cluster.go` — `Config.Zone`, `Config.ProbeReplicationFactor` alanları + `effectiveReplicationFactor()` helper; `Validate()` negatif factor reddi; `nodeMeta` struct (`Node`, `Zone`); `gossipDelegate.NodeMeta` zone'u dahil + overflow fallback; `Manager.zoneOf()` + `ZoneOf()` exported alias
+  - **Oluşturuldu**: `internal/cluster/phase13_config_test.go` — 14 unit test: default factor, override, negative reject, empty-zone omission, NodeMeta limit-overflow fallback, zoneOf self/unknown/exported senaryoları
+
+---
+
 - [dokuman] **Phase 13 planlandı: Distributed Probe Ownership (probe sorumluluğu dağıtımı).**
 
   Mevcut sorun: cluster'daki her node config'indeki tüm target'ları probe ediyor. 100 node'lu bir cluster aynı target için 100 probe/dakika atıyor — hedef servisler üzerinde gereksiz yük + erişim izni olmayan node'ların başarısız probe gürültüsü.

@@ -208,11 +208,13 @@ UP ──→ SOFT_DOWN   enqueue() — probe fail
 │   │   └── sql.go           # SQL Checker — oracle/mysql/postgres/mssql
 │   ├── appinfo.go           # var BinaryName = "netwatch" (ldflags ile override edilebilir)
 │   └── cluster/             # Gossip cluster katmanı (Phase 6–9)
-│       ├── cluster.go       # Config, GossipPayload, AntiEntropyProvider, Manager, hash ring, quorum
-│       ├── probers.go       # (Phase 13) CandidatesFor, SelectProbers, zoneAwarePick (3-tier)
-│       ├── testhelpers.go   # NewTestManager, SetIsolated, SetPeerState (test yardımcıları)
+│       ├── cluster.go       # Config (Zone, ProbeReplicationFactor dahil), GossipPayload, AntiEntropyProvider, Manager, hash ring, quorum, NodeMeta (zone)
+│       ├── probers.go       # LocalTargetProvider, CandidatesFor, SelectProbers, IsLocalProber, zoneAwarePick (3-tier)
+│       ├── testhelpers.go   # NewTestManager, SetIsolated, SetPeerState, SetTestAliveSet, SetTestZones
 │       ├── cluster_test.go  # Hash ring, quorum, IsolatedMode, PeerStatesForTarget testleri
-│       └── antientropy_test.go  # LocalState/MergeRemoteState dispatch, mockProvider testleri
+│       ├── antientropy_test.go    # LocalState/MergeRemoteState dispatch, mockProvider testleri
+│       ├── phase13_config_test.go  # Config validation, NodeMeta, zoneOf
+│       └── phase13_probers_test.go # CandidatesFor, hashCandidateOrder, zoneAwarePick, SelectProbers, IsLocalProber
 ├── notifications/           # Alert scriptleri (.sh / .ps1) buraya konur
 ├── config.yaml              # Örnek config — tüm alanlar açıklamalı
 ├── go.mod                   # Module: github.com/saidtaylan/netwatch, go 1.25.7

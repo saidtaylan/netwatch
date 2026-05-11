@@ -416,6 +416,19 @@ type Manager struct {
 	// peerAlertHandler is set by the engine to handle alerts for targets this
 	// node does not probe locally. nil until SetPeerAlertHandler is called.
 	peerAlertHandler PeerAlertHandler
+
+	// localTargetProvider is the engine-side inventory of target IDs in this
+	// node's config. Used by CandidatesFor to include the local node in
+	// candidate sets before its first state broadcast. nil until
+	// SetLocalTargetProvider is called. Protected by mu.
+	localTargetProvider LocalTargetProvider
+
+	// ── Test-only overrides ────────────────────────────────────────────────
+	// These are populated exclusively by testhelpers.go's SetTestAliveSet /
+	// SetTestZones. They let unit tests simulate membership and zone metadata
+	// without standing up a real memberlist. nil in production builds.
+	testAliveOverride map[string]bool
+	testZoneOverride  map[string]string
 }
 
 // New creates and starts the cluster manager.
@@ -732,6 +745,13 @@ func (m *Manager) IsResponsible(targetID string) bool {
 // lookups in the same operation should cache the result. Memberlist already
 // distributes NodeMeta automatically so no extra gossip traffic is involved.
 func (m *Manager) zoneOf(nodeName string) string {
+	// Test override takes precedence so unit tests can drive zone-aware logic
+	// without a running memberlist.
+	if m.testZoneOverride != nil {
+		if z, ok := m.testZoneOverride[nodeName]; ok {
+			return z
+		}
+	}
 	if m.list == nil {
 		// Local-only fast path used by tests / standalone construction.
 		if nodeName == m.cfg.NodeName {

@@ -33,3 +33,33 @@ func (m *Manager) SetPeerState(nodeName, targetID string, p GossipPayload) {
 	}
 	m.peerStates[nodeName][targetID] = p
 }
+
+// SetTestAliveSet marks the given node names as alive for aliveSet().
+// Use this in unit tests that need multi-node membership without booting a
+// real memberlist instance. Passing no names clears the override and falls
+// back to the default (m.list-based) behaviour.
+func (m *Manager) SetTestAliveSet(names ...string) {
+	if len(names) == 0 {
+		m.testAliveOverride = nil
+		return
+	}
+	m.testAliveOverride = make(map[string]bool, len(names))
+	for _, n := range names {
+		m.testAliveOverride[n] = true
+	}
+}
+
+// SetTestZones installs a per-node zone override consulted by zoneOf().
+// Use this in unit tests to drive zone-aware prober selection without
+// memberlist NodeMeta. Passing a nil map clears the override.
+func (m *Manager) SetTestZones(zones map[string]string) {
+	if zones == nil {
+		m.testZoneOverride = nil
+		return
+	}
+	clone := make(map[string]string, len(zones))
+	for k, v := range zones {
+		clone[k] = v
+	}
+	m.testZoneOverride = clone
+}
