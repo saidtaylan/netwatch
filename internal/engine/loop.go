@@ -460,4 +460,9 @@ func (e *Engine) Reload() {
 			e.startProbeLoop(t)
 		}
 	}
+
+	// Phase 13: re-announce inventory so peers learn about any added targets
+	// (and re-affirm existing ones). bootstrapInventoryBroadcast is a no-op
+	// when the cluster layer is disabled.
+	e.bootstrapInventoryBroadcast()
 }

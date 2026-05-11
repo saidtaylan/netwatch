@@ -135,6 +135,20 @@ type Target struct {
 	RetryIntervalSec *int     `json:"retry_interval_sec,omitempty"`
 	Timeout          *int     `json:"timeout,omitempty"`
 	IntervalSec      *int     `json:"interval_sec,omitempty"` // per-target probe cadence
+
+	// ProbeFrom optionally pins probe execution to a fixed set of node names.
+	// When non-empty, only the listed nodes are considered candidates for this
+	// target — overriding the automatic hash-ring + zone selection. Useful when
+	// network reachability or credentials are restricted to specific nodes.
+	//
+	// All nodes that carry this target in their config SHOULD declare the same
+	// ProbeFrom list; mismatched lists cause each node to compute a different
+	// candidate set, which breaks exactly-once alerting. Operator's responsibility.
+	//
+	// When the list is empty (default) the cluster picks probers automatically.
+	// In standalone mode (no cluster) ProbeFrom is ignored — the single node
+	// always probes its own targets.
+	ProbeFrom []string `json:"probe_from,omitempty"`
 }
 
 func (t Target) active() bool { return t.Enabled == nil || *t.Enabled }
@@ -943,6 +957,14 @@ func (e *Engine) Init() error {
 		// targets it does not probe locally when it is the primary responsible
 		// node (see cluster.PeerAlertHandler and OnStateReceived).
 		e.clusterMgr.SetPeerAlertHandler(e)
+		// Wire local-target inventory (Phase 13): lets CandidatesFor include
+		// this node before the first state broadcast, and lets ProbeFrom
+		// constraints flow into the candidate set filter.
+		e.clusterMgr.SetLocalTargetProvider(e)
+		// Announce presence for every locally configured target so peers can
+		// populate their candidate sets immediately. Cheap one-shot — see
+		// bootstrapInventoryBroadcast.
+		e.bootstrapInventoryBroadcast()
 	}
 
 	// Build the local probe ID set so HasLocalProbe can answer O(1).
@@ -1117,6 +1139,87 @@ func (e *Engine) shouldAlert(targetID string) bool {
 		return false
 	}
 	return true
+}
+
+// ── LocalTargetProvider (cluster.LocalTargetProvider) ────────────────────────
+
+// LocalTargets implements cluster.LocalTargetProvider. Returns the set of
+// target keys currently configured on this node — used by the cluster layer's
+// CandidatesFor to recognise this node as a candidate before it has broadcast
+// any state. Includes both active and disabled targets so prober assignment
+// stays stable when an operator toggles `enabled: false` temporarily; the
+// probe loop itself separately gates on Target.active().
+func (e *Engine) LocalTargets() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make([]string, 0, len(e.cfg.Targets))
+	for _, t := range e.cfg.Targets {
+		out = append(out, t.key())
+	}
+	return out
+}
+
+// ProbeFromConstraint implements cluster.LocalTargetProvider. Returns the
+// `probe_from` list configured on the target locally, or nil when the target
+// is absent from this node's config (no constraint to contribute) or the list
+// is empty (operator opted out of pinning).
+//
+// Lookup is O(N) over local targets. CandidatesFor calls this at most once per
+// recompute so the cost is negligible at typical target counts.
+func (e *Engine) ProbeFromConstraint(targetID string) []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	for _, t := range e.cfg.Targets {
+		if t.key() != targetID {
+			continue
+		}
+		if len(t.ProbeFrom) == 0 {
+			return nil
+		}
+		out := make([]string, len(t.ProbeFrom))
+		copy(out, t.ProbeFrom)
+		return out
+	}
+	return nil
+}
+
+// bootstrapInventoryBroadcast emits one cluster broadcast per local target so
+// peers can populate their candidate sets immediately, without waiting for the
+// first probe cycle. Closes the chicken-and-egg of Phase 13: a node that is
+// not selected as a prober for its own targets still needs to be visible to
+// peers; otherwise it could be missed during future prober recomputations.
+//
+// Payload content:
+//   - When state.json carries the target, broadcast the persisted state and
+//     seq — peers receive an authoritative re-assertion, helpful when this
+//     node has the freshest view after a restart.
+//   - When the target is new (not yet in lastKnown), broadcast state="unknown"
+//     with seq=0. computeScope explicitly ignores anything other than "up" /
+//     "hard_down", so this is a benign presence announcement that will be
+//     superseded by the first real probe (seq>=1) via Lamport ordering.
+//
+// No-op when the cluster layer is disabled.
+func (e *Engine) bootstrapInventoryBroadcast() {
+	if e.clusterMgr == nil {
+		return
+	}
+	e.mu.RLock()
+	targets := append([]Target(nil), e.cfg.Targets...)
+	e.mu.RUnlock()
+
+	e.stateMu.RLock()
+	defer e.stateMu.RUnlock()
+	for _, t := range targets {
+		if !t.active() {
+			continue
+		}
+		ps, ok := e.lastKnown[t.key()]
+		if !ok {
+			// First-time target — seq=0 so any later real broadcast wins.
+			ps = PersistedState{State: "unknown"}
+		}
+		e.broadcastState(t, ps)
+	}
 }
 
 // ── PeerAlertHandler (cluster.PeerAlertHandler) ──────────────────────────────

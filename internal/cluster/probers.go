@@ -25,13 +25,23 @@ import (
 // (it would create a cycle), so the engine pushes the inventory in via
 // SetLocalTargetProvider.
 //
-// LocalTargets must be cheap to call — CandidatesFor may invoke it on every
-// prober assignment recomputation. Returning a fresh slice on each call is
-// fine; callers iterate it and do not retain the reference.
+// Both methods must be cheap to call — CandidatesFor may invoke them on every
+// prober assignment recomputation. Returning fresh slices on each call is
+// fine; callers iterate them and do not retain the reference.
 type LocalTargetProvider interface {
 	// LocalTargets returns the target IDs (Target.key()) that this node has
 	// in its current config. Order is not important.
 	LocalTargets() []string
+
+	// ProbeFromConstraint returns the explicit list of node names allowed to
+	// probe targetID, as declared in the target's `probe_from` config field.
+	// An empty / nil return means "no constraint — let the cluster decide".
+	//
+	// When non-empty, CandidatesFor will intersect the candidate set with this
+	// list, effectively pinning probe execution to the named nodes. All nodes
+	// that have the target in their config should return the same list to
+	// avoid disagreement on prober assignments.
+	ProbeFromConstraint(targetID string) []string
 }
 
 // SetLocalTargetProvider registers the engine's local-target inventory source.
@@ -81,6 +91,10 @@ func (m *Manager) aliveSet() map[string]bool {
 //   - it is the local node and LocalTargetProvider reports targetID locally.
 //
 // Dead / left nodes are filtered out using the current memberlist alive set.
+// When the target carries a non-empty ProbeFromConstraint the candidate set
+// is intersected with that list — explicit pinning overrides automatic
+// selection.
+//
 // The result is lexicographically sorted for deterministic downstream hashing.
 func (m *Manager) CandidatesFor(targetID string) []string {
 	alive := m.aliveSet()
@@ -108,6 +122,24 @@ func (m *Manager) CandidatesFor(targetID string) []string {
 				out = append(out, m.cfg.NodeName)
 				break
 			}
+		}
+	}
+
+	// Apply ProbeFrom constraint when the operator pinned the target to a
+	// specific node list. Intersect candidate set with the allowed names.
+	if provider != nil {
+		if pin := provider.ProbeFromConstraint(targetID); len(pin) > 0 {
+			allowed := make(map[string]bool, len(pin))
+			for _, n := range pin {
+				allowed[n] = true
+			}
+			filtered := out[:0]
+			for _, n := range out {
+				if allowed[n] {
+					filtered = append(filtered, n)
+				}
+			}
+			out = filtered
 		}
 	}
 

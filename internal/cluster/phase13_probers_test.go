@@ -10,9 +10,22 @@ import (
 // ── Test helpers ─────────────────────────────────────────────────────────────
 
 // stubProvider implements LocalTargetProvider for tests.
-type stubProvider struct{ ids []string }
+//
+// pinPerTarget lets tests simulate `probe_from` constraints on a per-target
+// basis. nil / missing entry → no constraint (current default).
+type stubProvider struct {
+	ids          []string
+	pinPerTarget map[string][]string
+}
 
 func (s stubProvider) LocalTargets() []string { return s.ids }
+
+func (s stubProvider) ProbeFromConstraint(targetID string) []string {
+	if s.pinPerTarget == nil {
+		return nil
+	}
+	return s.pinPerTarget[targetID]
+}
 
 // makeMgr builds a Manager with peerStates and (optionally) a local-target
 // inventory, then forces the ring to "alive". m.list stays nil — aliveSet
@@ -403,5 +416,115 @@ func TestIsLocalProber_FalseForUnknownTarget(t *testing.T) {
 	m := makeMgr("n1", "", 3)
 	if m.IsLocalProber("ghost") {
 		t.Error("unknown target should not select any prober")
+	}
+}
+
+// ── ProbeFrom constraint (Active Probe Delegation) ───────────────────────────
+
+func TestProbeFrom_FiltersCandidatesToAllowedList(t *testing.T) {
+	// 4 nodes know the target, but probe_from pins it to {n2, n3}.
+	// Candidates must shrink to those two regardless of factor.
+	m := makeMgr("n1", "", 5)
+	setAliveForTest(m, "n1", "n2", "n3", "n4")
+	for _, n := range []string{"n1", "n2", "n3", "n4"} {
+		seed(m, n, "t-pinned")
+	}
+	m.SetLocalTargetProvider(stubProvider{
+		ids: []string{"t-pinned"},
+		pinPerTarget: map[string][]string{
+			"t-pinned": {"n2", "n3"},
+		},
+	})
+
+	got := m.CandidatesFor("t-pinned")
+	want := []string{"n2", "n3"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("constraint should restrict candidates to %v, got %v", want, got)
+	}
+}
+
+func TestProbeFrom_EmptyConstraintMeansNoFilter(t *testing.T) {
+	m := makeMgr("n1", "", 5)
+	setAliveForTest(m, "n1", "n2", "n3")
+	for _, n := range []string{"n1", "n2", "n3"} {
+		seed(m, n, "t1")
+	}
+	// Empty pin list → behaves as if not set.
+	m.SetLocalTargetProvider(stubProvider{
+		ids: []string{"t1"},
+		pinPerTarget: map[string][]string{
+			"t1": nil,
+		},
+	})
+	got := m.CandidatesFor("t1")
+	if len(got) != 3 {
+		t.Errorf("empty constraint should preserve all candidates, got %v", got)
+	}
+}
+
+func TestProbeFrom_AllowsUnknownNodesToFilterAway(t *testing.T) {
+	// probe_from references a node that does not currently know the target.
+	// Result: candidates contain only the intersection — possibly empty.
+	m := makeMgr("n1", "", 3)
+	setAliveForTest(m, "n1", "n2")
+	seed(m, "n1", "t1")
+	seed(m, "n2", "t1")
+	m.SetLocalTargetProvider(stubProvider{
+		ids: []string{"t1"},
+		pinPerTarget: map[string][]string{
+			"t1": {"ghost"},
+		},
+	})
+
+	got := m.CandidatesFor("t1")
+	if len(got) != 0 {
+		t.Errorf("non-existent pin should yield empty candidates, got %v", got)
+	}
+}
+
+func TestProbeFrom_DeadPinnedNodeStillFiltered(t *testing.T) {
+	// Pin allows n2 but n2 is dead → result excludes n2.
+	m := makeMgr("n1", "", 3)
+	setAliveForTest(m, "n1", "n3") // n2 absent
+	seed(m, "n1", "t1")
+	seed(m, "n2", "t1")
+	seed(m, "n3", "t1")
+	m.SetLocalTargetProvider(stubProvider{
+		ids: []string{"t1"},
+		pinPerTarget: map[string][]string{
+			"t1": {"n1", "n2", "n3"},
+		},
+	})
+
+	got := m.CandidatesFor("t1")
+	want := []string{"n1", "n3"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("dead pinned n2 should be excluded; want %v got %v", want, got)
+	}
+}
+
+func TestProbeFrom_OverridesZoneSpread(t *testing.T) {
+	// Even with zones declared, probe_from takes precedence — only pinned
+	// nodes are eligible, regardless of which zones they fall in.
+	m := makeMgr("n1", "Z1", 3)
+	setAliveForTest(m, "n1", "n2", "n3", "n4")
+	for _, n := range []string{"n1", "n2", "n3", "n4"} {
+		seed(m, n, "t1")
+	}
+	m.SetTestZones(map[string]string{
+		"n1": "Z1", "n2": "Z2", "n3": "Z3", "n4": "Z4",
+	})
+	m.SetLocalTargetProvider(stubProvider{
+		ids: []string{"t1"},
+		pinPerTarget: map[string][]string{
+			"t1": {"n1", "n2"}, // only two pinned, even though 4 zones exist
+		},
+	})
+
+	got := m.SelectProbers("t1")
+	want := []string{"n1", "n2"}
+	sort.Strings(got)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("pin should override zone spread; want %v got %v", want, got)
 	}
 }

@@ -275,12 +275,13 @@ UP ──→ SOFT_DOWN   enqueue() — probe fail
 | `SetStateProvider()` | Engine'i AntiEntropyProvider olarak kaydeder; push-pull döngüsünü engine'e devreder |
 | `AntiEntropyProvider` | Interface: `FullState()`, `ApplyRemoteState()`, `SetSyncing()` |
 | `PeerAlertHandler` | Interface: `HasLocalProbe()`, `DispatchPeerAlert()` — primary lokal probe yapmıyorsa sigorta |
-| `CandidatesFor()` *(Phase 13)* | Verilen targetID için peerStates + local config'den candidate node listesi |
+| `CandidatesFor()` *(Phase 13)* | Verilen targetID için peerStates + local config'den candidate node listesi; ProbeFrom constraint varsa kesişim alır |
 | `SelectProbers()` *(Phase 13)* | Hash ring + 3-tier zone-aware picker ile prober subset (factor adet) |
 | `IsLocalProber()` *(Phase 13)* | Bu node verilen target için probe etmekle yükümlü mü |
 | `ProberAssignmentListener` *(Phase 13)* | Interface: `StartProbing()`, `StopProbing()` — Engine bunu implement eder |
-| `LocalTargetProvider` *(Phase 13)* | Interface: Engine'in lokal config target listesini cluster'a verir |
+| `LocalTargetProvider` *(Phase 13)* | Interface: `LocalTargets()` + `ProbeFromConstraint(targetID)` — Engine implement eder |
 | `NodeMeta` *(Phase 13)* | Memberlist built-in: zone bilgisi tüm node'lara otomatik dağıtılır |
+| `bootstrapInventoryBroadcast()` *(Phase 13)* | Engine'de: Init + Reload sonrası her local target için 1 presence broadcast |
 
 ### Prometheus Metrics
 
@@ -309,6 +310,12 @@ Aşağıdaki değişiklikler **planlandı**, henüz uygulanmadı. Detay için `s
 cluster:
   zone: "istanbul"                  # opsiyonel; node'a yazılır, target'a değil
   probe_replication_factor: 3       # opsiyonel, default 3
+
+targets:
+  - id: "db-restricted"
+    type: "tcp"
+    target: "10.0.0.5:5432"
+    probe_from: ["node-fr", "node-tr"]  # opsiyonel; pin → sadece bu node'lar probe eder
 ```
 
 - `Zone` → memberlist `NodeMeta` üzerinden taşınır (built-in distribution)

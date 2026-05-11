@@ -18,6 +18,28 @@ Bu belge, netwatch projesinin günlük güncellemelerini ve teknik detaylarını
 
 ## 2026-05-11
 
+- [backend] [altyapi] **Phase 13 Step 5 tamamlandı: Bootstrap broadcast + todo.md F6 (Active Probe Delegation) entegre edildi.**
+
+  **Bootstrap broadcast:** Engine artık `cluster.LocalTargetProvider` interface'ini implement ediyor. `Init()` cluster setup'tan sonra `SetLocalTargetProvider(e)` + `bootstrapInventoryBroadcast()` çağırıyor. Her aktif local target için bir `GossipPayload` yayınlanıyor — `state.json`'da kayıt varsa onu, yoksa `state="unknown"`, `seq=0` ile presence announcement. computeScope ve peer-alert path'i "unknown" state'i ignore ettiği için bu mesajlar benign; ilk gerçek probe seq>=1 ile Lamport üzerinden eziyor. `Reload()` sonrası da çağrılıyor → yeni target'lar cluster'a duyuruluyor.
+
+  Bu Phase 13'ün chicken-and-egg problemini çözüyor: yeni başlayan veya hiçbir target için prober olarak seçilmeyen bir node bile peer'lar tarafından candidate set'te görülüyor.
+
+  **F6 — Active Probe Delegation (todo.md'den entegre):** `Target.ProbeFrom []string` alanı eklendi. Boş bırakılırsa (varsayılan) cluster otomatik karar veriyor; doldurulursa yalnızca listedeki node'lar candidate set'e giriyor. Bu Phase 13'ün otomatik seçimini "varsayılan otomatik, isteğe bağlı manuel" yapıyor.
+
+  Mekanizma: `cluster.LocalTargetProvider.ProbeFromConstraint(targetID)` interface metodu eklendi. `Manager.CandidatesFor` peerStates'ten + local config'ten derlediği listeyi pin set ile kesişime sokuyor. Dead pinned node'lar `aliveSet` filtresinden geçemez → otomatik dışlanır. Zone-aware picker pin override'a tabi (pin > zone diversity).
+
+  Kullanım örneği: `probe_from: ["node-fr", "node-tr"]` → bir target sadece bu iki node'dan probe edilir; diğer cluster üyeleri (zone ne olursa olsun) candidate olmaz.
+
+  **Operatör sorumluluğu:** Aynı target'ı taşıyan tüm node'lar aynı `probe_from` listesini deklare etmeli; aksi takdirde candidate set hesabı node'lar arasında farklılaşır ve exactly-once garantisi bozulur. Bu kısıt sprint.md ve config.example.yaml'de belgelenecek (Step 11).
+
+  - **Değiştirildi**: `internal/engine/engine.go` — `Target.ProbeFrom` alanı; `Engine.LocalTargets()` ve `Engine.ProbeFromConstraint()` metodları (cluster.LocalTargetProvider); `Engine.bootstrapInventoryBroadcast()` helper; `Init()` cluster setup içine `SetLocalTargetProvider` + bootstrap çağrısı eklendi
+  - **Değiştirildi**: `internal/engine/loop.go` — `Reload()` sonuna `bootstrapInventoryBroadcast()` çağrısı (yeni target'lar cluster'a duyurulur)
+  - **Değiştirildi**: `internal/cluster/probers.go` — `LocalTargetProvider.ProbeFromConstraint()` metodu interface'e eklendi; `CandidatesFor` constraint kesişim filtresi
+  - **Değiştirildi**: `internal/cluster/phase13_probers_test.go` — `stubProvider` yeni metodu ekledi; 5 yeni test: constraint filter, empty constraint, unknown pinned node, dead pinned node, zone override
+  - **Oluşturuldu**: `internal/engine/phase13_test.go` — 8 unit test: LocalTargets (full/empty), ProbeFromConstraint (unknown/unset/copy/ID-key), bootstrapInventoryBroadcast (standalone no-op, disabled-target skip)
+
+---
+
 - [backend] [altyapi] **Phase 13 Step 3–4 tamamlandı: Candidate set derivation + 3-tier zone-aware prober selection.**
 
   Step 3: `LocalTargetProvider` interface — engine cluster paketine import dependency yaratmadan kendi local target inventory'sini deklare ediyor. `Manager.SetLocalTargetProvider(p)` ile bağlanır. `Manager.CandidatesFor(targetID)` aşağıdaki birleşimden lex-sıralı listeyi döner:
