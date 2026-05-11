@@ -111,11 +111,14 @@ func (e *Engine) runCheck(ctx context.Context, t Target) {
 
 	if ok {
 		if !seen {
-			// First observation: register silently.
+			// First observation: register silently (no alert), but broadcast
+			// the UP state so cluster peers can include this node as a candidate.
+			firstPS := PersistedState{State: "up", Seq: 1}
 			e.stateMu.Lock()
-			e.lastKnown[t.key()] = PersistedState{State: "up"}
+			e.lastKnown[t.key()] = firstPS
 			e.stateMu.Unlock()
 			e.persistState()
+			e.broadcastState(t, firstPS)
 		} else if inPending || !prevUp {
 			// Recovery from soft-down or hard-down.
 			if e.markRecovered(pkey, t) {
@@ -124,6 +127,15 @@ func (e *Engine) runCheck(ctx context.Context, t Target) {
 					e.sendAlert(t, "reachable")
 				}
 			}
+		} else if e.clusterMgr != nil {
+			// Already UP, staying UP. In cluster mode, re-broadcast the current
+			// state on every probe cycle so late-joining peers can populate their
+			// candidate sets without waiting for a state transition. The overhead
+			// is one small UDP gossip message per target per probe interval.
+			e.stateMu.RLock()
+			curPS := e.lastKnown[t.key()]
+			e.stateMu.RUnlock()
+			e.broadcastState(t, curPS)
 		}
 		GaugeUp.With(labels).Set(1)
 	} else {
@@ -372,7 +384,7 @@ func (e *Engine) broadcastState(t Target, ps PersistedState) {
 		State:      ps.State,
 		Seq:        ps.Seq,
 		ErrorCode:  ps.ErrorCode,
-		NodeName:   e.hostname,
+		NodeName:   e.clusterNodeName(),
 		Timestamp:  time.Now(),
 	})
 }
@@ -406,7 +418,7 @@ func (e *Engine) broadcastStateByID(targetID string, ps PersistedState) {
 		State:     ps.State,
 		Seq:       ps.Seq,
 		ErrorCode: ps.ErrorCode,
-		NodeName:  e.hostname,
+		NodeName:  e.clusterNodeName(),
 		Timestamp: time.Now(),
 	})
 }

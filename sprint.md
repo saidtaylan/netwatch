@@ -659,7 +659,7 @@ Yeni model'de primary genelde prober subset içinde olduğu için bu yol nadir t
 ✅ Step 9: Anti-entropy syncing guard — StartProbing/StopProbing/bootstrap defer + SetSyncing(false) recompute trigger
 ✅ Step 10: Integration test — fakeCluster, 8 senaryo (factor invariant, zone spread, ProbeFrom pin, failover, churn, concurrency)
 ✅ Step 11: Dokümantasyon — config.example.yaml Phase 13 alanları, CLAUDE.md + README.md güncelleme
-   Step 12: Smoke test (3 yerel binary, target down/recover, zone karışık)
+✅ Step 12: Smoke test — 3 yerel binary (istanbul/ankara/izmir zones), failover, quorum-loss doğrulandı
 ```
 
 Her adım sonrası `go build` + `go test -race` yeşil olmalı.

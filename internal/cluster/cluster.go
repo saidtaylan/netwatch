@@ -351,6 +351,12 @@ func (e *eventDelegate) NotifyJoin(node *memberlist.Node) {
 		// Phase 13: a new member changes the candidate sets — schedule a
 		// debounced recompute so probe loops can be reassigned.
 		e.mgr.scheduleRecompute()
+		// Re-broadcast this node's target states so the new peer can learn
+		// our inventory. Gossip broadcasts are UDP (fire-and-forget) so the
+		// new node may have missed the original bootstrap and probe broadcasts.
+		if h := e.mgr.inventoryRefreshHandler; h != nil {
+			h.BroadcastInventory()
+		}
 	}()
 }
 
@@ -396,6 +402,14 @@ type PeerAlertHandler interface {
 	DispatchPeerAlert(payload GossipPayload)
 }
 
+// InventoryRefreshHandler is implemented by the engine to re-broadcast all
+// local target states when a new peer joins the cluster. This ensures that
+// late-joining nodes catch up with already-running probers, since gossip
+// broadcasts are fire-and-forget (UDP) and early broadcasts may be missed.
+type InventoryRefreshHandler interface {
+	BroadcastInventory()
+}
+
 // Manager owns the memberlist instance and all cluster state.
 type Manager struct {
 	cfg      Config
@@ -435,6 +449,11 @@ type Manager struct {
 	// peerAlertHandler is set by the engine to handle alerts for targets this
 	// node does not probe locally. nil until SetPeerAlertHandler is called.
 	peerAlertHandler PeerAlertHandler
+
+	// inventoryRefreshHandler is called on NotifyJoin so the engine
+	// re-broadcasts its local target states to late-joining peers.
+	// nil until SetInventoryRefreshHandler is called.
+	inventoryRefreshHandler InventoryRefreshHandler
 
 	// localTargetProvider is the engine-side inventory of target IDs in this
 	// node's config. Used by CandidatesFor to include the local node in
@@ -494,11 +513,15 @@ func New(cfg Config) (*Manager, error) {
 	}
 	if cfg.BindPort > 0 {
 		mlCfg.BindPort = cfg.BindPort
+		// AdvertisePort defaults to BindPort in DefaultLANConfig, but only at
+		// construction time. Sync it here so gossip pings use the correct port.
+		mlCfg.AdvertisePort = cfg.BindPort
 	}
 	if cfg.AdvertiseAddr != "" {
 		mlCfg.AdvertiseAddr = cfg.AdvertiseAddr
 	}
 	if cfg.AdvertisePort > 0 {
+		// Explicit AdvertisePort overrides the BindPort-derived default.
 		mlCfg.AdvertisePort = cfg.AdvertisePort
 	}
 
@@ -929,6 +952,15 @@ func (m *Manager) SetStateProvider(p AntiEntropyProvider) {
 func (m *Manager) SetPeerAlertHandler(h PeerAlertHandler) {
 	m.mu.Lock()
 	m.peerAlertHandler = h
+	m.mu.Unlock()
+}
+
+// SetInventoryRefreshHandler registers the engine callback invoked on each
+// NotifyJoin event so the engine re-broadcasts its target states to
+// late-joining peers. Must be called in Engine.Init after cluster.New.
+func (m *Manager) SetInventoryRefreshHandler(h InventoryRefreshHandler) {
+	m.mu.Lock()
+	m.inventoryRefreshHandler = h
 	m.mu.Unlock()
 }
 

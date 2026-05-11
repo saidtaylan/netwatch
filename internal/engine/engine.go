@@ -685,6 +685,20 @@ func (e *Engine) AppName() string {
 	return e.cfg.AppName
 }
 
+// clusterNodeName returns the cluster-configured node name when cluster is
+// enabled, and falls back to the OS hostname for standalone mode.
+// This value is the authoritative identity used in gossip payloads and must
+// match the name used by the consistent hash ring (cfg.Cluster.NodeName).
+func (e *Engine) clusterNodeName() string {
+	e.mu.RLock()
+	n := e.cfg.Cluster.NodeName
+	e.mu.RUnlock()
+	if n != "" {
+		return n
+	}
+	return e.hostname
+}
+
 // Port returns the configured HTTP port (defaults to "9115").
 func (e *Engine) Port() string {
 	e.mu.RLock()
@@ -993,6 +1007,10 @@ func (e *Engine) Init() error {
 		// layer will call StartProbing / StopProbing as membership changes
 		// shift prober responsibilities on and off this node.
 		e.clusterMgr.SetProberAssignmentListener(e)
+		// Wire inventory refresh handler (Phase 13): cluster calls
+		// BroadcastInventory on each NotifyJoin so late-joining peers
+		// receive this node's current target states.
+		e.clusterMgr.SetInventoryRefreshHandler(e)
 		// Announce presence for every locally configured target so peers can
 		// populate their candidate sets immediately. Cheap one-shot — see
 		// bootstrapInventoryBroadcast.
@@ -1347,6 +1365,14 @@ func (e *Engine) bootstrapInventoryBroadcast() {
 		}
 		e.broadcastState(t, ps)
 	}
+}
+
+// BroadcastInventory implements cluster.InventoryRefreshHandler.
+// Called by the cluster layer on each NotifyJoin so that late-joining peers
+// receive this node's current target states. Equivalent to
+// bootstrapInventoryBroadcast but callable via the interface.
+func (e *Engine) BroadcastInventory() {
+	e.bootstrapInventoryBroadcast()
 }
 
 // ── PeerAlertHandler (cluster.PeerAlertHandler) ──────────────────────────────

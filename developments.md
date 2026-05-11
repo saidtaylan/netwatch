@@ -18,6 +18,40 @@ Bu belge, netwatch projesinin günlük güncellemelerini ve teknik detaylarını
 
 ## 2026-05-11
 
+- [backend] [altyapi] **Phase 13 Step 12 tamamlandı + 5 production bug fix. Smoke test: 3 node (istanbul/ankara/izmir), zone-aware spread, failover, quorum-loss, tam doğrulama.**
+
+  **Step 12 — Smoke test:** 3 yerel binary farklı gossip portları (7951/7952/7953), HTTP portları (10301/10302/10303), zone'lar (istanbul/ankara/izmir). Factor=2 ile 2 target için prober seçimi, tüm başarı kriterleri:
+  - `✅` 3 node tam üye görüşü; zone'lar `/cluster/probers` ve `/fleet/status`'ta doğru
+  - `✅` Tüm node'lar aynı prober setini hesaplıyor (deterministic ring)
+  - `✅` Her target için 2 prober, 2 farklı zone'dan (zone-aware spread)
+  - `✅` `network_probe_local_assigned=1` için prober olan node'lar, `=0` olmayanlar
+  - `✅` Primary kill → ring rebalance → yeni primary seçildi (failover)
+  - `✅` 2 node kill → quorum lost, isolated=true, `[CLUSTER] quorum lost` log'u
+  - `✅` `/fleet/status`: cluster size, alive count, quorum_healthy, down_targets
+
+  **Bug Fix 1 — AdvertisePort gossip mismatch:**
+  `DefaultLANConfig()` ile `BindPort=7951` set edildiğinde `AdvertisePort` hâlâ 7946 kalıyordu. Memberlist diğer node'lara 7946 port'unu advertise edince UDP ping'ler başarısız oluyordu. Düzeltme: `BindPort` set edildiğinde `AdvertisePort` da eşzamanlı güncelleniyor; explicit `AdvertisePort` config'i override edebiliyor.
+
+  **Bug Fix 2 — GossipPayload.NodeName yanlış değer (OS hostname kullanılıyordu):**
+  `broadcastState` ve `broadcastStateByID` `e.hostname` (OS hostname, örn. "saidtaylan.local") kullanıyordu. Bu aynı makinedeki 3 node'un aynı NodeName ile broadcast yapmasına neden oluyordu; `peerStates` collision ve `CandidatesFor` bozulması. Düzeltme: yeni `clusterNodeName()` helper, cluster aktifken `cfg.Cluster.NodeName` ("node-istanbul" vb.) döner; standalone'da OS hostname'e fallback.
+
+  **Bug Fix 3 — İlk başarılı probe state broadcast etmiyordu:**
+  `runCheck` success path'inde `!seen` branch doğrudan `lastKnown["up"] = ...` yazıp `broadcastState` çağırmıyordu. Geç katılan peer'lar `CandidatesFor`'da bu target için node'u göremiyordu. Düzeltme: first observation'da `seq=1/up` ile `broadcastState` çağrılıyor.
+
+  **Bug Fix 4 — NotifyJoin BroadcastInventory (InventoryRefreshHandler):**
+  Yeni cluster üyesi join ettiğinde mevcut node'lar kendi target state'lerini tekrar broadcast etmiyordu. Geç katılanlar bootstrap UDP paketini kaçırıyordu. Düzeltme: yeni `InventoryRefreshHandler` interface + `SetInventoryRefreshHandler` setter; `NotifyJoin` goroutine'inde `BroadcastInventory()` çağrısı. Engine `bootstrapInventoryBroadcast()` üzerinden implement ediyor.
+
+  **Bug Fix 5 — UP target'lar periyodik re-broadcast yapmıyordu:**
+  `broadcastState` yalnızca state geçişlerinde (hard_down / recovery) çağrılıyordu. Sürekli UP kalan target'lar için cluster üyeleri yalnızca tek bir bootstrap/ilk-probe broadcast'ı alıyordu; bu da kaçırılırsa candidate set'te eksiklik kalıyordu. Düzeltme: `runCheck` success path'inde "already up, staying up" branch'ine `e.clusterMgr != nil` koşullu `broadcastState` eklendi. Her probe cycle'da mevcut UP state gossip'e besleniyor.
+
+  **Değiştirilen dosyalar:**
+  - **Düzenlendi**: `internal/cluster/cluster.go` — `AdvertisePort` fix; `InventoryRefreshHandler` interface + setter; `NotifyJoin` BroadcastInventory çağrısı
+  - **Düzenlendi**: `internal/engine/engine.go` — `clusterNodeName()` helper; `BroadcastInventory()` impl; `SetInventoryRefreshHandler` wiring in Init
+  - **Düzenlendi**: `internal/engine/loop.go` — `broadcastState` NodeName fix; first-probe broadcast; UP target periodic re-broadcast
+  - **Düzenlendi**: `sprint.md` — Step 12 ✅
+
+---
+
 - [test] [dokuman] **Phase 13 Step 10–11 tamamlandı: Integration testler + dokümantasyon güncellemesi.**
 
   **Step 10 — Integration testler (`internal/cluster/phase13_integration_test.go`):**
