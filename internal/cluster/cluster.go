@@ -70,6 +70,38 @@ type Config struct {
 	// MinQuorumRatio is the minimum fraction of nodes required for quorum
 	// (Phase 7). Default 0.5 (simple majority). Has no effect in Phase 6.
 	MinQuorumRatio float64 `json:"min_quorum_ratio,omitempty"`
+
+	// Zone is an optional free-form label identifying the physical or logical
+	// location of this node (e.g. "istanbul", "us-east-1a"). When set on at
+	// least two nodes, Phase 13's prober selection prefers picking probers
+	// from distinct zones for redundancy.
+	//
+	// Empty by default — operators must opt in by setting it on each node.
+	// The agent never derives this from hostname or any other implicit source.
+	//
+	// Propagated to peers via memberlist NodeMeta (no extra gossip traffic).
+	Zone string `json:"zone,omitempty"`
+
+	// ProbeReplicationFactor caps the number of nodes that probe any single
+	// target. Even if N nodes have the target in their config, only this many
+	// (selected deterministically via the hash ring with zone-aware spread)
+	// will run probes; the rest stay quiet and only consume gossip.
+	//
+	// 0 (default) → 3. To force every candidate node to probe (legacy
+	// behaviour), set a value larger than the cluster size, e.g. 999.
+	//
+	// When candidate count ≤ factor all candidates probe — small clusters
+	// keep the current behaviour with zero configuration.
+	ProbeReplicationFactor int `json:"probe_replication_factor,omitempty"`
+}
+
+// effectiveReplicationFactor returns ProbeReplicationFactor when set, else the
+// default of 3. Centralised so the default is defined in one place.
+func (c Config) effectiveReplicationFactor() int {
+	if c.ProbeReplicationFactor > 0 {
+		return c.ProbeReplicationFactor
+	}
+	return 3
 }
 
 // Validate checks required fields when cluster is enabled.
@@ -92,6 +124,11 @@ func (c Config) Validate() error {
 			return fmt.Errorf("cluster.keyring[%d]: decoded length %d is not 16, 24, or 32", i, n)
 		}
 	}
+	if c.ProbeReplicationFactor < 0 {
+		return fmt.Errorf("cluster.probe_replication_factor must be >= 0, got %d", c.ProbeReplicationFactor)
+	}
+	// Zone is free-form text — no constraints. An empty value disables
+	// zone-aware prober selection for this node specifically.
 	return nil
 }
 
@@ -195,11 +232,33 @@ type gossipDelegate struct {
 	broadcasts *memberlist.TransmitLimitedQueue
 }
 
+// nodeMeta is the JSON payload memberlist distributes for every node.
+// Stays intentionally small — memberlist limits NodeMeta to 512 bytes by
+// default and replicates it on every node update.
+//
+// Fields:
+//   - Node — the node's own NodeName; redundant with memberlist.Node.Name but
+//     useful for debugging when receivers dump the raw payload.
+//   - Zone — optional zone label used by Phase 13 prober selection. Empty
+//     means "no zone declared", which puts the node in the last-resort bucket
+//     of zoneAwarePick.
+type nodeMeta struct {
+	Node string `json:"node"`
+	Zone string `json:"zone,omitempty"`
+}
+
 func (d *gossipDelegate) NodeMeta(limit int) []byte {
-	meta := map[string]string{"node": d.mgr.cfg.NodeName}
-	data, _ := json.Marshal(meta)
+	data, _ := json.Marshal(nodeMeta{
+		Node: d.mgr.cfg.NodeName,
+		Zone: d.mgr.cfg.Zone,
+	})
 	if len(data) > limit {
-		return nil
+		// Drop the optional Zone field if we somehow overflow; the node name
+		// alone is small enough to always fit.
+		data, _ = json.Marshal(nodeMeta{Node: d.mgr.cfg.NodeName})
+		if len(data) > limit {
+			return nil
+		}
 	}
 	return data
 }
@@ -664,6 +723,47 @@ func (m *Manager) GetResponsibleNode(targetID string) (primary, secondary string
 func (m *Manager) IsResponsible(targetID string) bool {
 	primary, _ := m.GetResponsibleNode(targetID)
 	return m.cfg.NodeName == primary
+}
+
+// zoneOf returns the zone label declared by nodeName, or "" when no zone
+// is set (or the node is unknown).
+//
+// Lookup is O(N) over current memberlist members; callers that need many
+// lookups in the same operation should cache the result. Memberlist already
+// distributes NodeMeta automatically so no extra gossip traffic is involved.
+func (m *Manager) zoneOf(nodeName string) string {
+	if m.list == nil {
+		// Local-only fast path used by tests / standalone construction.
+		if nodeName == m.cfg.NodeName {
+			return m.cfg.Zone
+		}
+		return ""
+	}
+	// Fast path: querying ourselves — config is authoritative even before
+	// the first NodeMeta cycle has completed.
+	if nodeName == m.cfg.NodeName {
+		return m.cfg.Zone
+	}
+	for _, mem := range m.list.Members() {
+		if mem.Name != nodeName {
+			continue
+		}
+		if len(mem.Meta) == 0 {
+			return ""
+		}
+		var meta nodeMeta
+		if err := json.Unmarshal(mem.Meta, &meta); err != nil {
+			return ""
+		}
+		return meta.Zone
+	}
+	return ""
+}
+
+// ZoneOf is the exported view of zoneOf. Returns "" for unknown nodes or
+// nodes that have not declared a zone.
+func (m *Manager) ZoneOf(nodeName string) string {
+	return m.zoneOf(nodeName)
 }
 
 // PeerStatesForTarget returns the most recent GossipPayload from every peer
