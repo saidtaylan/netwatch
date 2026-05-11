@@ -238,3 +238,44 @@ cluster:
   # Quorum (Phase 7): minimum live nodes to allow alarm dispatch.
   expected_node_count: 3
   min_quorum_ratio:    0.5    # at least floor(3 * 0.5) + 1 = 2 alive nodes required
+
+  # ── Phase 13 — Distributed Probe Ownership ──────────────────────────────────
+  # By default the cluster automatically distributes probing: even when every
+  # node has the same targets in its config, only `probe_replication_factor`
+  # nodes actually run probes for each target. The rest stay quiet and only
+  # consume gossip. Hash ring + zone-aware spread picks the prober subset
+  # deterministically, so every node agrees without coordination.
+
+  # Optional zone label for this node. Free-form string (e.g. data centre,
+  # availability zone, rack). The agent never derives it — explicit only.
+  # When at least two nodes declare zones, prober selection prefers picking
+  # one node per distinct zone for failure-domain redundancy.
+  zone: "istanbul"
+
+  # Max number of nodes that will probe any single target. Default 3.
+  # When fewer candidates know the target, all of them probe (no waste).
+  # To revert to legacy "every node probes everything" behaviour set this
+  # to a number larger than the cluster size, e.g. 999.
+  probe_replication_factor: 3
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 13 — Per-target probe pinning (Active Probe Delegation)
+# ─────────────────────────────────────────────────────────────────────────────
+# Add `probe_from: [...]` to a target to override automatic selection and
+# pin probing to a specific node list. Useful when:
+#   - Only certain nodes have network reachability to the target.
+#   - Only certain nodes carry the required credentials.
+#   - You want explicit geographic synthetic monitoring from named nodes.
+#
+# IMPORTANT: every node that holds the target in its config MUST declare the
+# SAME probe_from list. Mismatched lists break exactly-once alerting because
+# nodes will disagree on which subset is the prober set.
+#
+# Example (uncomment to use):
+#
+# targets:
+#   - id: "vpn-frankfurt-only"
+#     type: tcp
+#     target: "10.50.50.10:443"
+#     name:   "VPN endpoint (FR-only)"
+#     probe_from: ["frankfurt-1", "frankfurt-2"]   # only these probe

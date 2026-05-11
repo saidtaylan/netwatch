@@ -18,6 +18,38 @@ Bu belge, netwatch projesinin günlük güncellemelerini ve teknik detaylarını
 
 ## 2026-05-11
 
+- [test] [dokuman] **Phase 13 Step 10–11 tamamlandı: Integration testler + dokümantasyon güncellemesi.**
+
+  **Step 10 — Integration testler (`internal/cluster/phase13_integration_test.go`):**
+
+  `fakeCluster` yardımcı tipi ile gerçek memberlist soketi açmadan N node simülasyonu. Her "node" kendi `Manager`'ı, ama hepsi ortak `peerStates`/`aliveSet`/`zones` görüşü paylaşıyor (gossip tamamen converge etmiş durumu temsil ediyor). 8 senaryo:
+
+  1. **ExactlyFactorProbersSelfIdentify** — 5 node, factor=3, tek target → tam 3 node `IsLocalProber=true` dönmeli.
+  2. **AllNodesAgreeOnProberSet** — 6 node, `SelectProbers` sonucu tüm node'larda byte-for-byte aynı.
+  3. **ZoneSpreadConsistentAcrossNodes** — 6 node, 3 zone × 2; zone diversity + tüm node'larda tutarlı pick.
+  4. **ProbeFromHonoredClusterWide** — pin={b,d}; her node `SelectProbers` → {b,d}.
+  5. **PrimaryFailoverWhenNodeLeaves** — primary ayrılır, kalan node'lar yeni prober set'te aynı fikir; eski primary dönemez.
+  6. **AddingNodeReshufflesConsistently** — 3→4 node; factor cap korunur, 4 node da aynı sonuç.
+  7. **ConcurrentReadsAreSafe** — 5 node × 3 target × 200 iter; `-race` altında `SelectProbers` / `IsLocalProber` / `CandidatesFor`.
+  8. **FactorHoldsAcrossManyTargets** — 7 node, factor=2, 50 target; küme genelinde toplam `IsLocalProber=true` sayısı tam 100 (50 × 2).
+
+  Tüm testler `go test -race ./internal/cluster/...` ile yeşil.
+
+  **Step 11 — Dokümantasyon:**
+
+  - **`config.example.yaml`** — `cluster:` bloğuna `zone: "istanbul"` ve `probe_replication_factor: 3` eklendi; `probe_from` kullanım örneği açıklamalı section olarak eklendi.
+  - **`CLAUDE.md`** — Tamamlanan Phase 13 girişi eklendi: new endpoints (`/cluster/probers`, `/fleet/status`), yeni metrikler (`network_probe_local_assigned`, `network_probe_probers_for_target`, `network_probe_inventory_peers`), config schema Phase 13 alanları, `stubProvider.ProbeFromConstraint` notu.
+  - **`README.md`** — Features tablosuna 3 yeni bullet (distributed probe ownership, zone-aware spread, active probe delegation); metrics ve endpoints tablolarına Phase 13 satırları; "How alerting works" bölümü cluster modunu yansıtacak şekilde güncellendi; yeni "Distributed Probe Ownership" section (hash ring, zone spread, probe_from, replication factor açıklaması).
+
+  **Değiştirilen/eklenen dosyalar:**
+  - **Eklendi**: `internal/cluster/phase13_integration_test.go`
+  - **Düzenlendi**: `config.example.yaml`
+  - **Düzenlendi**: `CLAUDE.md`
+  - **Düzenlendi**: `README.md`
+  - **Düzenlendi**: `sprint.md` — Step 10-11 ✅ işaretlendi
+
+---
+
 - [backend] [altyapi] **Phase 13 Step 8–9 tamamlandı: `/cluster/probers` + `/fleet/status` endpoint'leri, Phase 13 metrikleri, anti-entropy sync guard'ları. todo.md F2'nin (fleet/status) özet versiyonu entegre edildi.**
 
   **Step 8 — Observability:** Üç yeni public yüzey, bir kaç metric, MemberInfo'ya zone alanı.

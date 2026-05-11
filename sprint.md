@@ -657,8 +657,8 @@ Yeni model'de primary genelde prober subset içinde olduğu için bu yol nadir t
 ✅ Step 7: Reactive recompute + 5sn debounce (NotifyJoin/Leave/Update)   (commit ba027b7)
 ✅ Step 8: /cluster/probers + /fleet/status endpoint'leri + Phase 13 metrikleri (todo.md F2 minimal entegre)
 ✅ Step 9: Anti-entropy syncing guard — StartProbing/StopProbing/bootstrap defer + SetSyncing(false) recompute trigger
-   Step 10: Integration test (3-tier zone senaryoları + 5-6 node)
-   Step 11: README + CLAUDE.md güncelleme
+✅ Step 10: Integration test — fakeCluster, 8 senaryo (factor invariant, zone spread, ProbeFrom pin, failover, churn, concurrency)
+✅ Step 11: Dokümantasyon — config.example.yaml Phase 13 alanları, CLAUDE.md + README.md güncelleme
    Step 12: Smoke test (3 yerel binary, target down/recover, zone karışık)
 ```
 

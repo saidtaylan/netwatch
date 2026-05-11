@@ -82,7 +82,10 @@ config.yaml               # Canlı config (sample — içinde açıklamalar var)
 | `GET /metrics` | Prometheus — her çağrıda `e.NotifyScrape()` tetiklenir (watchdog için) |
 | `GET /health` | Liveness check — her zaman `200 OK` döner |
 | `GET /status` | Tüm target'ların JSON durumu: name, status, seq, error_code |
-| `GET /cluster/state` | Cluster üyeleri + peer target durumları; cluster kapalıysa 503 |
+| `GET /cluster/state` | Cluster üyeleri + peer target durumları (raw); cluster kapalıysa 503 |
+| `GET /cluster/probers` | **Phase 13:** Her target için seçilen prober subset + primary + candidate seti + `probe_from` constraint'i + zone'larla üye listesi |
+| `GET /fleet/status` | **Phase 13:** Cluster-wide özet (zone'lu üyeler, quorum/isolated, target count rollup, down target ID listesi — cap 100); per-target detay yok |
+| `POST /cluster/leave` | Graceful cluster leave + process exit |
 
 ---
 
@@ -95,12 +98,20 @@ Eski isimler (`netwatch_probe_*`) kaldırıldı, direkt yeni isimlere geçildi:
 | `network_probe_local_status` | Bu node'da son probe sonucu: 1=UP, 0=DOWN |
 | `network_probe_local_latency_seconds` | Son probe round-trip süresi (saniye) |
 | `network_probe_prometheus_connected` | 1=scraping normal, 0=watchdog threshold aşıldı |
+| `network_probe_cluster_status` *(cluster)* | Konsensüs sonucu — tüm node'lar up görüyorsa 1, herhangi node down ise 0 |
+| `network_prober_quorum_healthy` *(cluster)* | 1=quorum tamam, 0=quorum kaybı |
+| `network_prober_isolated` *(cluster)* | 1=izole mod (alarm suppressed), 0=normal |
+| `network_prober_cluster_size` *(cluster)* | Bu node'un gördüğü alive üye sayısı |
+| `network_probe_local_assigned` *(Phase 13)* | 1=bu node target'ı probe ediyor, 0=etmiyor (cluster atadı başkasına) |
+| `network_probe_prober_count` *(Phase 13)* | Bu target için cluster'da seçilen toplam prober sayısı |
+| `network_probe_inventory_peers` *(Phase 13)* | Gossip ile keşfedilen peer sayısı |
 
-Label'lar (`local_status`, `local_latency_seconds`): `name`, `target`, `type`, `source_host`, `app_name`
+Label'lar (`local_status`, `local_latency_seconds`, `cluster_status`): `name`, `target`, `type`, `source_host`, `app_name`
+Label'lar (`local_assigned`, `prober_count`): `name`, `target`, `type` (ownership = host/app'tan bağımsız)
+Diğerleri label'sız.
 
-`network_probe_prometheus_connected` label'sız tek gauge'dır; `watchdog_threshold_sec: 0` (varsayılan) olduğunda daima 1 kalır.
-
-Cluster gelince `network_probe_cluster_status` (konsensüs değeri) eklenecek — mevcut metrikler dokunulmayacak.
+`network_probe_prometheus_connected` `watchdog_threshold_sec: 0` (varsayılan) olduğunda daima 1 kalır.
+Cluster metrikleri yalnızca `cluster.enabled=true` iken `RegisterClusterMetrics` aracılığıyla kaydedilir — disabled durumda registry'de görünmez.
 
 ---
 
@@ -165,7 +176,29 @@ cluster:
     - "base64encodedkey32byteslong=="
   expected_node_count: 3          # Phase 7 quorum hesabı için
   min_quorum_ratio: 0.5           # Phase 7: varsayılan basit çoğunluk
+  zone: "istanbul"                # Phase 13: opsiyonel; node-level label, hostname'den türetilmez
+  probe_replication_factor: 3     # Phase 13: per-target prober cap; varsayılan 3
 ```
+
+**Phase 13 — Distributed Probe Ownership:**
+
+Cluster modda her node her target'ı probe etmez. `probe_replication_factor` (default 3) kadar node seçilir:
+- Candidate set = peerStates'ten gelen + local LocalTargetProvider'dan (alive olanlar)
+- Hash ring (FNV-32a) ile deterministic sıralama
+- 3-tier zone-aware picker: (1) farklı zone'lardan birer, (2) zone-tagged repeat, (3) zone-less son tercih
+- Operatör hiçbir şey yazmaz → tam otomatik; isterse `target.probe_from: [n1,n2]` ile manuel pin (Active Probe Delegation)
+
+Target başına opsiyonel `probe_from`:
+
+```yaml
+targets:
+  - id: "iran-vpn"
+    type: tcp
+    target: "10.50.50.10:443"
+    probe_from: ["frankfurt-1", "istanbul-1"]   # sadece bu iki node probe eder
+```
+
+> **Kontrat:** Aynı target'ı taşıyan tüm node'lar aynı `probe_from` listesini deklare etmelidir; aksi takdirde candidate set node'lar arasında farklılaşır ve exactly-once garantisi bozulur.
 
 **KRİTİK:** `Target.Options` asla düz alanlara dönüştürülmez. `json.RawMessage` olarak saklanır; her Checker kendi parse fonksiyonunu çağırır. Bu HTTP `expected_status` operatörleri, DNS `expected_ips`, SQL `query` gibi zengin opsiyonları korur.
 
@@ -353,21 +386,43 @@ Engine `e.appIndex` field'ında tutar, `e.mu` ile korunur.
 
 **Sonuç:** Primary node, kendi config'inde olmayan bir target için peer gossip'i alırsa artık `DispatchPeerAlert` ile alarm atıyor. `NODE_NAME` env var'ı gerçekte detect eden node'u gösteriyor. Apps enrichment best-effort: primary'nin kendi apps index'inde target varsa doldurulur.
 
+### ✅ Phase 13 — Distributed Probe Ownership
+
+**Hedef:** Cluster'daki her node her target'ı probe etmez. Hash ring + zone-aware spread ile `probe_replication_factor` adet (default 3) node seçilir, geri kalanlar gossip dinler. Hedef servisler üzerinde gereksiz yük yok, erişim izni olmayan node'lar pin'lenebilir.
+
+**Yeni config alanları:**
+- `cluster.zone: "istanbul"` — opsiyonel node label (hostname'den türetilmez)
+- `cluster.probe_replication_factor: 3` — target başına max prober (varsayılan 3)
+- `target.probe_from: ["n1","n2"]` — manuel pin (Active Probe Delegation, todo.md F6)
+
+**Yeni dosyalar (`internal/cluster/`):**
+- `probers.go` — `LocalTargetProvider`, `ProberAssignmentListener`, `CandidatesFor`, `SelectProbers`, `IsLocalProber`, `zoneAwarePick` (3-tier), `recomputeProberAssignments`, `scheduleRecompute` (5sn debounce), `SeedProberAssignments`, `TriggerProberRecompute`
+- `views.go` — `ProberAssignmentsSnapshot` (/cluster/probers), `FleetSummarySnapshot` (/fleet/status)
+
+**Engine entegrasyonu:**
+- `Engine.LocalTargets()` + `Engine.ProbeFromConstraint()` (LocalTargetProvider impl)
+- `Engine.StartProbing()` + `Engine.StopProbing()` (ProberAssignmentListener impl)
+- `Engine.bootstrapInventoryBroadcast()` — Init + Reload sonrası presence broadcast (chicken-and-egg çözer)
+- `startProbeLoop` koşullu: `clusterMgr != nil && !IsLocalProber → erken return`
+- Anti-entropy sync guard'ı: `syncing=true` iken Start/Stop/bootstrap ertelenir; `SetSyncing(false)` recompute tetikler
+
+**Yeni metrikler:** `network_probe_local_assigned`, `network_probe_prober_count`, `network_probe_inventory_peers`
+
+**Yeni endpoint'ler:** `/cluster/probers` (per-target), `/fleet/status` (özet — zone'lar dahil; per-target detay yok)
+
+**Memberlist gossip mesajı sayısı değişmedi** — zone bilgisi `NodeMeta` (built-in), candidate set mevcut state broadcast'larından türetiliyor.
+
+**Davranış değişikliği:** 5 node'lu cluster + factor=3 → bir target için tam 3 probe goroutine çalışır, geri kalan 2 node sessiz dinleyici. Operatör hiçbir şey değiştirmedi.
+
+**Test sayısı:** 54 (config/probers/recompute/views/integration toplamı), tümü `-race` ile yeşil.
+
 ---
 
 ## Bekleyen Aşamalar
 
-### Phase 10 — Lifecycle Komutları
+### ✅ Phase 10 — Lifecycle Komutları (TAMAMLANDI)
 
-**Hedef:** systemd/Windows Service entegrasyonu için CLI komutları.
-
-**Görevler:**
-1. `netwatch init [--config-dir DIR]` — `config.yaml` + `credentials.env` iskeleti yaz, Linux'ta systemd unit dosyası oluştur, Windows'ta servis kayıt komutu hint'i ver.
-2. `netwatch leave [--reason TEXT]` — `/cluster/leave` HTTP endpoint'ine POST → çalışan agent graceful leave yapar.
-3. `netwatch uninstall` — leave + servisi kaldır + dosyaları sil (onay sorar).
-4. `netwatch service install/remove` (Windows) — mevcut `installService` fonksiyonu zaten var, CLI'a bağla.
-
-**Kabul kriteri:** `init` sıfırdan çalışan setup üretir; `leave` cluster'ı bilgilendirir; `uninstall` her şeyi temizler.
+CLI subcommand routing eklendi: `netwatch init`, `netwatch leave`, `netwatch uninstall`, Windows için `service install/remove`. `/cluster/leave` HTTP endpoint'i eklendi. Detay için `developments.md` 2026-05-07.
 
 ---
 
@@ -382,18 +437,26 @@ Engine `e.appIndex` field'ında tutar, `e.mu` ile korunur.
 
 ---
 
-### Phase 12 — Integration Tests
+### Phase 12 — Integration Tests (cross-phase)
 
-**Hedef:** Regresyon güvencesi.
+**Hedef:** Regresyon güvencesi — Phase 13'ün kendi içindeki integration testleri `internal/cluster/phase13_integration_test.go`'da yapıldı, ama uçtan-uca senaryolar hâlâ bekliyor.
 
 **Görevler:**
 1. `test/integration/standalone_test.go` — config ile başlat, mock TCP server'ı kapat, `state.json`'a `hard_down` yazılmış mı, alert script çağrılmış mı.
-2. `test/integration/cluster_test.go` — 3 node lokal başlat, target'ı kontrol et, scope hesabı, exactly-once alarm.
+2. `test/integration/cluster_test.go` — 3 yerel binary başlat, target'ı kontrol et, scope hesabı, exactly-once alarm.
 3. `test/integration/antientropy_test.go` — Phase 9 senaryosu (re-join alarm storm yok).
 4. `test/integration/keyrotation_test.go` — keyring rotation sıfır kesinti.
 5. CI gate: `go test ./... -race -timeout 120s`.
 
 **Kabul kriteri:** Tüm testler `-race` ile geçer.
+
+---
+
+### ✅ Phase 13 — Distributed Probe Ownership (TAMAMLANDI)
+
+Cluster artık her node her target'ı probe etmiyor; hash + zone-aware spread ile `probe_replication_factor` adet (default 3) prober seçiyor. todo.md F6 (Active Probe Delegation, `target.probe_from`) ve todo.md F2 (minimal `/fleet/status`) entegre. Detay için `developments.md` 2026-05-11.
+
+Kalan tek manuel adım: **Phase 13 Step 12 — smoke test** (3 yerel binary ile real-world doğrulama).
 
 ---
 
@@ -406,7 +469,7 @@ Engine `e.appIndex` field'ında tutar, `e.mu` ile korunur.
                            ✅6 → ✅7 → ✅8 → ✅9
                                                   │
                                                   ▼
-                                              ✅10 → ✅11 → [ 12 ]
+                                              ✅10 → ✅11 → [ 12 ] → ✅13
 ```
 
 Her aşama bittikten sonra **kullanıcı onayı** alınır. Sonraki aşamaya geçilmeden önce smoke test yapılır.

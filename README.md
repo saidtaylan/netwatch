@@ -10,7 +10,9 @@
 |---|---|
 | **Multi-protocol probes** | TCP, HTTP/HTTPS (body + status assertions), ICMP ping, DNS, SQL (MySQL / PostgreSQL / SQL Server / Oracle) |
 | **Smart state machine** | Transient failures cause a *soft-down* retry phase; only after `max_retries` failures is the target declared *hard-down* and an alert sent |
-| **Exactly-once alerting** | In cluster mode, consistent hashing assigns a primary + secondary owner per target; only the responsible node sends the alert |
+| **Exactly-once alerting** | In cluster mode, consistent hashing assigns a primary per target; only the responsible node sends the alert. Failover is automatic when the primary leaves the cluster. |
+| **Distributed probe ownership** | Probes themselves are spread across the cluster: only `probe_replication_factor` (default 3) nodes probe each target, with zone-aware redundancy. Stops a 50-node cluster from hammering targets 50× |
+| **Active probe delegation** | Optional per-target `probe_from` list — pin probing to named nodes for reachability, credentials, or geo-synthetic use cases |
 | **Quorum gating** | If a cluster loses quorum (majority of nodes unreachable), alert dispatch is suppressed to avoid false positives from a split-brain node |
 | **Anti-entropy re-join** | When a node restarts and rejoins the cluster, it syncs state before allowing new alerts — no storm of duplicate notifications |
 | **Alert channels** | Script (`.sh` / `.ps1`), SMTP mail (multipart HTML), generic JSON webhook, or Prometheus Alertmanager format |
@@ -324,6 +326,9 @@ Default port: `10240`
 | `network_prober_quorum_healthy` | Gauge | — | 1 = quorum present, 0 = quorum lost |
 | `network_prober_isolated` | Gauge | — | 1 = this node is isolated (alert dispatch suppressed) |
 | `network_prober_cluster_size` | Gauge | — | Number of alive cluster members |
+| `network_probe_local_assigned` | Gauge | name, target, type | 1 = this node probes the target; 0 = a peer was assigned (Phase 13) |
+| `network_probe_prober_count` | Gauge | name, target, type | Total number of probers selected by the cluster for this target |
+| `network_probe_inventory_peers` | Gauge | — | Distinct peers seen via gossip (approaches `cluster_size` once gossip converges) |
 
 ---
 
@@ -334,7 +339,9 @@ Default port: `10240`
 | `GET /metrics` | Prometheus scrape — also notifies the watchdog |
 | `GET /health` | Liveness check — always `200 OK` |
 | `GET /status` | JSON: all targets with current state, seq, error_code |
-| `GET /cluster/state` | JSON: member list + peer target states; `503` if cluster is disabled |
+| `GET /cluster/state` | JSON: member list + raw peer target states; `503` if cluster is disabled |
+| `GET /cluster/probers` | JSON: per-target prober assignments — selected probers, primary, candidate set, active `probe_from` constraint, members with zones |
+| `GET /fleet/status` | JSON: cluster-wide summary — members with zones, quorum/isolated flags, aggregated target counts (up/hard_down/unknown), capped list of down target IDs. Summary only, no per-target detail |
 | `POST /cluster/leave` | Graceful cluster departure + process exit; `?reason=TEXT` optional |
 
 ---
@@ -362,12 +369,50 @@ Open port `7946` (TCP + UDP) between all cluster members.
 
 ### How alerting works in cluster mode
 
-1. Every node probes every target independently (local health signal).
+1. A subset of nodes (default 3) probes each target — see "Distributed Probe Ownership" below.
 2. State changes are broadcast via gossip — all nodes maintain a view of peer states.
-3. Consistent hashing assigns a **primary** and **secondary** responsible node per target.
-4. Only the responsible node calls `sendAlert()`.
-5. If the responsible node dies, the secondary takes over (the hash ring is recomputed when membership changes).
+3. Consistent hashing assigns a **primary** responsible node per target.
+4. Only the primary calls `sendAlert()`.
+5. If the primary leaves, the next node in the hash ring takes over automatically.
 6. `SCOPE` env var in the alert: `GLOBAL` (all nodes see down) / `NODE_LOCAL` (one node sees down) / `PARTIAL`.
+
+### Distributed Probe Ownership (Phase 13)
+
+By default the cluster automatically distributes probing — not every node probes every target. This avoids hammering the target server with N redundant probes from a 50-node cluster.
+
+```yaml
+cluster:
+  probe_replication_factor: 3   # max nodes that probe any single target (default 3)
+  zone: "istanbul"              # optional node label for zone-aware spread
+```
+
+**Selection logic:**
+
+1. **Candidate set** — every alive node that has the target in its config. Derived from the same gossip stream that carries probe results; no extra messages.
+2. **Hash ring** — sorted candidate list rotated by `FNV-32a(targetID)` so every node computes the same starting point.
+3. **3-tier zone-aware picker:**
+   - Tier 1: pick one node per distinct zone (failure-domain redundancy)
+   - Tier 2: if the factor isn't filled, take another zone-tagged node (a repeated zone is still preferred over a zoneless one)
+   - Tier 3: zone-less nodes — strictly last resort
+4. When candidate count ≤ factor, all candidates probe (legacy "everyone probes" behaviour for small clusters).
+
+**Active Probe Delegation** — operator-controlled pinning. Override automatic selection per target:
+
+```yaml
+targets:
+  - id: "vpn-frankfurt-only"
+    type: tcp
+    target: "10.50.50.10:443"
+    probe_from: ["frankfurt-1", "frankfurt-2"]   # only these nodes probe
+```
+
+Useful when reachability or credentials are restricted to specific nodes, or for explicit multi-region synthetic monitoring. **Contract:** every node that carries the target must declare the same `probe_from` list — mismatched lists break exactly-once alerting.
+
+**Observability:**
+
+- `GET /cluster/probers` — see what was assigned and why (candidates, picks, zones, pins).
+- `GET /fleet/status` — cluster-wide rollup with zone-tagged member list.
+- `network_probe_local_assigned{...}` — Prometheus check from each node.
 
 ### Quorum
 
