@@ -18,6 +18,50 @@ Bu belge, netwatch projesinin günlük güncellemelerini ve teknik detaylarını
 
 ## 2026-05-11
 
+- [backend] [altyapi] **Phase 13 Step 8–9 tamamlandı: `/cluster/probers` + `/fleet/status` endpoint'leri, Phase 13 metrikleri, anti-entropy sync guard'ları. todo.md F2'nin (fleet/status) özet versiyonu entegre edildi.**
+
+  **Step 8 — Observability:** Üç yeni public yüzey, bir kaç metric, MemberInfo'ya zone alanı.
+
+  - `GET /cluster/probers` — **per-target prober assignment view**. Her target için: seçilen probers (factor adet), primary (probers[0]), candidates (factor cap'inden önce), bu node prober mı (`i_probe`), aktif `probe_from` constraint'i (varsa). Members listesi zone'larla birlikte ekleniyor. Operatör "neden bu node X'i probe etmiyor?" sorusunu tek `curl` ile cevaplayabiliyor.
+  - `GET /fleet/status` — **cluster-wide özet view** (todo.md F2 minimal). Per-target detay YOK (kullanıcı açıkça istemedi). İçerik:
+    - `Cluster`: size, alive count, quorum_healthy, isolated, expected_node_count, min_quorum_ratio, replication_factor
+    - `Members`: zone'lar dahil tüm üye listesi
+    - `Targets`: cluster-wide aggregate counts — Total (unique target ID'lerinin sayısı), Up (tüm reporting node'lar agree), HardDown (herhangi node down rapor ediyorsa — exactly-once alerting modeliyle uyumlu), Unknown (bootstrap state'i veya consensus yok)
+    - `DownTargets`: down olan target ID'lerinin listesi (cap=100, count exact ama liste bounded)
+  - `MemberInfo` — `Zone` alanı eklendi (memberlist NodeMeta'dan parse edilir; eksikse boş)
+  - Yeni metrikler (`RegisterClusterMetrics` ile koşullu kayıt):
+    - `network_probe_local_assigned{name,target,type}` — bu node probe ediyor mu (1/0)
+    - `network_probe_prober_count{name,target,type}` — seçilen prober sayısı
+    - `network_probe_inventory_peers` — gossip ile keşfedilen peer sayısı (cluster size'a yaklaşır)
+  - Metrikler `updateClusterMetrics` içinde her 5sn'de bir güncelleniyor (mevcut updater goroutine'i içinde)
+
+  **Step 9 — Anti-entropy sync guard'ları:** Phase 9'da `runCheck` ve `processPending` zaten `syncing.Load()` ile guard'lıydı. Phase 13'ün eklediği yollar da artık aynı guard'a tabi:
+
+  - `Engine.StartProbing(targetID)` — syncing true ise erken return + debug log
+  - `Engine.StopProbing(targetID)` — syncing true ise erken return (mevcut probe loop'lar dokunulmuyor)
+  - `Engine.bootstrapInventoryBroadcast()` — syncing true ise erken return (FullState merge ile race önleniyor; seq=0 placeholder'larla otoriter seq'leri ezme riski yok)
+  - `Engine.SetSyncing(false)` — true→false transition'ında **goroutine ile** `clusterMgr.TriggerProberRecompute()` çağırıyor; sync sırasında ertelenen Start/Stop callback'leri sync biter bitmez catch-up yapıyor (max 5sn debounce beklemek yerine)
+
+  Sonuç: Anti-entropy join sırasında ne ekstra alarm gidiyor, ne probe loop kasırgası, ne de yanlış seq=0 broadcast'i.
+
+  **Test:** 8 yeni cluster testi (`phase13_views_test.go`): ProberSnapshot içerik/primary/i_probe/constraint exposure; FleetSummary state counting, DownTargets cap, local provider inclusion, cluster info config reflection. 4 yeni engine testi (`phase13_test.go` ekleri): bootstrap-deferred-while-syncing, StartProbing-deferred-while-syncing, StopProbing-deferred-while-syncing, SetSyncing-flag-transition. Plus `Members()` ve `AliveCount()` test path'inde nil-safe edildi (m.list=nil durumunda aliveSet override'a düşüyor).
+
+  **Smoke test ipucu:**
+  ```
+  curl localhost:10240/fleet/status | jq '.targets, .cluster, .members[].zone'
+  curl localhost:10240/cluster/probers | jq '.assignments["my-target"]'
+  curl localhost:10240/metrics | grep network_probe_local_assigned
+  ```
+
+  - **Oluşturuldu**: `internal/cluster/views.go` — `ProberAssignment`, `ProberSnapshot`, `FleetClusterInfo`, `FleetTargetCounts`, `FleetSummary` tipleri; `ProberAssignmentsSnapshot()`, `FleetSummarySnapshot()` metodları; `FleetDownTargetsCap=100`
+  - **Değiştirildi**: `internal/cluster/cluster.go` — `MemberInfo.Zone` alanı; `Members()` NodeMeta'dan zone parse + nil-safe; `AliveCount()` nil-safe
+  - **Değiştirildi**: `internal/engine/engine.go` — 3 yeni cluster gauge (`GaugeLocalAssigned`, `GaugeProberCount`, `GaugeInventoryPeers`); `RegisterClusterMetrics` bunları register ediyor; `updateClusterMetrics` Phase 13 ownership gauge'larını günceller; `StartProbing`/`StopProbing` sync guard'ları; `bootstrapInventoryBroadcast` sync guard; `SetSyncing` true→false transition'ında recompute tetiklemesi
+  - **Değiştirildi**: `cmd/linux/main.go` — `/cluster/probers` ve `/fleet/status` endpoint kayıtları
+  - **Oluşturuldu**: `internal/cluster/phase13_views_test.go` — 8 unit test
+  - **Değiştirildi**: `internal/engine/phase13_test.go` — 4 yeni sync guard testi
+
+---
+
 - [backend] [altyapi] **Phase 13 Step 6–7 tamamlandı: Dinamik probe loop atama + 5sn debounce'lu reactive recompute. Davranış değişikliği aktif: artık hash + zone seçimi gerçekten probe loop'larını başlatıp durduruyor.**
 
   **Step 6 — `ProberAssignmentListener` interface + engine entegrasyonu:** Cluster paketine yeni `ProberAssignmentListener` interface'i eklendi (`StartProbing(targetID)` + `StopProbing(targetID)`). Engine bu interface'i implement ediyor: cluster'dan gelen callback'lere lookup yapıp ilgili target'ın probe goroutine'ini başlatıyor veya iptal ediyor. `Manager.recomputeProberAssignments` her local target için `IsLocalProber` hesaplayıp önceki `proberAssignments` snapshot'ı ile diff alıyor; sadece transition'lar için callback fırlatıyor (idempotent recompute = sessiz). Stop'lar start'lardan önce çağrılıyor → swap senaryolarında overlap minimize edilmiş.

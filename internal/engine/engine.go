@@ -299,6 +299,32 @@ var (
 		Name: "network_probe_cluster_status",
 		Help: "Cluster-wide consensus probe result: 1=all nodes up, 0=any node down",
 	}, LabelNames)
+
+	// ── Phase 13: probe ownership metrics ──────────────────────────────────
+
+	// GaugeLocalAssigned is 1 when this node is one of the selected probers
+	// for the labelled target, 0 otherwise. Operators consult this to
+	// understand why a node is or is not running probes.
+	GaugeLocalAssigned = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "network_probe_local_assigned",
+		Help: "1 = this node probes the target locally, 0 = leaves it to other cluster members",
+	}, []string{"name", "target", "type"})
+
+	// GaugeProberCount reports how many cluster members are running probes
+	// for the labelled target. Helpful for verifying that ProbeReplicationFactor
+	// is taking effect.
+	GaugeProberCount = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "network_probe_prober_count",
+		Help: "Number of cluster members currently assigned to probe the target",
+	}, []string{"name", "target", "type"})
+
+	// GaugeInventoryPeers reports the number of peers whose target inventory
+	// this node has observed (i.e. peers that have broadcast at least one
+	// state). Diverges from cluster size during bootstrap or anti-entropy.
+	GaugeInventoryPeers = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "network_probe_inventory_peers",
+		Help: "Number of distinct peer nodes whose target inventory has been observed via gossip",
+	})
 )
 
 // RegisterMetrics registers the core (non-cluster) metrics with reg.
@@ -314,9 +340,11 @@ func RegisterMetrics(reg *prometheus.Registry) {
 // disabled would register gauges that are never updated, which is confusing.
 func RegisterClusterMetrics(reg *prometheus.Registry) {
 	reg.MustRegister(GaugeQuorumHealthy, GaugeIsolated, GaugeClusterSize, GaugeClusterStatus)
+	reg.MustRegister(GaugeLocalAssigned, GaugeProberCount, GaugeInventoryPeers)
 	GaugeQuorumHealthy.Set(1) // optimistic: assume quorum until first check
 	GaugeIsolated.Set(0)
 	GaugeClusterSize.Set(0)
+	GaugeInventoryPeers.Set(0)
 }
 
 // ── Logger ────────────────────────────────────────────────────────────────────
@@ -1093,7 +1121,26 @@ func (e *Engine) updateClusterMetrics() {
 		} else {
 			GaugeClusterStatus.With(labels).Set(0)
 		}
+
+		// Phase 13 ownership gauges (label set is smaller — no host/app
+		// because these are about cluster assignment, not probe results).
+		ownerLabels := prometheus.Labels{
+			"name":   t.key(),
+			"target": t.Target,
+			"type":   t.Type,
+		}
+		probers := e.clusterMgr.SelectProbers(t.key())
+		GaugeProberCount.With(ownerLabels).Set(float64(len(probers)))
+		if e.clusterMgr.IsLocalProber(t.key()) {
+			GaugeLocalAssigned.With(ownerLabels).Set(1)
+		} else {
+			GaugeLocalAssigned.With(ownerLabels).Set(0)
+		}
 	}
+
+	// Inventory-peer count: distinct peer names with at least one broadcast
+	// in peerStates. Uses Snapshot().PeerStates which is already deep-copied.
+	GaugeInventoryPeers.Set(float64(len(e.clusterMgr.Snapshot().PeerStates)))
 }
 
 // computeScope determines the alert scope based on how many cluster nodes see
@@ -1168,7 +1215,17 @@ func (e *Engine) shouldAlert(targetID string) bool {
 // targetID. Looks up the target in the current config and runs startProbeLoop;
 // disabled or removed targets are silently ignored (the listener may briefly
 // reference a target that has just been removed by a concurrent Reload).
+//
+// Suppressed during anti-entropy sync (Step 9): probe-loop changes mid-sync
+// could race with the FullState merge. The engine fires a fresh recompute
+// when SetSyncing(false) clears the flag, so any missed assignment catches
+// up on the next pass.
 func (e *Engine) StartProbing(targetID string) {
+	if e.syncing.Load() {
+		slog.Debug("start probing deferred: anti-entropy sync in progress",
+			"target", targetID)
+		return
+	}
 	e.mu.RLock()
 	var found *Target
 	for i := range e.cfg.Targets {
@@ -1191,7 +1248,16 @@ func (e *Engine) StartProbing(targetID string) {
 // cluster layer when this node is no longer in the prober subset for
 // targetID. Cancels the probe goroutine if one is running; harmless when
 // none exists.
+//
+// Sync guard: same rationale as StartProbing — we don't tear down probe
+// loops while a full-state merge is reconciling everything; the post-sync
+// recompute trigger re-applies the correct assignment.
 func (e *Engine) StopProbing(targetID string) {
+	if e.syncing.Load() {
+		slog.Debug("stop probing deferred: anti-entropy sync in progress",
+			"target", targetID)
+		return
+	}
 	slog.Info("probe loop stopped by cluster assignment",
 		"target", targetID, "node", e.hostname)
 	e.stopProbeLoop(targetID)
@@ -1252,9 +1318,16 @@ func (e *Engine) ProbeFromConstraint(targetID string) []string {
 //     "hard_down", so this is a benign presence announcement that will be
 //     superseded by the first real probe (seq>=1) via Lamport ordering.
 //
-// No-op when the cluster layer is disabled.
+// No-op when the cluster layer is disabled or while an anti-entropy sync
+// is in flight (Step 9): broadcasting bootstrap states during a FullState
+// merge would race with ApplyRemoteState and risk overwriting authoritative
+// seqs with seq=0 placeholders.
 func (e *Engine) bootstrapInventoryBroadcast() {
 	if e.clusterMgr == nil {
+		return
+	}
+	if e.syncing.Load() {
+		slog.Debug("bootstrap broadcast deferred: anti-entropy sync in progress")
 		return
 	}
 	e.mu.RLock()
@@ -1454,13 +1527,25 @@ func (e *Engine) ApplyRemoteState(buf []byte) {
 
 // SetSyncing implements cluster.AntiEntropyProvider.
 // While syncing is true, runCheck and processPending return immediately so no
-// new alarms are dispatched during state reconciliation.
+// new alarms are dispatched during state reconciliation. Phase 13 extends
+// this guard to probe-loop assignment: StartProbing / StopProbing callbacks
+// also defer while syncing.
+//
+// On the sync-complete transition (true → false), a fresh prober recompute is
+// triggered so any assignment changes that arrived via the merged peer state
+// are applied. Without this trigger, deferred StartProbing/StopProbing calls
+// would only catch up on the next debounced recompute (up to 5 s later).
 func (e *Engine) SetSyncing(v bool) {
-	e.syncing.Store(v)
+	prev := e.syncing.Swap(v)
 	if v {
 		slog.Info("[ANTI-ENTROPY] sync started — alarm dispatch suppressed")
-	} else {
-		slog.Info("[ANTI-ENTROPY] sync complete — normal operation resumed")
+		return
+	}
+	slog.Info("[ANTI-ENTROPY] sync complete — normal operation resumed")
+	// Transitioned from syncing→not-syncing: catch up on any prober changes
+	// we deferred during the merge.
+	if prev && e.clusterMgr != nil {
+		go e.clusterMgr.TriggerProberRecompute()
 	}
 }
 

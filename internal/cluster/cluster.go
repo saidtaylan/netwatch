@@ -178,12 +178,18 @@ type GossipPayload struct {
 // ── MemberInfo ────────────────────────────────────────────────────────────────
 
 // MemberInfo is the JSON-serializable view of a cluster member.
+//
+// Zone is sourced from memberlist NodeMeta (Phase 13) and is empty when the
+// member has not declared one. Operators rely on Zone in /fleet/status and
+// /cluster/probers to verify that prober assignments fall across distinct
+// failure domains.
 type MemberInfo struct {
 	Name   string `json:"name"`
 	Addr   string `json:"addr"`
 	Port   uint16 `json:"port"`
 	Status string `json:"status"` // alive | suspect | dead | left
 	Self   bool   `json:"self"`
+	Zone   string `json:"zone,omitempty"`
 }
 
 // ── ClusterStateSnapshot ──────────────────────────────────────────────────────
@@ -680,17 +686,54 @@ func (m *Manager) OnStateReceived(p GossipPayload) {
 }
 
 // Members returns a snapshot of all currently known cluster members.
+// Zone is parsed from each member's NodeMeta payload; missing or malformed
+// metadata yields an empty Zone string.
+//
+// Returns an empty slice when the manager was constructed without a real
+// memberlist (test path) — callers can safely range over the result.
 func (m *Manager) Members() []MemberInfo {
+	if m.list == nil {
+		// Test path: fall back to the alive override if set, otherwise self.
+		alive := m.aliveSet()
+		out := make([]MemberInfo, 0, len(alive))
+		for name := range alive {
+			zone := ""
+			if name == m.cfg.NodeName {
+				zone = m.cfg.Zone
+			}
+			out = append(out, MemberInfo{
+				Name:   name,
+				Status: "alive",
+				Self:   name == m.cfg.NodeName,
+				Zone:   zone,
+			})
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+		return out
+	}
 	local := m.list.LocalNode()
 	members := m.list.Members()
 	out := make([]MemberInfo, 0, len(members))
 	for _, mem := range members {
+		var zone string
+		if len(mem.Meta) > 0 {
+			var meta nodeMeta
+			if json.Unmarshal(mem.Meta, &meta) == nil {
+				zone = meta.Zone
+			}
+		}
+		if mem.Name == local.Name && zone == "" {
+			// Self-zone is authoritative from local config — useful before
+			// the first NodeMeta cycle completes.
+			zone = m.cfg.Zone
+		}
 		out = append(out, MemberInfo{
 			Name:   mem.Name,
 			Addr:   mem.Addr.String(),
 			Port:   mem.Port,
 			Status: nodeStateStr(mem.State),
 			Self:   mem.Name == local.Name,
+			Zone:   zone,
 		})
 	}
 	return out
@@ -892,7 +935,14 @@ func (m *Manager) SetPeerAlertHandler(h PeerAlertHandler) {
 // ── Quorum ────────────────────────────────────────────────────────────────────
 
 // AliveCount returns the number of cluster members currently in StateAlive.
+// Returns 0 in test contexts where the memberlist has not been initialised
+// (callers should treat 0 as "no cluster" rather than "quorum lost").
 func (m *Manager) AliveCount() int {
+	if m.list == nil {
+		// Test path — derive from the optional aliveSet override; useful so
+		// quorum checks in tests can simulate a populated cluster.
+		return len(m.aliveSet())
+	}
 	count := 0
 	for _, node := range m.list.Members() {
 		if node.State == memberlist.StateAlive {

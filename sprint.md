@@ -654,9 +654,9 @@ Yeni model'de primary genelde prober subset içinde olduğu için bu yol nadir t
 ✅ Step 4: SelectProbers + zone-aware picker (3-tier) + unit testler          (commit cabd6bb)
 ✅ Step 5: Bootstrap broadcast + Active Probe Delegation (todo.md F6 entegre)  (commit 5826737)
 ✅ Step 6: ProberAssignmentListener interface + engine StartProbing/StopProbing entegrasyonu
-✅ Step 7: Reactive recompute + 5sn debounce (NotifyJoin/Leave/Update)
-   Step 8: /cluster/probers endpoint + metrikler
-   Step 9: Phase 9 anti-entropy ile uyum doğrulama (syncing guard)
+✅ Step 7: Reactive recompute + 5sn debounce (NotifyJoin/Leave/Update)   (commit ba027b7)
+✅ Step 8: /cluster/probers + /fleet/status endpoint'leri + Phase 13 metrikleri (todo.md F2 minimal entegre)
+✅ Step 9: Anti-entropy syncing guard — StartProbing/StopProbing/bootstrap defer + SetSyncing(false) recompute trigger
    Step 10: Integration test (3-tier zone senaryoları + 5-6 node)
    Step 11: README + CLAUDE.md güncelleme
    Step 12: Smoke test (3 yerel binary, target down/recover, zone karışık)

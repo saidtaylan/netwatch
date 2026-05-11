@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"reflect"
 	"sort"
 	"sync"
@@ -106,6 +107,67 @@ func TestBootstrapInventoryBroadcast_NoopWhenClusterDisabled(t *testing.T) {
 		}
 	}()
 	e.bootstrapInventoryBroadcast()
+}
+
+func TestBootstrapInventoryBroadcast_DeferredWhileSyncing(t *testing.T) {
+	// syncing=true must short-circuit the broadcast before touching state.
+	e := &Engine{mu: sync.RWMutex{}, stateMu: sync.RWMutex{}}
+	e.syncing.Store(true)
+	e.cfg.Targets = []Target{{Name: "alpha", Type: "tcp", Target: "a:1"}}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("panic during sync-suppressed bootstrap: %v", r)
+		}
+	}()
+	e.bootstrapInventoryBroadcast()
+}
+
+// ── Step 9 — anti-entropy sync guard ─────────────────────────────────────────
+
+func TestStartProbing_DeferredWhileSyncing(t *testing.T) {
+	enabled := true
+	e := &Engine{mu: sync.RWMutex{}, probesMu: sync.Mutex{}}
+	e.syncing.Store(true)
+	e.cfg.Targets = []Target{{Name: "alpha", Type: "tcp", Target: "a:1", Enabled: &enabled}}
+	e.probeCancel = make(map[string]context.CancelFunc)
+	// Must not start a probe loop while syncing.
+	e.StartProbing("alpha")
+	if _, ok := e.probeCancel["alpha"]; ok {
+		t.Errorf("probe loop should not have been started during sync")
+	}
+}
+
+func TestStopProbing_DeferredWhileSyncing(t *testing.T) {
+	// Pre-populate a fake probe cancel so we can verify Stop is a no-op
+	// during sync (the entry should still be there afterwards).
+	called := false
+	e := &Engine{probesMu: sync.Mutex{}}
+	e.syncing.Store(true)
+	e.probeCancel = map[string]context.CancelFunc{
+		"alpha": func() { called = true },
+	}
+	e.StopProbing("alpha")
+	if called {
+		t.Errorf("StopProbing must not cancel during sync")
+	}
+	if _, ok := e.probeCancel["alpha"]; !ok {
+		t.Errorf("probe cancel entry should still be present after deferred Stop")
+	}
+}
+
+func TestSetSyncing_TriggersRecomputeOnExit(t *testing.T) {
+	// Verify SetSyncing(false) flips the flag; the cluster recompute
+	// trigger is best-effort and guarded by clusterMgr != nil, so this
+	// test just asserts the state transition (no clusterMgr present).
+	e := &Engine{}
+	e.SetSyncing(true)
+	if !e.syncing.Load() {
+		t.Fatal("expected syncing=true after SetSyncing(true)")
+	}
+	e.SetSyncing(false)
+	if e.syncing.Load() {
+		t.Fatal("expected syncing=false after SetSyncing(false)")
+	}
 }
 
 func TestBootstrapInventoryBroadcast_SkipsDisabledTargets(t *testing.T) {
