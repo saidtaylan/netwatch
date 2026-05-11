@@ -246,7 +246,18 @@ func (e *Engine) FleetSnapshot() FleetSnapshot {
 
 ---
 
-## 3. Scope Intelligence Enhancement (Network Partition Detection) [P1]
+## ✅ 3. Scope Intelligence Enhancement (Network Partition Detection) [P1] — TAMAMLANDI
+
+**Dosya:** `internal/engine/scope.go`, `scope_test.go`
+**Yeni tip:** `DetailedScope` (Scope, Classification, DownNodes, UpNodes, OfflineNodes, PartitionGroups, Confidence)
+**Yeni metod:** `classifyScope(targetID)` — REAL_OUTAGE / NETWORK_PARTITION / LOCAL_FAILURE / AMBIGUOUS
+**Alert env:** CLASSIFICATION, CONFIDENCE, DOWN_NODES, UP_NODES, OFFLINE_NODES
+**fleet.go:** `FleetTarget.Classification` + `FleetTarget.Confidence` alanları eklendi
+**Tests:** 9 unit test, `-race` yeşil
+
+---
+
+## 3. Scope Intelligence Enhancement (Network Partition Detection) [P1] — Orijinal Plan
 
 ### Neden değerli
 Phase 8'de `SCOPE=GLOBAL/PARTIAL/NODE_LOCAL` zaten var. Ama alarm geldiğinde operatör hâlâ "ağ partition'ı mı, gerçek outage mı?" diye düşünüyor. Bu adımda sınıflandırmayı zenginleştir:
@@ -305,7 +316,19 @@ Mail HTML body'de uyarı kutusu:
 
 ---
 
-## 4. SLO Tracker [P1]
+## ✅ 4. SLO Tracker [P1] — TAMAMLANDI
+
+**Dosya:** `internal/engine/slo.go`, `slo_test.go`
+**Config:** `slo.enabled`, `slo.targets[].target_uptime`, `slo.targets[].window` (30d/7d/24h), `slo.slo_notify`, `slo.retention_days`
+**Persistence:** `incidents.json` (yanında `state_file`) — restart sonrası açık incident'lar restore edilir
+**Endpoint:** `GET /slo` — uptime ratio, error budget, incident_count, slo_breached
+**Metrics:** `network_probe_slo_uptime_ratio`, `network_probe_slo_error_budget_seconds`, `network_probe_slo_breached`
+**Alerts:** Edge-triggered breach alert — `STATUS=slo_breached`, ek env: SLO_TARGET_UPTIME, SLO_ACTUAL_UPTIME, SLO_WINDOW, SLO_DOWNTIME_MINUTES, SLO_INCIDENT_COUNT, SLO_ERROR_BUDGET_SEC
+**Tests:** 12 unit test, `-race` yeşil
+
+---
+
+## 4. SLO Tracker [P1] — Orijinal Plan
 
 ### Neden değerli
 "Bu hizmet bu ay kaç dakika down kaldı?" sorusunun cevabı için ekipler şu an Prometheus + manuel hesaplama yapıyor. netwatch zaten her state geçişini biliyor — sadece persist etsin, hesaplasın.

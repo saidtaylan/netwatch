@@ -122,6 +122,7 @@ func (e *Engine) runCheck(ctx context.Context, t Target) {
 		} else if inPending || !prevUp {
 			// Recovery from soft-down or hard-down.
 			if e.markRecovered(pkey, t) {
+				e.sloRecordEnd(t) // SLO: close open incident (no-op if none open)
 				slog.Info("target recovered", "name", t.key(), "target", t.Target, "latency", elapsed)
 				if e.shouldAlert(t.key()) {
 					e.sendAlert(t, "reachable")
@@ -240,6 +241,7 @@ func (e *Engine) processPending(ctx context.Context) {
 
 		if ok {
 			if e.markRecovered(pkey, t) {
+				e.sloRecordEnd(t) // SLO: close open incident
 				slog.Info("target recovered after retries", "name", t.key(), "target", t.Target, "retries", d.entry.RetryCount)
 				if e.shouldAlert(t.key()) {
 					e.sendAlert(t, "reachable")
@@ -251,6 +253,7 @@ func (e *Engine) processPending(ctx context.Context) {
 		newCount := d.entry.RetryCount + 1
 		if newCount >= maxRetries {
 			if e.markHardDown(pkey, t, errCode) {
+				e.sloRecordStart(t, errCode) // SLO: open new incident
 				slog.Error("target hard-down after retries", "name", t.key(), "target", t.Target, "retries", newCount)
 				if e.shouldAlert(t.key()) {
 					e.sendAlert(t, "unreachable")

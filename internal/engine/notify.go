@@ -149,7 +149,6 @@ func (e *Engine) sendAlert(t Target, status string) {
 		}
 	}
 
-	localDown := status == "unreachable"
 	env := map[string]string{
 		"NAME":       t.Name,
 		"TARGET":     t.Target,
@@ -161,7 +160,11 @@ func (e *Engine) sendAlert(t Target, status string) {
 		"TYPE":       t.Type,
 		"SEQ":        strconv.FormatUint(ps.Seq, 10),
 		"ERROR_CODE": ps.ErrorCode,
-		"SCOPE":      e.computeScope(t.key(), localDown),
+	}
+	// Scope intelligence: injects SCOPE, CLASSIFICATION, CONFIDENCE, DOWN_NODES,
+	// UP_NODES, OFFLINE_NODES into the env for all channel types.
+	for k, v := range e.classifyScope(t.key()).ScopeEnv() {
+		env[k] = v
 	}
 	if affected, teams := buildAppContext(apps); affected != "" {
 		env["AFFECTED_APPS"] = affected

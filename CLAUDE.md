@@ -53,6 +53,8 @@ internal/engine/          ← business logic paketi
   app.go                  # App struct, AppTargetIndex, buildAppTargetIndex, validateApps
   topology.go             # DependencyGraph, buildDependencyGraph, FindRootCause, CascadingImpact, TopologySnapshot
   fleet.go                # FleetSnapshot — rich /fleet/status: per-target detail, scope, apps, root cause, incidents
+  scope.go                # DetailedScope, classifyScope — REAL_OUTAGE / NETWORK_PARTITION / LOCAL_FAILURE / AMBIGUOUS
+  slo.go                  # SLOConfig, sloManager, incidents.json, ComputeSLO, runSLOChecker, /slo endpoint data
   webhook.go              # WebhookAlerter (generic + alertmanager format)
   watchdog.go             # Prometheus scrape watchdog goroutine + NotifyScrape()
   mail.go                 # SMTP alerter (multipart/alternative, HTML body)
@@ -86,8 +88,9 @@ config.yaml               # Canlı config (sample — içinde açıklamalar var)
 | `GET /status` | Tüm target'ların JSON durumu: name, status, seq, error_code |
 | `GET /cluster/state` | Cluster üyeleri + peer target durumları (raw); cluster kapalıysa 503 |
 | `GET /cluster/probers` | **Phase 13:** Her target için seçilen prober subset + primary + candidate seti + `probe_from` constraint'i + zone'larla üye listesi |
-| `GET /fleet/status` | Rich engine-level fleet view: per-target consensus state, scope, by-node breakdown, affected apps, root cause, cascading impact, active incidents. Standalone modda da çalışır (cluster=nil). |
+| `GET /fleet/status` | Rich engine-level fleet view: per-target consensus state, scope, **classification** (REAL_OUTAGE/NETWORK_PARTITION/LOCAL_FAILURE/AMBIGUOUS), **confidence**, by-node breakdown, affected apps, root cause, cascading impact, active incidents. Standalone modda da çalışır (cluster=nil). |
 | `GET /topology` | Target dependency graph (depends_on ilişkileri): her target için direct deps, reverse deps, transitive cascading impact. |
+| `GET /slo` | SLO metrics: per-target uptime ratio, error budget, incident history, breach status. `slo.enabled: false` ise 503. |
 | `POST /cluster/leave` | Graceful cluster leave + process exit |
 
 ---
@@ -108,6 +111,9 @@ Eski isimler (`netwatch_probe_*`) kaldırıldı, direkt yeni isimlere geçildi:
 | `network_probe_local_assigned` *(Phase 13)* | 1=bu node target'ı probe ediyor, 0=etmiyor (cluster atadı başkasına) |
 | `network_probe_prober_count` *(Phase 13)* | Bu target için cluster'da seçilen toplam prober sayısı |
 | `network_probe_inventory_peers` *(Phase 13)* | Gossip ile keşfedilen peer sayısı |
+| `network_probe_slo_uptime_ratio` *(SLO)* | Gerçek uptime oranı window içinde (0.0–1.0). Labels: `target_id`, `window` |
+| `network_probe_slo_error_budget_seconds` *(SLO)* | Kalan error budget saniye cinsinden (negatif = ihlal). Labels: `target_id`, `window` |
+| `network_probe_slo_breached` *(SLO)* | 1=SLO ihlali aktif, 0=budget dahilinde. Label: `target_id` |
 
 Label'lar (`local_status`, `local_latency_seconds`, `cluster_status`): `name`, `target`, `type`, `source_host`, `app_name`
 Label'lar (`local_assigned`, `prober_count`): `name`, `target`, `type` (ownership = host/app'tan bağımsız)
@@ -115,6 +121,7 @@ Diğerleri label'sız.
 
 `network_probe_prometheus_connected` `watchdog_threshold_sec: 0` (varsayılan) olduğunda daima 1 kalır.
 Cluster metrikleri yalnızca `cluster.enabled=true` iken `RegisterClusterMetrics` aracılığıyla kaydedilir — disabled durumda registry'de görünmez.
+SLO metrikleri yalnızca `slo.enabled=true` iken `RegisterSLOMetrics` aracılığıyla kaydedilir.
 
 ---
 
@@ -205,6 +212,27 @@ targets:
 
 > **Kontrat:** Aynı target'ı taşıyan tüm node'lar aynı `probe_from` listesini deklare etmelidir; aksi takdirde candidate set node'lar arasında farklılaşır ve exactly-once garantisi bozulur.
 
+**SLO Tracker:**
+
+```yaml
+slo:
+  enabled: true
+  retention_days: 90        # incidents.json'dan bu kadar gün öncesi silinir
+  slo_notify: ["ops"]       # breach alertleri için; boşsa default_notify kullanılır
+  targets:
+    - id: "db-primary"
+      target_uptime: 0.999  # 99.9%
+      window: "30d"         # 30d veya 7d veya 24h
+    - id: "api-gateway"
+      target_uptime: 0.9995
+      window: "7d"
+```
+
+- `incidents.json` dosyası `state_file` ile aynı dizinde oluşturulur
+- Açık incident'lar (EndedAt=nil) restart sonrası otomatik yeniden açılır
+- Breach alert edge-triggered'dır: bir SLO döneminde tek bir alert atılır
+- Breach düzeldiğinde `breachAlerted` flag temizlenir (bir sonraki ihlalde yeniden alert gider)
+
 **KRİTİK:** `Target.Options` asla düz alanlara dönüştürülmez. `json.RawMessage` olarak saklanır; her Checker kendi parse fonksiyonunu çağırır. Bu HTTP `expected_status` operatörleri, DNS `expected_ips`, SQL `query` gibi zengin opsiyonları korur.
 
 ---
@@ -268,6 +296,24 @@ Alert env değişkenleri (script, mail ve webhook'un tümü alır):
 | `ROOT_CAUSE` | root cause target ID; zincir varsa en derin down bağımlılık | depends_on varsa + unreachable |
 | `CASCADING_IMPACT` | bu target down kalırsa etkilenecek target ID'leri (virgülle) | depends_on varsa + unreachable |
 | `DEPENDENCY_DEPTH` | root cause'dan bu target'a hop mesafesi (0=root) | depends_on varsa + unreachable |
+| `SCOPE` | GLOBAL \| PARTIAL \| NODE_LOCAL \| STANDALONE | ✓ |
+| `CLASSIFICATION` | REAL_OUTAGE \| NETWORK_PARTITION \| LOCAL_FAILURE \| AMBIGUOUS | ✓ |
+| `CONFIDENCE` | 0.00–1.00 ondalık (ne kadar kesin olduğu) | ✓ |
+| `DOWN_NODES` | hard_down gören node adları (virgülle) | cluster modda + down |
+| `UP_NODES` | up gören node adları (virgülle) | cluster modda + down |
+| `OFFLINE_NODES` | cevap vermeyen alive node'lar | cluster modda, varsa |
+
+**SLO breach alertlerinde** ek env değişkenleri (`STATUS=slo_breached` ile gönderilir):
+
+| Değişken | Açıklama |
+|---|---|
+| `SLO_TARGET_UPTIME` | hedef uptime (örn. "0.9990") |
+| `SLO_ACTUAL_UPTIME` | gerçekleşen uptime (örn. "0.9981") |
+| `SLO_WINDOW` | ölçüm penceresi (örn. "30d") |
+| `SLO_DOWNTIME_MINUTES` | toplam downtime dakika cinsinden |
+| `SLO_INCIDENT_COUNT` | penceredeki toplam olay sayısı |
+| `SLO_ERROR_BUDGET_SEC` | kalan hata bütçesi saniye (negatif=ihlal) |
+| `SLO_LONGEST_INCIDENT_SEC` | en uzun olay süresi saniye |
 
 ---
 
@@ -471,6 +517,39 @@ CLI subcommand routing eklendi: `netwatch init`, `netwatch leave`, `netwatch uni
 ### ✅ Phase 13 — Distributed Probe Ownership (TAMAMLANDI)
 
 Cluster artık her node her target'ı probe etmiyor; hash + zone-aware spread ile `probe_replication_factor` adet (default 3) prober seçiyor. todo.md F6 (Active Probe Delegation, `target.probe_from`) ve todo.md F2 (minimal `/fleet/status`) entegre. Detay için `developments.md` 2026-05-11.
+
+---
+
+### ✅ todo.md P0.1 + P0.2 — Dependency Graph + Root Cause + Rich /fleet/status (TAMAMLANDI)
+
+**Dosyalar:** `internal/engine/topology.go`, `topology_test.go`, `fleet.go`, `fleet_test.go`
+
+P0.1: `depends_on` config alanı, `DependencyGraph` (cycle detection, BFS/DFS), `FindRootCause`, `CascadingImpact`, `DependencyDepth`, `TopologySnapshot`, `GET /topology`, `ROOT_CAUSE`/`CASCADING_IMPACT`/`DEPENDENCY_DEPTH` alert env. `AllPeerStates()`/`QuorumHealthy()`/`ReplicationFactor()` cluster.Manager'a eklendi.
+
+P0.2: Engine-level `FleetSnapshot` — `by_node`, `consensus_state`, `scope`, `affected_apps`, `root_cause`, `incidents[]`. Standalone + cluster her ikisinde çalışır.
+
+---
+
+### ✅ todo.md P1.3 + P1.4 — Scope Intelligence + SLO Tracker (TAMAMLANDI)
+
+**Dosyalar:** `internal/engine/scope.go`, `scope_test.go`, `slo.go`, `slo_test.go`
+
+**P1.3 — Scope Intelligence Enhancement:**
+- `DetailedScope` struct: Scope, Classification, DownNodes, UpNodes, OfflineNodes, PartitionGroups, Confidence
+- `classifyScope(targetID)` — REAL_OUTAGE (tüm node'lar down, offline yok) / NETWORK_PARTITION (mixed votes) / LOCAL_FAILURE (sadece bu node down) / AMBIGUOUS (yetersiz veri)
+- `ScopeEnv()` — `SCOPE`, `CLASSIFICATION`, `CONFIDENCE`, `DOWN_NODES`, `UP_NODES`, `OFFLINE_NODES` alert env'ini doldurur
+- `fleet.go` `FleetTarget`'a `classification` + `confidence` alanları eklendi
+- `notify.go` `computeScope` → `classifyScope` ile değiştirildi
+
+**P1.4 — SLO Tracker:**
+- `SLOConfig`, `SLOTarget` config alanları
+- `sloManager`: `incidents.json` persistence, `RecordStart`/`RecordEnd`, `PruneOldIncidents`, `ComputeSLO`
+- `loop.go` `markHardDown` → `sloRecordStart`, `markRecovered` → `sloRecordEnd` hook'ları
+- `runSLOChecker` goroutine (saatlik): breach detection, edge-triggered alert, retention pruning
+- `network_probe_slo_uptime_ratio`, `network_probe_slo_error_budget_seconds`, `network_probe_slo_breached` Prometheus metrikleri
+- `GET /slo` endpoint; `slo.enabled: false` ise 503
+
+**Tests:** `scope_test.go` 9 test, `slo_test.go` 12 test — tümü `-race` ile yeşil.
 
 ---
 

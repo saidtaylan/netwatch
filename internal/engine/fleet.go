@@ -36,17 +36,19 @@ type FleetNodeView struct {
 
 // FleetTarget is one target's entry in the fleet view.
 type FleetTarget struct {
-	Name           string                   `json:"name"`
-	TargetAddr     string                   `json:"target"`
-	Type           string                   `json:"type"`
-	ConsensusState string                   `json:"consensus_state"` // up | hard_down | soft_down | unknown
-	Scope          string                   `json:"scope,omitempty"` // GLOBAL | PARTIAL | NODE_LOCAL
-	ByNode         map[string]FleetNodeView `json:"by_node,omitempty"`
-	AffectedApps   []string                 `json:"affected_apps,omitempty"`
-	OwnerTeams     []string                 `json:"owner_teams,omitempty"`
-	RootCause      string                   `json:"root_cause,omitempty"`      // target ID of root cause
-	CascadingImpact []string                `json:"cascading_impact,omitempty"` // transitive dependents
-	DownSince      *time.Time               `json:"down_since,omitempty"`        // first hard_down seen (best-effort)
+	Name            string                   `json:"name"`
+	TargetAddr      string                   `json:"target"`
+	Type            string                   `json:"type"`
+	ConsensusState  string                   `json:"consensus_state"` // up | hard_down | soft_down | unknown
+	Scope           string                   `json:"scope,omitempty"` // GLOBAL | PARTIAL | NODE_LOCAL
+	Classification  string                   `json:"classification,omitempty"` // REAL_OUTAGE | NETWORK_PARTITION | LOCAL_FAILURE | AMBIGUOUS
+	Confidence      float64                  `json:"confidence,omitempty"`     // 0.0–1.0
+	ByNode          map[string]FleetNodeView `json:"by_node,omitempty"`
+	AffectedApps    []string                 `json:"affected_apps,omitempty"`
+	OwnerTeams      []string                 `json:"owner_teams,omitempty"`
+	RootCause       string                   `json:"root_cause,omitempty"`       // target ID of root cause
+	CascadingImpact []string                 `json:"cascading_impact,omitempty"` // transitive dependents
+	DownSince       *time.Time               `json:"down_since,omitempty"`       // first hard_down seen (best-effort)
 }
 
 // FleetSummarySection is the rollup count section.
@@ -200,16 +202,24 @@ func (e *Engine) FleetSnapshot() FleetSnapshot {
 			}
 		}
 
+		var classification string
+		var confidence float64
+
 		switch {
 		case softDown:
 			consensusState = "soft_down"
 			summary.SoftDown++
 			scope = "NODE_LOCAL"
+			classification = "LOCAL_FAILURE"
+			confidence = 1.0
 		case localKnown && localPS.State == "hard_down":
-			// Check if all peers also see it as hard_down (GLOBAL) or only this node.
+			// Use classifyScope for richer GLOBAL/PARTIAL/NODE_LOCAL + classification.
+			ds := e.classifyScope(key)
 			consensusState = "hard_down"
 			summary.HardDown++
-			scope = e.computeScope(key, true)
+			scope = ds.Scope
+			classification = ds.Classification
+			confidence = ds.Confidence
 		case localKnown && localPS.State == "up":
 			consensusState = "up"
 			summary.Up++
@@ -244,6 +254,8 @@ func (e *Engine) FleetSnapshot() FleetSnapshot {
 			Type:            t.Type,
 			ConsensusState:  consensusState,
 			Scope:           scope,
+			Classification:  classification,
+			Confidence:      confidence,
 			AffectedApps:    affectedApps,
 			OwnerTeams:      ownerTeams,
 			RootCause:       rootCause,

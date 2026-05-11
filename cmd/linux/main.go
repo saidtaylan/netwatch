@@ -88,6 +88,9 @@ func main() {
 	if e.ClusterManager() != nil {
 		engine.RegisterClusterMetrics(reg)
 	}
+	if e.SLOEnabled() {
+		engine.RegisterSLOMetrics(reg)
+	}
 
 	mux := http.NewServeMux()
 
@@ -169,6 +172,24 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(e.FleetSnapshot()); err != nil {
 			slog.Error("fleet status encode error", "err", err)
+		}
+	})
+
+	// /slo returns SLO metrics for all configured SLO targets: uptime ratio,
+	// error budget, incident history, and breach status.
+	// Returns 503 when slo.enabled is false.
+	mux.HandleFunc("/slo", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		snap := e.SLOSnapshot()
+		if snap == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "SLO tracking not enabled (set slo.enabled: true in config)",
+			})
+			return
+		}
+		if err := json.NewEncoder(w).Encode(snap); err != nil {
+			slog.Error("slo encode error", "err", err)
 		}
 	})
 

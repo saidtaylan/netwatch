@@ -207,6 +207,10 @@ type Config struct {
 	// Cluster holds gossip cluster settings. When Cluster.Enabled is false
 	// (the default) the entire cluster layer is a no-op.
 	Cluster cluster.Config `json:"cluster,omitempty"`
+
+	// SLO holds the SLO tracking configuration.
+	// When nil or Enabled=false, incident tracking and /slo are disabled.
+	SLO *SLOConfig `json:"slo,omitempty"`
 }
 
 func (c Config) globalMaxRetries() int {
@@ -579,6 +583,10 @@ type Engine struct {
 	// nil when no target declares any dependencies (most configs). Guarded by mu.
 	topoGraph *DependencyGraph
 
+	// sloMgr manages incident history and SLO budget calculation.
+	// nil when slo.enabled is false (the default).
+	sloMgr *sloManager
+
 	// Suppress repeated credential-load log entries.
 	credLogged bool
 }
@@ -743,6 +751,12 @@ func (e *Engine) Shutdown() {
 // Exposed so cmd/linux/main.go can serve the /cluster/state endpoint.
 func (e *Engine) ClusterManager() *cluster.Manager {
 	return e.clusterMgr
+}
+
+// SLOEnabled reports whether the SLO tracker is active.
+// Used by cmd/linux/main.go to decide whether to register SLO metrics.
+func (e *Engine) SLOEnabled() bool {
+	return e.sloMgr != nil
 }
 
 // LoadConfig reads the config file, resolves variables, validates, and hot-swaps.
@@ -1069,6 +1083,17 @@ func (e *Engine) Init() error {
 	// Only started when cluster is enabled.
 	if e.clusterMgr != nil {
 		go e.runClusterMetricsUpdater(rootCtx)
+	}
+
+	// SLO tracker: persists incident history, checks breaches hourly.
+	// Disabled when slo.enabled is false (the default).
+	e.mu.RLock()
+	sloCfg := e.cfg.SLO
+	stateFilePath := e.cfg.StateFile
+	e.mu.RUnlock()
+	if sloCfg != nil && sloCfg.Enabled {
+		e.sloMgr = newSLOManager(stateFilePath)
+		go e.runSLOChecker(rootCtx)
 	}
 
 	// Phase 13: pre-seed the cluster's proberAssignments map so the first
