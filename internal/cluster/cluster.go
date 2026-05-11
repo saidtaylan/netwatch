@@ -354,7 +354,12 @@ func (e *eventDelegate) NotifyJoin(node *memberlist.Node) {
 		// Re-broadcast this node's target states so the new peer can learn
 		// our inventory. Gossip broadcasts are UDP (fire-and-forget) so the
 		// new node may have missed the original bootstrap and probe broadcasts.
-		if h := e.mgr.inventoryRefreshHandler; h != nil {
+		// Read inventoryRefreshHandler under mu to avoid a data race with
+		// SetInventoryRefreshHandler() which writes under mu.Lock().
+		e.mgr.mu.RLock()
+		h := e.mgr.inventoryRefreshHandler
+		e.mgr.mu.RUnlock()
+		if h != nil {
 			h.BroadcastInventory()
 		}
 	}()
@@ -557,7 +562,11 @@ func New(cfg Config) (*Manager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cluster create: %w", err)
 	}
+	// Assign under ringMu so that any concurrent updateRing() goroutine spawned
+	// by the NotifyJoin callback during Create() sees a consistent list pointer.
+	m.ringMu.Lock()
 	m.list = list
+	m.ringMu.Unlock()
 
 	// Seed the ring with the local node before joining peers.
 	m.updateRing()
@@ -790,7 +799,11 @@ func (m *Manager) NodeName() string { return m.cfg.NodeName }
 
 // updateRing rebuilds the sorted alive-member list from the current memberlist
 // state. Called by eventDelegate on every Join/Leave/Update and once in New().
+// Holds ringMu for the full function body so that the m.list nil check and the
+// ring update are atomic with respect to New()'s list assignment.
 func (m *Manager) updateRing() {
+	m.ringMu.Lock()
+	defer m.ringMu.Unlock()
 	if m.list == nil {
 		return
 	}
@@ -802,10 +815,7 @@ func (m *Manager) updateRing() {
 		}
 	}
 	sort.Strings(names)
-
-	m.ringMu.Lock()
 	m.ring = names
-	m.ringMu.Unlock()
 }
 
 // hashTarget returns a stable FNV-32a hash of targetID.
