@@ -340,7 +340,12 @@ func (e *eventDelegate) NotifyJoin(node *memberlist.Node) {
 	// updateRing calls list.Members() which acquires nodeLock.RLock.
 	// memberlist calls NotifyJoin while holding nodeLock.WLock, so calling
 	// list.Members() here would deadlock. Run asynchronously instead.
-	go e.mgr.updateRing()
+	go func() {
+		e.mgr.updateRing()
+		// Phase 13: a new member changes the candidate sets — schedule a
+		// debounced recompute so probe loops can be reassigned.
+		e.mgr.scheduleRecompute()
+	}()
 }
 
 func (e *eventDelegate) NotifyLeave(node *memberlist.Node) {
@@ -351,12 +356,20 @@ func (e *eventDelegate) NotifyLeave(node *memberlist.Node) {
 		delete(e.mgr.peerStates, nodeName)
 		e.mgr.mu.Unlock()
 		e.mgr.updateRing()
+		// Phase 13: removing a member may force this node into the prober
+		// set for some target it previously left to a now-gone peer.
+		e.mgr.scheduleRecompute()
 	}()
 }
 
 func (e *eventDelegate) NotifyUpdate(node *memberlist.Node) {
 	slog.Debug("cluster member updated", "node", node.Name)
-	go e.mgr.updateRing()
+	go func() {
+		e.mgr.updateRing()
+		// NodeMeta (zone) may have changed — recompute could yield different
+		// zone-aware picks. Cheap enough to schedule on every update.
+		e.mgr.scheduleRecompute()
+	}()
 }
 
 // ── Manager ───────────────────────────────────────────────────────────────────
@@ -422,6 +435,25 @@ type Manager struct {
 	// candidate sets before its first state broadcast. nil until
 	// SetLocalTargetProvider is called. Protected by mu.
 	localTargetProvider LocalTargetProvider
+
+	// assignmentListener receives StartProbing / StopProbing callbacks when
+	// this node's prober responsibilities change. Set via
+	// SetProberAssignmentListener. nil → no callbacks emitted. Protected by mu.
+	assignmentListener ProberAssignmentListener
+
+	// proberAssignments caches the result of the last recomputeProberAssignments
+	// pass: targetID → "this node is one of the probers". Used to diff
+	// against the new desired set so only changed targets get callbacks.
+	// Protected by mu.
+	proberAssignments map[string]bool
+
+	// recomputeMu protects recomputeTimer. Separate from m.mu so timer resets
+	// from gossip event handlers do not contend with the much hotter peerStates
+	// lock.
+	recomputeMu sync.Mutex
+	// recomputeTimer is the debounce timer scheduleRecompute resets on every
+	// membership / inventory event. nil until the first call.
+	recomputeTimer *time.Timer
 
 	// ── Test-only overrides ────────────────────────────────────────────────
 	// These are populated exclusively by testhelpers.go's SetTestAliveSet /
@@ -603,6 +635,12 @@ func (m *Manager) OnStateReceived(p GossipPayload) {
 	accepted := !ok || p.Seq > existing.Seq ||
 		(p.Seq == existing.Seq && p.NodeName > existing.NodeName)
 
+	// A brand-new (node, target) combination grows the candidate set for that
+	// target — Phase 13 schedules a recompute so probe loops can rebalance.
+	// State value transitions on an existing entry do NOT trigger recompute
+	// (they would defeat the debounce on busy clusters).
+	isNewEntry := !ok && accepted
+
 	if accepted {
 		m.peerStates[p.NodeName][p.TargetID] = p
 		slog.Debug("cluster state accepted",
@@ -632,6 +670,12 @@ func (m *Manager) OnStateReceived(p GossipPayload) {
 		slog.Debug("cluster: peer-alert dispatch (no local probe)",
 			"target", p.TargetID, "from", p.NodeName, "seq", p.Seq)
 		go handler.DispatchPeerAlert(p)
+	}
+
+	// Schedule recompute outside the lock — debounced, so a burst of new
+	// gossip entries during anti-entropy only triggers one recompute pass.
+	if isNewEntry {
+		m.scheduleRecompute()
 	}
 }
 
@@ -809,6 +853,14 @@ func (m *Manager) Leave(timeout time.Duration) error {
 	if m.stopQuorum != nil {
 		m.stopQuorum()
 	}
+	// Cancel any pending recompute so listener callbacks are not invoked
+	// against an engine that is also shutting down.
+	m.recomputeMu.Lock()
+	if m.recomputeTimer != nil {
+		m.recomputeTimer.Stop()
+		m.recomputeTimer = nil
+	}
+	m.recomputeMu.Unlock()
 	if m.list == nil {
 		return nil
 	}

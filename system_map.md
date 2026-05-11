@@ -209,12 +209,13 @@ UP ──→ SOFT_DOWN   enqueue() — probe fail
 │   ├── appinfo.go           # var BinaryName = "netwatch" (ldflags ile override edilebilir)
 │   └── cluster/             # Gossip cluster katmanı (Phase 6–9)
 │       ├── cluster.go       # Config (Zone, ProbeReplicationFactor dahil), GossipPayload, AntiEntropyProvider, Manager, hash ring, quorum, NodeMeta (zone)
-│       ├── probers.go       # LocalTargetProvider, CandidatesFor, SelectProbers, IsLocalProber, zoneAwarePick (3-tier)
+│       ├── probers.go       # LocalTargetProvider, ProberAssignmentListener, CandidatesFor, SelectProbers, IsLocalProber, zoneAwarePick (3-tier), recomputeProberAssignments, scheduleRecompute (debounce), SeedProberAssignments
 │       ├── testhelpers.go   # NewTestManager, SetIsolated, SetPeerState, SetTestAliveSet, SetTestZones
 │       ├── cluster_test.go  # Hash ring, quorum, IsolatedMode, PeerStatesForTarget testleri
 │       ├── antientropy_test.go    # LocalState/MergeRemoteState dispatch, mockProvider testleri
 │       ├── phase13_config_test.go  # Config validation, NodeMeta, zoneOf
-│       └── phase13_probers_test.go # CandidatesFor, hashCandidateOrder, zoneAwarePick, SelectProbers, IsLocalProber
+│       ├── phase13_probers_test.go # CandidatesFor, hashCandidateOrder, zoneAwarePick, SelectProbers, IsLocalProber, ProbeFrom
+│       └── phase13_recompute_test.go # recomputeProberAssignments, Seed, scheduleRecompute debounce
 ├── notifications/           # Alert scriptleri (.sh / .ps1) buraya konur
 ├── config.yaml              # Örnek config — tüm alanlar açıklamalı
 ├── go.mod                   # Module: github.com/saidtaylan/netwatch, go 1.25.7
@@ -278,10 +279,14 @@ UP ──→ SOFT_DOWN   enqueue() — probe fail
 | `CandidatesFor()` *(Phase 13)* | Verilen targetID için peerStates + local config'den candidate node listesi; ProbeFrom constraint varsa kesişim alır |
 | `SelectProbers()` *(Phase 13)* | Hash ring + 3-tier zone-aware picker ile prober subset (factor adet) |
 | `IsLocalProber()` *(Phase 13)* | Bu node verilen target için probe etmekle yükümlü mü |
-| `ProberAssignmentListener` *(Phase 13)* | Interface: `StartProbing()`, `StopProbing()` — Engine bunu implement eder |
+| `ProberAssignmentListener` *(Phase 13)* | Interface: `StartProbing()`, `StopProbing()` — Engine implement eder; cluster recompute sonrası diff'ten callback gelir |
 | `LocalTargetProvider` *(Phase 13)* | Interface: `LocalTargets()` + `ProbeFromConstraint(targetID)` — Engine implement eder |
 | `NodeMeta` *(Phase 13)* | Memberlist built-in: zone bilgisi tüm node'lara otomatik dağıtılır |
 | `bootstrapInventoryBroadcast()` *(Phase 13)* | Engine'de: Init + Reload sonrası her local target için 1 presence broadcast |
+| `recomputeProberAssignments()` *(Phase 13)* | Manager'da: local target başına `IsLocalProber` hesapla, önceki snapshot ile diff al, transition'larda Start/Stop dispatch |
+| `scheduleRecompute()` *(Phase 13)* | 5sn debounce timer; NotifyJoin/Leave/Update + yeni peerStates entry'sinde tetiklenir; membership flapping'i kasırgaya çevirmez |
+| `TriggerProberRecompute()` *(Phase 13)* | Engine.Reload bunu çağırır — local target listesi değişince debounce'u beklemeden sync recompute |
+| `SeedProberAssignments()` *(Phase 13)* | Engine.Init bunu çağırır — probe loop'lar başlatıldıktan sonra cluster'a "bunlar zaten çalışıyor" deyip ilk reactive recompute'u sessizleştirir |
 
 ### Prometheus Metrics
 

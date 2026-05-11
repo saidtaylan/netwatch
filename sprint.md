@@ -652,10 +652,9 @@ Yeni model'de primary genelde prober subset içinde olduğu için bu yol nadir t
 ✅ Step 2: NodeMeta üzerinden zone propagation (gossipDelegate.NodeMeta)     (commit fd33b10)
 ✅ Step 3: CandidatesFor (peerStates derivation) + LocalTargetProvider interface  (commit cabd6bb)
 ✅ Step 4: SelectProbers + zone-aware picker (3-tier) + unit testler          (commit cabd6bb)
-✅ Step 5: Bootstrap broadcast + Active Probe Delegation (todo.md F6 entegre)
-   Step 5: Bootstrap broadcast (Init + Reload sonrası N target × 1 state broadcast)
-   Step 6: ProberAssignmentListener interface + engine StartProbing/StopProbing entegrasyonu
-   Step 7: Reactive recompute + 5sn debounce (NotifyJoin/Leave/Update)
+✅ Step 5: Bootstrap broadcast + Active Probe Delegation (todo.md F6 entegre)  (commit 5826737)
+✅ Step 6: ProberAssignmentListener interface + engine StartProbing/StopProbing entegrasyonu
+✅ Step 7: Reactive recompute + 5sn debounce (NotifyJoin/Leave/Update)
    Step 8: /cluster/probers endpoint + metrikler
    Step 9: Phase 9 anti-entropy ile uyum doğrulama (syncing guard)
    Step 10: Integration test (3-tier zone senaryoları + 5-6 node)

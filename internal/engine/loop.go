@@ -26,7 +26,17 @@ type PendingEntry struct {
 
 // startProbeLoop launches a goroutine that probes t on its configured interval.
 // Calling this again for the same target.key() cancels the previous goroutine first.
+//
+// Phase 13: when the cluster layer is active, the loop is started only if
+// this node is currently in the prober subset for the target. Non-prober
+// nodes still consume gossip but do not generate probe load. Standalone mode
+// (clusterMgr nil) always starts the loop — the single node owns every target.
 func (e *Engine) startProbeLoop(t Target) {
+	if e.clusterMgr != nil && !e.clusterMgr.IsLocalProber(t.key()) {
+		slog.Debug("probe loop skipped: not a prober",
+			"target", t.key(), "node", e.hostname)
+		return
+	}
 	e.probesMu.Lock()
 	if cancel, ok := e.probeCancel[t.key()]; ok {
 		cancel()
@@ -465,4 +475,12 @@ func (e *Engine) Reload() {
 	// (and re-affirm existing ones). bootstrapInventoryBroadcast is a no-op
 	// when the cluster layer is disabled.
 	e.bootstrapInventoryBroadcast()
+
+	// Phase 13: synchronously recompute prober assignments. LocalTargets()
+	// just changed, so candidate sets must be rebuilt before the next probe
+	// cycle decides what to run. TriggerProberRecompute is a no-op when no
+	// listener / provider is wired (standalone mode).
+	if e.clusterMgr != nil {
+		e.clusterMgr.TriggerProberRecompute()
+	}
 }

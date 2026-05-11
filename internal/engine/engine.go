@@ -961,6 +961,10 @@ func (e *Engine) Init() error {
 		// this node before the first state broadcast, and lets ProbeFrom
 		// constraints flow into the candidate set filter.
 		e.clusterMgr.SetLocalTargetProvider(e)
+		// Wire prober assignment listener (Phase 13 step 6): the cluster
+		// layer will call StartProbing / StopProbing as membership changes
+		// shift prober responsibilities on and off this node.
+		e.clusterMgr.SetProberAssignmentListener(e)
 		// Announce presence for every locally configured target so peers can
 		// populate their candidate sets immediately. Cheap one-shot — see
 		// bootstrapInventoryBroadcast.
@@ -1004,7 +1008,23 @@ func (e *Engine) Init() error {
 		go e.runClusterMetricsUpdater(rootCtx)
 	}
 
-	// Start a probe goroutine for each active target.
+	// Phase 13: pre-seed the cluster's proberAssignments map so the first
+	// reactive recompute does not see "all assignments new" and needlessly
+	// cancel-and-restart every probe loop we are about to launch below.
+	if e.clusterMgr != nil {
+		initial := make(map[string]bool, len(targets))
+		for _, t := range targets {
+			if t.active() {
+				initial[t.key()] = e.clusterMgr.IsLocalProber(t.key())
+			}
+		}
+		e.clusterMgr.SeedProberAssignments(initial)
+	}
+
+	// Start a probe goroutine for each active target. startProbeLoop is itself
+	// Phase 13-aware: when the cluster has not selected this node as a prober
+	// for the target it returns early, so only the assigned subset actually
+	// runs.
 	for _, t := range targets {
 		if t.active() {
 			e.startProbeLoop(t)
@@ -1142,6 +1162,40 @@ func (e *Engine) shouldAlert(targetID string) bool {
 }
 
 // ── LocalTargetProvider (cluster.LocalTargetProvider) ────────────────────────
+
+// StartProbing implements cluster.ProberAssignmentListener. Called by the
+// cluster layer after a recompute determines this node should now probe
+// targetID. Looks up the target in the current config and runs startProbeLoop;
+// disabled or removed targets are silently ignored (the listener may briefly
+// reference a target that has just been removed by a concurrent Reload).
+func (e *Engine) StartProbing(targetID string) {
+	e.mu.RLock()
+	var found *Target
+	for i := range e.cfg.Targets {
+		if e.cfg.Targets[i].key() == targetID && e.cfg.Targets[i].active() {
+			t := e.cfg.Targets[i]
+			found = &t
+			break
+		}
+	}
+	e.mu.RUnlock()
+	if found == nil {
+		return
+	}
+	slog.Info("probe loop started by cluster assignment",
+		"target", found.key(), "node", e.hostname)
+	e.startProbeLoop(*found)
+}
+
+// StopProbing implements cluster.ProberAssignmentListener. Called by the
+// cluster layer when this node is no longer in the prober subset for
+// targetID. Cancels the probe goroutine if one is running; harmless when
+// none exists.
+func (e *Engine) StopProbing(targetID string) {
+	slog.Info("probe loop stopped by cluster assignment",
+		"target", targetID, "node", e.hostname)
+	e.stopProbeLoop(targetID)
+}
 
 // LocalTargets implements cluster.LocalTargetProvider. Returns the set of
 // target keys currently configured on this node — used by the cluster layer's

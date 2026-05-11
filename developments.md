@@ -18,6 +18,43 @@ Bu belge, netwatch projesinin günlük güncellemelerini ve teknik detaylarını
 
 ## 2026-05-11
 
+- [backend] [altyapi] **Phase 13 Step 6–7 tamamlandı: Dinamik probe loop atama + 5sn debounce'lu reactive recompute. Davranış değişikliği aktif: artık hash + zone seçimi gerçekten probe loop'larını başlatıp durduruyor.**
+
+  **Step 6 — `ProberAssignmentListener` interface + engine entegrasyonu:** Cluster paketine yeni `ProberAssignmentListener` interface'i eklendi (`StartProbing(targetID)` + `StopProbing(targetID)`). Engine bu interface'i implement ediyor: cluster'dan gelen callback'lere lookup yapıp ilgili target'ın probe goroutine'ini başlatıyor veya iptal ediyor. `Manager.recomputeProberAssignments` her local target için `IsLocalProber` hesaplayıp önceki `proberAssignments` snapshot'ı ile diff alıyor; sadece transition'lar için callback fırlatıyor (idempotent recompute = sessiz). Stop'lar start'lardan önce çağrılıyor → swap senaryolarında overlap minimize edilmiş.
+
+  `startProbeLoop` artık `clusterMgr != nil && !IsLocalProber(...)` durumunda erken return ediyor. Standalone moda dokunulmadı: clusterMgr nil → her zaman probe.
+
+  `Init` flow'u yeniden düzenlendi: cluster setup → `SetLocalTargetProvider` + `SetProberAssignmentListener` + `bootstrapInventoryBroadcast` → her aktif target için `IsLocalProber` hesaplayıp `SeedProberAssignments` ile cluster'a "bunlar zaten çalışıyor" diye seed ediliyor. Sonra `startProbeLoop` çağrıları yapılıyor (filtered by IsLocalProber içeriden). Bu sayede ilk reactive recompute (5s sonra peer broadcast'ları gelince) gereksiz Start/Stop callback'leri üretmiyor.
+
+  `Reload` sonuna `TriggerProberRecompute` eklendi — local target listesi değiştiğinde sync recompute, debounce'u beklemeden.
+
+  **Step 7 — Reactive recompute + debounce:** `Manager.scheduleRecompute` 5sn'lik debounce timer kullanıyor. `time.AfterFunc` ile arm/reset. Hook'lar:
+  - `eventDelegate.NotifyJoin` — yeni üye eklendi, candidate set değişebilir
+  - `eventDelegate.NotifyLeave` — üye ayrıldı, prober devralma gerekebilir
+  - `eventDelegate.NotifyUpdate` — NodeMeta (zone) değişmiş olabilir, zone-aware picker farklı sonuç verebilir
+  - `OnStateReceived` — sadece **yeni** `(node, targetID)` entry'sinde (state value transition değil); aksi takdirde busy cluster'da timer hiç fire olmazdı
+
+  `Leave` çağrısında timer durduruluyor (goroutine leak önlemi).
+
+  **Debounce mantığı:** 50 schedule call'u tek bir recompute'a düşüyor (test ile doğrulandı). Membership flapping veya anti-entropy burst'lerinde sürekli start/stop kasırgası olmuyor.
+
+  **Test sonuçları:** 9 yeni cluster testi (`phase13_recompute_test.go`):
+  - `Recompute`: idempotent silence, prober transition, target removed, stop-before-start ordering, nil listener safety, nil provider safety
+  - `Seed`: redundant-start suppression, defensive copy
+  - `ScheduleRecompute`: burst collapse (50→1)
+
+  Tüm cluster + engine testleri `-race` ile yeşil.
+
+  **Davranış değişikliği yansıması:** Artık 5+ node'lu cluster'da bir target için sadece factor (default 3) adet probe goroutine çalışıyor. Tek başına config'inde target'ı olan ama hash/zone tarafından seçilmemiş node'lar sessiz dinleyici durumunda. Operatör hiçbir şey değiştirmedi — Phase 13'ün vaadi tutuldu.
+
+  - **Değiştirildi**: `internal/cluster/cluster.go` — `Manager` struct'ına `assignmentListener`, `proberAssignments`, `recomputeMu`, `recomputeTimer` field'ları; `eventDelegate` NotifyJoin/Leave/Update sonuna `scheduleRecompute`; `OnStateReceived` içine `isNewEntry` track + lock sonrası `scheduleRecompute`; `Leave` içinde timer durdurma
+  - **Değiştirildi**: `internal/cluster/probers.go` — `ProberAssignmentListener` interface; `SetProberAssignmentListener`; `recomputeProberAssignments` (diff-based callback dispatch); `TriggerProberRecompute` (sync API); `SeedProberAssignments` (init için); `scheduleRecompute` (debounce); `recomputeDebounce = 5s` sabit
+  - **Değiştirildi**: `internal/engine/engine.go` — `Engine.StartProbing(targetID)` + `StopProbing(targetID)` metodları (cluster.ProberAssignmentListener); `Init` cluster setup içine `SetProberAssignmentListener` + probe loop başlatmadan önce `SeedProberAssignments`
+  - **Değiştirildi**: `internal/engine/loop.go` — `startProbeLoop` Phase 13 guard (cluster + !IsLocalProber → erken return); `Reload` sonuna `TriggerProberRecompute`
+  - **Oluşturuldu**: `internal/cluster/phase13_recompute_test.go` — 9 unit test + `recordingListener` test helper + `drain()` utility
+
+---
+
 - [backend] [altyapi] **Phase 13 Step 5 tamamlandı: Bootstrap broadcast + todo.md F6 (Active Probe Delegation) entegre edildi.**
 
   **Bootstrap broadcast:** Engine artık `cluster.LocalTargetProvider` interface'ini implement ediyor. `Init()` cluster setup'tan sonra `SetLocalTargetProvider(e)` + `bootstrapInventoryBroadcast()` çağırıyor. Her aktif local target için bir `GossipPayload` yayınlanıyor — `state.json`'da kayıt varsa onu, yoksa `state="unknown"`, `seq=0` ile presence announcement. computeScope ve peer-alert path'i "unknown" state'i ignore ettiği için bu mesajlar benign; ilk gerçek probe seq>=1 ile Lamport üzerinden eziyor. `Reload()` sonrası da çağrılıyor → yeni target'lar cluster'a duyuruluyor.

@@ -14,9 +14,16 @@ package cluster
 
 import (
 	"sort"
+	"time"
 
 	"github.com/hashicorp/memberlist"
 )
+
+// recomputeDebounce is the quiet window scheduleRecompute waits for after the
+// last membership / gossip event before firing recomputeProberAssignments.
+// 5 s absorbs the typical NotifyJoin burst during cluster startup without
+// being so long that operators notice probe-loop reshuffles.
+const recomputeDebounce = 5 * time.Second
 
 // ── LocalTargetProvider ──────────────────────────────────────────────────────
 
@@ -52,6 +59,137 @@ func (m *Manager) SetLocalTargetProvider(p LocalTargetProvider) {
 	m.mu.Lock()
 	m.localTargetProvider = p
 	m.mu.Unlock()
+}
+
+// ── ProberAssignmentListener ────────────────────────────────────────────────
+
+// ProberAssignmentListener is implemented by the engine to react when this
+// node's prober responsibilities change. The cluster layer calls these
+// callbacks after recomputeProberAssignments determines a difference between
+// the previous and the current "should this node probe targetID?" answer.
+//
+// Both callbacks must be cheap and non-blocking — they run on the cluster's
+// recompute path. Engine.StartProbing should just call startProbeLoop;
+// StopProbing should call stopProbeLoop.
+type ProberAssignmentListener interface {
+	StartProbing(targetID string)
+	StopProbing(targetID string)
+}
+
+// SetProberAssignmentListener registers the engine callback used to start
+// and stop probe loops as cluster membership and assignment changes.
+// Call it once during Engine.Init after SetLocalTargetProvider.
+func (m *Manager) SetProberAssignmentListener(l ProberAssignmentListener) {
+	m.mu.Lock()
+	m.assignmentListener = l
+	m.mu.Unlock()
+}
+
+// recomputeProberAssignments diffs the current prober status for every local
+// target against the last computed assignments, and emits StartProbing /
+// StopProbing callbacks to bring the engine into sync.
+//
+// It is safe to call concurrently — every invocation takes a snapshot of the
+// current LocalTargetProvider output and the current assignments map. The
+// listener callbacks are invoked outside the lock to keep the cluster mutex
+// from being held during engine work.
+//
+// Called by scheduleRecompute after a 5s debounce on membership changes,
+// and synchronously by TriggerProberRecompute on demand (e.g. from Reload).
+func (m *Manager) recomputeProberAssignments() {
+	m.mu.RLock()
+	provider := m.localTargetProvider
+	listener := m.assignmentListener
+	m.mu.RUnlock()
+
+	if provider == nil || listener == nil {
+		return
+	}
+
+	localIDs := provider.LocalTargets()
+	desired := make(map[string]bool, len(localIDs))
+	for _, id := range localIDs {
+		desired[id] = m.IsLocalProber(id)
+	}
+
+	var toStart, toStop []string
+	m.mu.Lock()
+	if m.proberAssignments == nil {
+		m.proberAssignments = make(map[string]bool)
+	}
+	prev := m.proberAssignments
+	// New / changed assignments
+	for id, isProber := range desired {
+		was, existed := prev[id]
+		switch {
+		case isProber && (!existed || !was):
+			toStart = append(toStart, id)
+		case !isProber && existed && was:
+			toStop = append(toStop, id)
+		}
+	}
+	// Targets that disappeared from local config — stop them if they were running.
+	for id, was := range prev {
+		if _, stillLocal := desired[id]; !stillLocal && was {
+			toStop = append(toStop, id)
+		}
+	}
+	// Persist only the targets currently in local config so the map does not
+	// grow without bound across config reloads.
+	m.proberAssignments = desired
+	m.mu.Unlock()
+
+	// Stop first, then start — minimises overlap when a target moves between
+	// the prober set and the listener set during the same recompute.
+	for _, id := range toStop {
+		listener.StopProbing(id)
+	}
+	for _, id := range toStart {
+		listener.StartProbing(id)
+	}
+}
+
+// TriggerProberRecompute runs recomputeProberAssignments synchronously and
+// outside the debounce. Use it after operations that change local state in a
+// way the cluster cannot observe via gossip — primarily Engine.Reload, which
+// rewrites LocalTargetProvider's view of the config.
+func (m *Manager) TriggerProberRecompute() {
+	m.recomputeProberAssignments()
+}
+
+// SeedProberAssignments installs an initial assignment map without firing
+// listener callbacks. Engine.Init uses it to mark "these probe loops are
+// already running" so the first reactive recompute does not produce a flood
+// of redundant StartProbing calls (which would needlessly cancel-and-restart
+// every active goroutine).
+//
+// The caller owns the input map; SeedProberAssignments copies it.
+func (m *Manager) SeedProberAssignments(initial map[string]bool) {
+	clone := make(map[string]bool, len(initial))
+	for k, v := range initial {
+		clone[k] = v
+	}
+	m.mu.Lock()
+	m.proberAssignments = clone
+	m.mu.Unlock()
+}
+
+// scheduleRecompute resets a 5-second debounce timer that triggers
+// recomputeProberAssignments. Calling it repeatedly within the window only
+// delays the eventual recompute — useful when a burst of NotifyJoin events
+// arrives during cluster startup.
+//
+// To prevent indefinite postponement under continuous gossip traffic, callers
+// should be selective about when they call this — see eventDelegate (only on
+// real membership transitions) and OnStateReceived (only on NEW (node,target)
+// entries, not on state value updates).
+func (m *Manager) scheduleRecompute() {
+	m.recomputeMu.Lock()
+	defer m.recomputeMu.Unlock()
+	if m.recomputeTimer != nil {
+		m.recomputeTimer.Stop()
+	}
+	m.recomputeTimer = time.AfterFunc(recomputeDebounce, m.recomputeProberAssignments)
 }
 
 // ── Candidate set derivation ────────────────────────────────────────────────
