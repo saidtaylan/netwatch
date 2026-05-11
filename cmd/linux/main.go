@@ -113,6 +113,15 @@ func main() {
 		}
 	})
 
+	// /topology returns the target dependency graph (depends_on relationships).
+	// Useful for understanding root-cause chains and cascading impact.
+	mux.HandleFunc("/topology", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(e.TopologySnapshot()); err != nil {
+			slog.Error("topology encode error", "err", err)
+		}
+	})
+
 	// /cluster/state returns membership and per-node target states.
 	mux.HandleFunc("/cluster/state", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -153,17 +162,12 @@ func main() {
 	// summary-only — per-target detail lives in /cluster/state and
 	// /cluster/probers. DownTargets is capped at FleetDownTargetsCap to
 	// keep the payload bounded.
+	// /fleet/status returns the rich engine-level fleet view: per-target
+	// consensus state, scope, by-node breakdown, affected apps, root cause,
+	// and active incidents. Works in both standalone and cluster mode.
 	mux.HandleFunc("/fleet/status", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		mgr := e.ClusterManager()
-		if mgr == nil {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"error": "cluster not enabled (set cluster.enabled: true in config)",
-			})
-			return
-		}
-		if err := json.NewEncoder(w).Encode(mgr.FleetSummarySnapshot()); err != nil {
+		if err := json.NewEncoder(w).Encode(e.FleetSnapshot()); err != nil {
 			slog.Error("fleet status encode error", "err", err)
 		}
 	})

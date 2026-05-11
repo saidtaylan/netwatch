@@ -51,6 +51,8 @@ internal/engine/          ← business logic paketi
   loop.go                 # Per-target probe goroutine, retry loop, state machine + broadcastState()
   notify.go               # Alerter interface, kanal yönlendirme, sendAlert
   app.go                  # App struct, AppTargetIndex, buildAppTargetIndex, validateApps
+  topology.go             # DependencyGraph, buildDependencyGraph, FindRootCause, CascadingImpact, TopologySnapshot
+  fleet.go                # FleetSnapshot — rich /fleet/status: per-target detail, scope, apps, root cause, incidents
   webhook.go              # WebhookAlerter (generic + alertmanager format)
   watchdog.go             # Prometheus scrape watchdog goroutine + NotifyScrape()
   mail.go                 # SMTP alerter (multipart/alternative, HTML body)
@@ -84,7 +86,8 @@ config.yaml               # Canlı config (sample — içinde açıklamalar var)
 | `GET /status` | Tüm target'ların JSON durumu: name, status, seq, error_code |
 | `GET /cluster/state` | Cluster üyeleri + peer target durumları (raw); cluster kapalıysa 503 |
 | `GET /cluster/probers` | **Phase 13:** Her target için seçilen prober subset + primary + candidate seti + `probe_from` constraint'i + zone'larla üye listesi |
-| `GET /fleet/status` | **Phase 13:** Cluster-wide özet (zone'lu üyeler, quorum/isolated, target count rollup, down target ID listesi — cap 100); per-target detay yok |
+| `GET /fleet/status` | Rich engine-level fleet view: per-target consensus state, scope, by-node breakdown, affected apps, root cause, cascading impact, active incidents. Standalone modda da çalışır (cluster=nil). |
+| `GET /topology` | Target dependency graph (depends_on ilişkileri): her target için direct deps, reverse deps, transitive cascading impact. |
 | `POST /cluster/leave` | Graceful cluster leave + process exit |
 
 ---
@@ -157,6 +160,8 @@ targets:
     name: "display-name"
     notify: ["kanal-adi"]     # opsiyonel; yoksa default_notify
     options: {}               # tip'e özgü, json.RawMessage olarak saklanır
+    depends_on:               # opsiyonel; root-cause detection için bağımlılık listesi
+      - "other-target-id"     # cyclic refs ve bilinmeyen ID'ler config yükleme hatası verir
 
 apps:                         # opsiyonel; yoksa eski davranış korunur
   - name: "payment-gateway"
@@ -260,6 +265,9 @@ Alert env değişkenleri (script, mail ve webhook'un tümü alır):
 | `ERROR_CODE` | son probe hata metni; recovery'de boş | ✓ |
 | `AFFECTED_APPS` | virgülle ayrılmış app isimleri | apps varsa |
 | `OWNER_TEAMS` | virgülle ayrılmış takım isimleri | apps varsa |
+| `ROOT_CAUSE` | root cause target ID; zincir varsa en derin down bağımlılık | depends_on varsa + unreachable |
+| `CASCADING_IMPACT` | bu target down kalırsa etkilenecek target ID'leri (virgülle) | depends_on varsa + unreachable |
+| `DEPENDENCY_DEPTH` | root cause'dan bu target'a hop mesafesi (0=root) | depends_on varsa + unreachable |
 
 ---
 

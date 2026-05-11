@@ -8,7 +8,17 @@ Bu dosya cluster mesh'in alarm dışında sunabileceği değerleri detaylandır�
 
 ---
 
-## 1. Dependency Graph + Root Cause Detection [P0]
+## ✅ 1. Dependency Graph + Root Cause Detection [P0] — TAMAMLANDI
+
+**Dosyalar:** `internal/engine/topology.go`, `topology_test.go`
+**Config:** `target.depends_on: [...]` — cyclic ve unknown-ref validation
+**Yeni alert env:** `ROOT_CAUSE`, `CASCADING_IMPACT`, `DEPENDENCY_DEPTH`
+**Yeni endpoint:** `GET /topology` — tam dependency graph JSON'u
+**Tests:** 14 unit test, topology_test.go (buildGraph, FindRootCause, CascadingImpact, DependencyDepth)
+
+---
+
+## 1. Dependency Graph + Root Cause Detection [P0] — Orijinal Plan
 
 ### Neden hayati
 Şu an alarm mesajı şunu söylüyor: "db-primary unreachable". Operatöre fayda yok — neden down? Bağlı servisler de etkileniyor mu? Bu bilgi yok.
@@ -107,7 +117,17 @@ Webhook payload'a (Alertmanager format):
 
 ---
 
-## 2. /fleet/status — Decentralized Fleet Aggregation [P0]
+## ✅ 2. /fleet/status — Decentralized Fleet Aggregation [P0] — TAMAMLANDI
+
+**Dosyalar:** `internal/engine/fleet.go`, `fleet_test.go`
+**Endpoint:** `GET /fleet/status` — engine-level, standalone + cluster her ikisinde çalışır
+**Payload:** `cluster` (nil in standalone), `summary` (total/up/soft_down/hard_down/unknown), `targets[]` (per-target: by_node, consensus_state, scope, affected_apps, owner_teams, root_cause, cascading_impact), `incidents[]`
+**cluster.Manager:** `QuorumHealthy()`, `ReplicationFactor()`, `AllPeerStates()` eklendi
+**Tests:** 6 unit test (fleet_test.go)
+
+---
+
+## 2. /fleet/status — Decentralized Fleet Aggregation [P0] — Orijinal Plan
 
 ### Neden hayati
 Bu özellik netwatch'ı "Prometheus exporter"dan "kendi başına monitoring agent"a çeviriyor. Küçük/orta ekipler Grafana kurmak istemiyor — `curl /fleet/status` ile her şeyi görsünler.

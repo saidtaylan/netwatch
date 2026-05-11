@@ -128,7 +128,26 @@ func (e *Engine) sendAlert(t Target, status string) {
 	// (scripts can use $SEQ / $ERROR_CODE, webhooks embed them in JSON).
 	e.stateMu.RLock()
 	ps := e.lastKnown[t.key()]
+	// Build a merged state snapshot for root-cause detection: local states
+	// plus any peer states visible to the cluster layer.
+	allStates := make(map[string]PersistedState, len(e.lastKnown))
+	for k, v := range e.lastKnown {
+		allStates[k] = v
+	}
 	e.stateMu.RUnlock()
+
+	// Overlay peer-observed states so root-cause detection uses cluster-wide knowledge.
+	if e.clusterMgr != nil {
+		for _, payload := range e.clusterMgr.AllPeerStates() {
+			if _, exists := allStates[payload.TargetID]; !exists || payload.Seq > allStates[payload.TargetID].Seq {
+				allStates[payload.TargetID] = PersistedState{
+					State:     payload.State,
+					Seq:       payload.Seq,
+					ErrorCode: payload.ErrorCode,
+				}
+			}
+		}
+	}
 
 	localDown := status == "unreachable"
 	env := map[string]string{
@@ -147,6 +166,10 @@ func (e *Engine) sendAlert(t Target, status string) {
 	if affected, teams := buildAppContext(apps); affected != "" {
 		env["AFFECTED_APPS"] = affected
 		env["OWNER_TEAMS"] = teams
+	}
+	// Topology: root cause + cascading impact (no-op when no depends_on configured).
+	for k, v := range e.rootCauseEnv(t, status, allStates) {
+		env[k] = v
 	}
 
 	slog.Info("sending alert", "target", t.Name, "status", status, "channels", names, "apps", len(apps))

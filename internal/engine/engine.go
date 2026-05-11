@@ -136,6 +136,12 @@ type Target struct {
 	Timeout          *int     `json:"timeout,omitempty"`
 	IntervalSec      *int     `json:"interval_sec,omitempty"` // per-target probe cadence
 
+	// DependsOn lists target IDs (or names) that this target depends on.
+	// When a dependency is hard_down at the time this target goes down, that
+	// dependency is reported as the ROOT_CAUSE in alert notifications.
+	// Cyclic references and unknown IDs are rejected at config load time.
+	DependsOn []string `json:"depends_on,omitempty"`
+
 	// ProbeFrom optionally pins probe execution to a fixed set of node names.
 	// When non-empty, only the listed nodes are considered candidates for this
 	// target — overriding the automatic hash-ring + zone selection. Useful when
@@ -569,6 +575,10 @@ type Engine struct {
 	// Read by HasLocalProbe (cluster.PeerAlertHandler) — guarded by mu.
 	localProbeIDs map[string]bool
 
+	// topoGraph holds the dependency graph derived from Target.DependsOn entries.
+	// nil when no target declares any dependencies (most configs). Guarded by mu.
+	topoGraph *DependencyGraph
+
 	// Suppress repeated credential-load log entries.
 	credLogged bool
 }
@@ -847,6 +857,12 @@ func (e *Engine) LoadConfig() error {
 	}
 	appIndex := buildAppTargetIndex(newCfg)
 
+	// Build dependency graph (nil when no target declares depends_on).
+	topo, topoErr := buildDependencyGraph(newCfg.Targets)
+	if topoErr != nil {
+		return fmt.Errorf("dependency graph: %w", topoErr)
+	}
+
 	// Purge stale state for removed/disabled targets.
 	activeKeys := make(map[string]bool)
 	activePending := make(map[string]bool)
@@ -890,6 +906,7 @@ func (e *Engine) LoadConfig() error {
 	e.cfg = newCfg
 	e.channels = channels
 	e.appIndex = appIndex
+	e.topoGraph = topo
 	e.localProbeIDs = newProbeIDs
 	if info, err := os.Stat(cfgPath); err == nil {
 		e.configMtime = info.ModTime()

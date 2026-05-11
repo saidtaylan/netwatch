@@ -792,6 +792,23 @@ func (m *Manager) Snapshot() ClusterStateSnapshot {
 	}
 }
 
+// AllPeerStates returns a flat slice of every GossipPayload currently stored
+// across all peers. Used by the engine to build a cluster-wide state view for
+// root-cause detection without exposing the two-level peerStates map.
+//
+// The returned slice is a defensive copy — callers may modify it freely.
+func (m *Manager) AllPeerStates() []GossipPayload {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []GossipPayload
+	for _, targets := range m.peerStates {
+		for _, p := range targets {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // NodeName returns the name this node is known by in the cluster.
 func (m *Manager) NodeName() string { return m.cfg.NodeName }
 
@@ -1068,6 +1085,19 @@ func (m *Manager) runQuorumLoop(ctx context.Context) {
 // suppress alert sending. Phase 8 gates alarm dispatch on this flag.
 func (m *Manager) IsolatedMode() bool {
 	return m.isolated.Load()
+}
+
+// QuorumHealthy returns true when the cluster currently satisfies its quorum
+// requirement. Exported alias for the internal checkQuorum() so callers outside
+// this package (e.g. engine.FleetSnapshot) can read quorum state without
+// accessing cluster internals.
+func (m *Manager) QuorumHealthy() bool {
+	return m.checkQuorum()
+}
+
+// ReplicationFactor returns the configured probe_replication_factor (default 3).
+func (m *Manager) ReplicationFactor() int {
+	return m.cfg.effectiveReplicationFactor()
 }
 
 // startAntiEntropy is called when quorum recovers.
