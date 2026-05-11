@@ -1,0 +1,225 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# network-prober
+#
+# Config hot-reload: her Prometheus scrape'inde otomatik okunur.
+# Yeniden başlatmaya gerek yoktur.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Prometheus /metrics endpoint'inin dinleyeceği port
+port: "10240"
+
+# Prometheus etiketlerinde ve alarm mesajlarında görünecek agent kimliği
+app_name: "test"
+
+# Log dosyası ve durum kayıt dosyası (binary dizinine göre çözümlenir)
+# Log Path boş olursa stdout'a yazar.
+log_path: "/Users/saidtaylan/Documents/network cluster/prober.log"
+state_file: "/Users/saidtaylan/Documents/network cluster/state.json"
+
+# Bağlantı zaman aşımı — her probe için TCP/HTTP bekleme süresi (saniye)
+timeout: 5
+
+# ── Yeniden deneme ayarları ────────────────────────────────────────────────────
+# max_retries       : hard-down bildirimini tetiklemeden önce kaç kez retry yapılır
+# retry_interval_sec: retry'lar arası bekleme (saniye)
+# ticker_interval_sec: arka plan ticker'ının uyku süresi (saniye)
+max_retries: 2
+retry_interval_sec: 30
+ticker_interval_sec: 5
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CREDENTIALS DOSYASI
+#
+# ${DEGISKEN_ADI} sözdizimi ile bu dosyadaki değerleri config'in her yerine
+# enjekte edebilirsiniz. Öncelik: credentials_file → sistem ortam değişkeni.
+# Yol göreceliyle (binary dizini) veya mutlak olarak belirtilebilir.
+# ═══════════════════════════════════════════════════════════════════════════════
+#credentials_file: "credentials.env"
+
+# credentials.env örneği:
+#   # Diyez ile başlayan satırlar yok sayılır
+#   SMTP_USER=prober@company.local
+#   SMTP_PASS=S3cr3t!
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BİLDİRİM KANALLARİ
+#
+# İki tür desteklenir:
+#   script : notifications/<kanal-adı>.sh (Linux) veya .ps1 (Windows) çalıştırır
+#   mail   : Go SMTP istemcisi ile doğrudan e-posta gönderir
+#
+# Her target için notify: [kanal1, kanal2] ile özel kanal atanabilir.
+# Atanmamış targetler default_notify kanallarını kullanır.
+# ═══════════════════════════════════════════════════════════════════════════════
+notifications:
+  # ── OpsManager / opcmon alarm scripti ───────────────────────────────────────
+  opcmon-bto:
+    type: "script"
+    parameters:
+      POLICY: "6"
+      OBJECT: "telnet_control"
+      MSG_GRP: "BTO_KURUMSAL"
+      COMPANY: "F"
+      GRP: "Kurumsal Uygulama Op."
+
+  # ── E-posta bildirimi (Exchange / SMTP) ─────────────────────────────────────
+  # Aktifleştirmek için yorum işaretlerini kaldırın ve credentials.env'e
+  # SMTP_USER / SMTP_PASS değerlerini ekleyin.
+  #
+  # TLS notu:
+  #   Windows / macOS : ca_cert gerekmez; Go, OS cert store'u (CryptoAPI /
+  #                     Keychain) otomatik kullanır → Group Policy CA'ları tanır.
+  #   Linux           : kurumsal CA, sistem bundle'ına eklenmemişse ca_cert gerekir.
+  #
+  # mail-ops:
+  #   type: "mail"
+  #   parameters:
+  #     smtp_host: "mail.company.local"
+  #     smtp_port: "587"              # 587 = STARTTLS  |  465 = TLS  |  25 = plain
+  #     tls_mode:  "starttls"         # starttls (varsayılan) | tls | none
+  #     #ca_cert:  "/etc/ssl/certs/corp-root-ca.pem"   # Linux: kurumsal CA PEM
+  #     #tls_insecure: "true"          # YALNIZCA izole iç ağda — cert doğrulamasını atla
+  #     smtp_user: "${SMTP_USER}"
+  #     smtp_pass: "${SMTP_PASS}"
+  #     from:      "${SMTP_USER}"
+  #     to:        "ops-team@company.local,dba@company.local"
+  #     subject_prefix: "[PROBER ALERT]"
+
+# Notify alanı olmayan targetlere uygulanacak varsayılan kanallar
+default_notify: ["opcmon-bto"]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HEDEFLER (TARGETS)
+#
+# Ortak alanlar:
+#   type             : tcp | http | ping | dns | sql
+#   target           : bağlantı adresi (tip'e göre format değişir, aşağıya bakın)
+#   name             : zorunlu, benzersiz etiket → Prometheus 'name' label'ı ve alarmlarda kullanılır
+#   enabled          : false yazılırsa probe devre dışı kalır (varsayılan: true)
+#   max_retries      : bu target için global ayarı override eder
+#   retry_interval_sec: bu target için global ayarı override eder
+#   notify           : ["kanal1","kanal2"] — default_notify yerine geçer
+# ═══════════════════════════════════════════════════════════════════════════════
+targets:
+  # ───────────────────────────────────────────────────────────────────────────────
+  # TCP  ──  Katman 4 bağlantı kontrolü
+  #
+  # Ne yapar : Hedefe TCP SYN gönderir. Port açık ve cevap veriyorsa → UP.
+  # Ne yapmaz: HTTP parse etmez, TLS kurmaz, içerik kontrol etmez.
+  # Ne zaman : HTTP olmayan her protokol için (LDAP, RDP, SMTP, MQ, FTP...).
+  # target   : host:port  (URL değil!)
+  # ───────────────────────────────────────────────────────────────────────────────
+
+  - type: "tcp"
+    target: "test.com:1414"
+    name: "ibm-mq-broker"
+    max_retries: 3 # global 2'yi override eder
+    retry_interval_sec: 15 # global 30'u override eder
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# HTTP  ──  HTTP/HTTPS servis sağlık kontrolü
+#
+# Ne yapar : HTTP isteği gönderir; durum kodu ve/veya yanıt gövdesini kontrol eder.
+# TLS      : target URL'si https:// ile başlarsa TLS otomatik devreye girer.
+# target   : tam URL, scheme zorunlu  (http://host:port/path  veya  https://host/path)
+#
+# expected_status operatörleri (birini seçin):
+#   in: [200, 204]        → kod listede varsa UP
+#   between: [200, 299]   → kod aralıktaysa UP  (her iki uç dahil)
+#   lt: 400               → kod < 400 ise UP
+#   lte: 302              → kod ≤ 302 ise UP
+#   gt: 99                → kod > 99 ise UP
+#   gte: 200              → kod ≥ 200 ise UP
+# (belirtilmezse varsayılan: kod < 400 → UP)
+# ───────────────────────────────────────────────────────────────────────────────
+
+#- type: "http"
+#  target: "https://app-server.company.local:8080/health"
+#  name: "uygulama-health"
+#  options:
+#    method: "GET"                     # GET | POST | PUT | DELETE | HEAD | OPTIONS | PATCH
+#    expected_status:
+#      in: [200, 204]                  # yalnızca 200 veya 204 → UP
+#    body_contains: '"status":"ok"'    # yanıt bu metni içermezse → DOWN
+#    body_not_contains: '"degraded"'   # yanıt bu metni içerirse → DOWN
+#    headers:
+#      X-Internal-Key: "static-value"
+#      Accept: "application/json"
+#    body: ""                         # GET için genellikle boş
+
+# ───────────────────────────────────────────────────────────────────────────────
+# PING  ──  ICMP erişilebilirlik (Katman 3)
+#
+# Ne yapar : ICMPv4 echo request gönderir. Cevap gelirse → UP.
+# Gereksinim: Linux'ta CAP_NET_RAW veya root yetkisi gerekir.
+#             Windows'ta administrator olarak çalıştırılmalıdır.
+# target   : IP adresi veya hostname  (port belirtilmez!)
+# ───────────────────────────────────────────────────────────────────────────────
+
+#- type: "ping"
+#  target: "10.0.0.1"
+#  name: "core-gateway"
+
+# ───────────────────────────────────────────────────────────────────────────────
+# DNS  ──  Alan adı çözümleme ve DNS sunucu sağlık kontrolü
+#
+# NE YAPAR?
+#   Bir hostname'i (alan adını) IP adresine çözümlemeye çalışır.
+#   • Çözümleme başarısız olursa (sunucu cevap vermiyorsa, kayıt yoksa) → DOWN.
+#   • expected_ips verilirse: çözümlenen IP'nin beklenen değerle eşleşip
+#     eşleşmediğini kontrol eder → yanlış kayıt / DNS hijacking tespiti.
+#   • nameserver verilirse: sistem DNS'i yerine belirtilen sunucu sorgulanır
+#     → belirli bir DNS sunucusunun sağlığını ölçersiniz.
+#
+# NE YAPMAZ?
+#   DNS'in TCP/UDP portunu (53) kontrol etmez → bunun için tcp type kullanın.
+#   A kaydı dışındaki kayıt türlerini (MX, CNAME, TXT) sorgulamaz.
+#
+# KULLANIM SENARYOLARI:
+#   1) "DNS sunucum çalışıyor mu?"      → nameserver + herhangi bir hostname
+#   2) "Kayıt doğru IP'ye mi işaret?"   → expected_ips ile doğrula
+#   3) "Sistem DNS'im çalışıyor mu?"    → nameserver vermeden sorgula
+#
+# target: çözümlenecek hostname  (port belirtilmez, URL değil!)
+# ───────────────────────────────────────────────────────────────────────────────
+
+#- type: "dns"
+#  target: "erp.company.local"
+#  name: "erp-dns-kaydi"
+#  options:
+#    nameserver: "10.0.0.10"
+#    expected_ips: ["10.0.1.50", "10.0.1.51"]  # load balancer IP'leri; hiçbiri eşleşmezse → DOWN
+
+# ───────────────────────────────────────────────────────────────────────────────
+# SQL  ──  Veritabanı bağlantı ve sağlık kontrolü
+#
+# Ne yapar : Veritabanına bağlanır, opsiyonel olarak bir SQL sorgusu çalıştırır.
+# target   : host:port  (URL değil!  Örn: oracle-db.company.local:1521)
+#
+# Desteklenen driverlar: oracle  ·  mysql  ·  postgres  ·  mssql
+#
+# query alanı hakkında:
+#   • Yazılırsa   : bu SQL sorgusu çalıştırılır; hatasız biterse → UP.
+#                   Sıfır satır dönmesi hata sayılmaz (EXISTS sorgusu yazılabilir).
+#   • Yazılmazsa  : driver'ın yerleşik Ping() metodu kullanılır (daha hızlı).
+#
+# Önerilen sorgular:
+#   Basit ping    :  SELECT 1                           (mysql / postgres / mssql)
+#                    SELECT 1 FROM dual                  (oracle — FROM dual zorunlu!)
+#   Tablo var mı? :  SELECT 1 FROM my_table WHERE ROWNUM = 1   (oracle)
+#                    SELECT TOP 1 1 FROM my_table               (mssql)
+#   Servis kaydı  :  SELECT status FROM health_check WHERE service = 'erp'
+# ───────────────────────────────────────────────────────────────────────────────
+
+# ── Oracle (aktif) ─────────────────────────────────────────────────────────────
+#- type: "sql"
+#  target: "oracle-db.company.local:1521"
+#  name: "oracle-erp-prod"
+#  options:
+#    driver: "oracle"
+#    service_name: "ERPDB"             # Oracle PDB/CDB servis adı — SID yerine tercih edilir
+#    database: "ERPDB"               # service_name yoksa SID buraya yazılır
+#    username: "${ORA_USER}"
+#    password: "${ORA_PASS}"
+#    query: "SELECT 1 FROM dual"       # Oracle'da SELECT 1 tek başına çalışmaz; FROM dual gerekir

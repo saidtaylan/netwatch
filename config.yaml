@@ -1,0 +1,127 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# netwatch — local development config
+# Run: ./bin/netwatch-darwin
+# Full reference: config.example.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+
+app_name: "netwatch-agent"
+port:     "10240"
+
+state_file:       "state.json"
+log_path:         ""
+credentials_file: "credentials.env"
+
+timeout:             3
+max_retries:         2
+retry_interval_sec:  10
+probe_interval_sec:  15
+ticker_interval_sec: 3
+reload_interval_sec: 0
+
+watchdog_threshold_sec: 0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Notification channels
+# ─────────────────────────────────────────────────────────────────────────────
+
+notifications:
+  log-alert:
+    type: script
+    parameters:
+      script: "notifications/alert.sh"
+
+  # Slack webhook - uncomment and set SLACK_WEBHOOK_URL in credentials.env
+  # slack-hook:
+  #   type: webhook
+  #   parameters:
+  #     url:    "${SLACK_WEBHOOK_URL}"
+  #     format: "generic"
+
+  # Mail - uncomment and fill in credentials.env
+  # email-ops:
+  #   type: mail
+  #   parameters:
+  #     smtp_host:    "smtp.company.local"
+  #     smtp_port:    "587"
+  #     from:         "netwatch@company.local"
+  #     to:           "sre-team@company.local"
+  #     tls_mode:     "starttls"
+  #     username:     "${SMTP_USER}"
+  #     password:     "${SMTP_PASS}"
+
+  # Alertmanager webhook - uncomment to enable
+  # alertmanager:
+  #   type: webhook
+  #   parameters:
+  #     url:    "http://localhost:9093/api/v2/alerts"
+  #     format: "alertmanager"
+
+default_notify:
+  - log-alert
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Targets
+# ─────────────────────────────────────────────────────────────────────────────
+
+targets:
+  - id:     "google-dns"
+    name:   "Google DNS"
+    type:   tcp
+    target: "8.8.8.8:53"
+
+  - id:     "fake-down"
+    name:   "Fake Down Target"
+    type:   tcp
+    target: "127.0.0.1:19999"
+
+  # HTTP example - uncomment to test
+  # - id:     "http-example"
+  #   name:   "HTTP Health"
+  #   type:   http
+  #   target: "https://httpbin.org/status/200"
+  #   options:
+  #     expected_status:
+  #       eq: 200
+
+  # PostgreSQL - uncomment and set credentials
+  # - id:     "payments-db"
+  #   name:   "Payments DB"
+  #   type:   sql
+  #   target: "localhost:5432"
+  #   options:
+  #     driver:   "postgres"
+  #     username: "${PG_USER}"
+  #     password: "${PG_PASS}"
+  #     database: "payments"
+  #     ssl_mode: "disable"
+  #     query:    "SELECT 1"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Apps (optional)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# apps:
+#   - name:       "payment-gateway"
+#     owner_team: "fintech-sre"
+#     uses:
+#       - "payments-db"
+#     notifications:
+#       - "email-ops"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cluster (disabled - see config.example.yaml for full reference)
+# ─────────────────────────────────────────────────────────────────────────────
+
+cluster:
+  enabled: false
+  # node_name:  "node-1"
+  # bind_addr:  "0.0.0.0"
+  # bind_port:  7946
+  # advertise_addr: "192.168.1.100"
+  # advertise_port: 7946
+  # peers:
+  #   - "192.168.1.101:7946"
+  # keyring:
+  #   - "base64encodedkey32byteslong=="
+  # expected_node_count: 3
+  # min_quorum_ratio:    0.5

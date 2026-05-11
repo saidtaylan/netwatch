@@ -1,0 +1,28 @@
+[Unit]
+Description=netwatch network monitoring agent
+Documentation=https://github.com/saidtaylan/netwatch
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+
+# Adjust --config path to match your installation.
+ExecStart=/usr/local/bin/netwatch --config /etc/netwatch/config.yaml
+
+Restart=on-failure
+RestartSec=5s
+
+# Allow the binary to open raw sockets for ICMP ping probes.
+# Remove the next two lines if you do not use `type: ping` targets.
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+
+# Logging: go to systemd journal by default.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=netwatch
+
+[Install]
+WantedBy=multi-user.target

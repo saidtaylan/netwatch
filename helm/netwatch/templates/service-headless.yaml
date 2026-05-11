@@ -1,0 +1,47 @@
+---
+# ClusterIP service — Prometheus scraping
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "netwatch.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "netwatch.labels" . | nindent 4 }}
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port:   {{ .Values.service.port | quote }}
+    prometheus.io/path:   "/metrics"
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "netwatch.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+
+---
+# Headless service — gossip peer discovery
+# Agents look up <fullname>-gossip.<namespace>.svc.cluster.local (DNS A records)
+# to build their initial peer list.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "netwatch.fullname" . }}-gossip
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "netwatch.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "netwatch.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: gossip-tcp
+      port: {{ .Values.gossip.port }}
+      targetPort: gossip
+      protocol: TCP
+    - name: gossip-udp
+      port: {{ .Values.gossip.port }}
+      targetPort: gossip-udp
+      protocol: UDP

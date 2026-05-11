@@ -1,0 +1,833 @@
+// Package cluster implements the gossip-based cluster layer using memberlist.
+//
+// Phase 6 scope: nodes join/leave, state changes are broadcast, peer states
+// are tracked. Alerting decisions are NOT yet affected — that comes in Phase 8
+// (consistent hashing + exactly-once alerting).
+//
+// When Config.Enabled is false, New() returns (nil, nil) and callers treat a
+// nil *Manager as a no-op. No code path inside the engine package is opened.
+package cluster
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"log"
+	"os"
+	"log/slog"
+	"math"
+	"net"
+	"sort"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/hashicorp/memberlist"
+)
+
+// ── Config ────────────────────────────────────────────────────────────────────
+
+// Config holds all cluster-related configuration fields.
+// It is embedded as `cluster:` in the top-level engine Config.
+type Config struct {
+	// Enabled must be true to activate the cluster layer.
+	// false (default) → New() returns nil; zero cluster code paths.
+	Enabled bool `json:"enabled"`
+
+	// NodeName uniquely identifies this node in the cluster.
+	// Required when Enabled=true. Typically hostname or hostname:port.
+	NodeName string `json:"node_name"`
+
+	// BindAddr is the address memberlist listens on (default "0.0.0.0").
+	BindAddr string `json:"bind_addr,omitempty"`
+
+	// BindPort is the gossip port (default 7946).
+	BindPort int `json:"bind_port,omitempty"`
+
+	// AdvertiseAddr is the address peers use to reach this node.
+	// Useful behind NAT or in container networks.
+	AdvertiseAddr string `json:"advertise_addr,omitempty"`
+
+	// AdvertisePort overrides the advertised port (defaults to BindPort).
+	AdvertisePort int `json:"advertise_port,omitempty"`
+
+	// Peers is a list of seed addresses (host:port) used on startup to join
+	// an existing cluster. best-effort — no error if none are reachable.
+	Peers []string `json:"peers,omitempty"`
+
+	// Keyring contains base64-encoded AES keys (decoded length must be 16, 24,
+	// or 32 bytes). The first key is used for encryption; all keys are tried for
+	// decryption (supports zero-downtime key rotation). Leave empty to disable
+	// encryption (not recommended in production).
+	Keyring []string `json:"keyring,omitempty"`
+
+	// ExpectedNodeCount is the total expected cluster size, used for quorum
+	// calculation in Phase 7. Has no effect in Phase 6.
+	ExpectedNodeCount int `json:"expected_node_count,omitempty"`
+
+	// MinQuorumRatio is the minimum fraction of nodes required for quorum
+	// (Phase 7). Default 0.5 (simple majority). Has no effect in Phase 6.
+	MinQuorumRatio float64 `json:"min_quorum_ratio,omitempty"`
+}
+
+// Validate checks required fields when cluster is enabled.
+func (c Config) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	if c.NodeName == "" {
+		return fmt.Errorf("cluster.node_name is required when cluster.enabled=true")
+	}
+	if c.BindPort != 0 && (c.BindPort < 1 || c.BindPort > 65535) {
+		return fmt.Errorf("cluster.bind_port must be 1–65535, got %d", c.BindPort)
+	}
+	for i, k := range c.Keyring {
+		raw, err := base64.StdEncoding.DecodeString(k)
+		if err != nil {
+			return fmt.Errorf("cluster.keyring[%d]: base64 decode: %w", i, err)
+		}
+		if n := len(raw); n != 16 && n != 24 && n != 32 {
+			return fmt.Errorf("cluster.keyring[%d]: decoded length %d is not 16, 24, or 32", i, n)
+		}
+	}
+	return nil
+}
+
+// ── AntiEntropyProvider ───────────────────────────────────────────────────────
+
+// AntiEntropyProvider is implemented by the engine layer and plugged in via
+// Manager.SetStateProvider(). It lets the cluster layer request and apply full
+// state snapshots during memberlist push-pull cycles without importing the
+// engine package (which would create a dependency cycle).
+type AntiEntropyProvider interface {
+	// FullState returns a serialised snapshot of all locally known target
+	// states. Called during LocalState(join=true) so a re-joining peer
+	// receives the complete current picture.
+	FullState() []byte
+
+	// ApplyRemoteState merges a remote full-state snapshot into this engine.
+	// Called during MergeRemoteState(join=true) after a push-pull re-join.
+	ApplyRemoteState(buf []byte)
+
+	// SetSyncing enables (true) or disables (false) sync mode.
+	// While true the engine suppresses new alert dispatch to prevent alarm
+	// storms during state reconciliation.
+	SetSyncing(v bool)
+}
+
+// ── GossipPayload ─────────────────────────────────────────────────────────────
+
+// GossipPayload is the unit of state exchanged between cluster nodes.
+// It carries the latest known health state for one target from one node's
+// perspective.
+//
+// TargetName and TargetType are included so that a primary node that does not
+// probe this target locally can still dispatch a meaningful alert when it
+// receives a hard_down state from a peer. Without them the primary would only
+// know the target's ID, losing the human-readable name in the alert.
+type GossipPayload struct {
+	TargetID   string    `json:"target_id"`
+	TargetName string    `json:"target_name,omitempty"` // display name (config: name:)
+	TargetType string    `json:"target_type,omitempty"` // probe type: tcp/http/ping/dns/sql
+	State      string    `json:"state"`                 // "up" | "hard_down"
+	Seq        uint64    `json:"seq"`                   // Lamport sequence from engine
+	ErrorCode  string    `json:"error_code,omitempty"`
+	NodeName   string    `json:"node_name"`             // originating node
+	Timestamp  time.Time `json:"timestamp"`
+}
+
+// ── MemberInfo ────────────────────────────────────────────────────────────────
+
+// MemberInfo is the JSON-serializable view of a cluster member.
+type MemberInfo struct {
+	Name   string `json:"name"`
+	Addr   string `json:"addr"`
+	Port   uint16 `json:"port"`
+	Status string `json:"status"` // alive | suspect | dead | left
+	Self   bool   `json:"self"`
+}
+
+// ── ClusterStateSnapshot ──────────────────────────────────────────────────────
+
+// ClusterStateSnapshot is returned by Manager.Snapshot() for /cluster/state.
+type ClusterStateSnapshot struct {
+	LocalNode  string                               `json:"local_node"`
+	Members    []MemberInfo                         `json:"members"`
+	PeerStates map[string]map[string]GossipPayload  `json:"peer_states,omitempty"`
+}
+
+// ── broadcast (implements memberlist.Broadcast) ───────────────────────────────
+
+type broadcast struct {
+	payload GossipPayload
+	data    []byte // pre-encoded JSON
+}
+
+func newBroadcast(p GossipPayload) (*broadcast, error) {
+	data, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	return &broadcast{payload: p, data: data}, nil
+}
+
+// Invalidates returns true when this broadcast supersedes an older one for the
+// same (node, target) pair so the queue drops the stale entry.
+func (b *broadcast) Invalidates(other memberlist.Broadcast) bool {
+	ob, ok := other.(*broadcast)
+	if !ok {
+		return false
+	}
+	return b.payload.NodeName == ob.payload.NodeName &&
+		b.payload.TargetID == ob.payload.TargetID &&
+		b.payload.Seq >= ob.payload.Seq
+}
+
+func (b *broadcast) Message() []byte { return b.data }
+func (b *broadcast) Finished()       {}
+
+// ── gossipDelegate (implements memberlist.Delegate) ───────────────────────────
+
+type gossipDelegate struct {
+	mgr        *Manager
+	broadcasts *memberlist.TransmitLimitedQueue
+}
+
+func (d *gossipDelegate) NodeMeta(limit int) []byte {
+	meta := map[string]string{"node": d.mgr.cfg.NodeName}
+	data, _ := json.Marshal(meta)
+	if len(data) > limit {
+		return nil
+	}
+	return data
+}
+
+// NotifyMsg is called whenever a UDP gossip message arrives.
+func (d *gossipDelegate) NotifyMsg(b []byte) {
+	if len(b) == 0 {
+		return
+	}
+	var p GossipPayload
+	if err := json.Unmarshal(b, &p); err != nil {
+		slog.Warn("cluster: malformed gossip message", "len", len(b), "err", err)
+		return
+	}
+	d.mgr.OnStateReceived(p)
+}
+
+// GetBroadcasts is called by memberlist to drain the outgoing broadcast queue.
+func (d *gossipDelegate) GetBroadcasts(overhead, limit int) [][]byte {
+	return d.broadcasts.GetBroadcasts(overhead, limit)
+}
+
+// LocalState serialises this node's state for memberlist push-pull cycles.
+//
+//   - join=true  (re-join): return the engine's full lastKnown map so the
+//     incoming peer can reconcile without spurious alarms. Requires a registered
+//     AntiEntropyProvider (wired up in Engine.Init).
+//   - join=false (periodic): return peerStates — individual gossip payloads
+//     from all known peers. This is the lightweight periodic exchange.
+func (d *gossipDelegate) LocalState(join bool) []byte {
+	if join && d.mgr.stateProvider != nil {
+		return d.mgr.stateProvider.FullState()
+	}
+	// Periodic push-pull — exchange peer-states as before.
+	d.mgr.mu.RLock()
+	data, _ := json.Marshal(d.mgr.peerStates)
+	d.mgr.mu.RUnlock()
+	return data
+}
+
+// MergeRemoteState is called when a push-pull cycle receives a peer's state.
+//
+//   - join=true  (re-join): delegate full merge to AntiEntropyProvider; suppress
+//     alarm dispatch while the merge is in progress to prevent alarm storms.
+//   - join=false (periodic): process each payload through the normal Lamport-merge
+//     path (OnStateReceived), same as UDP gossip messages.
+func (d *gossipDelegate) MergeRemoteState(buf []byte, join bool) {
+	if len(buf) == 0 {
+		return
+	}
+	if join && d.mgr.stateProvider != nil {
+		// Re-join full sync — let the engine merge with alarm suppression.
+		d.mgr.stateProvider.SetSyncing(true)
+		d.mgr.stateProvider.ApplyRemoteState(buf)
+		d.mgr.stateProvider.SetSyncing(false)
+		return
+	}
+	// Periodic push-pull — treat as individual gossip updates.
+	var remote map[string]map[string]GossipPayload
+	if err := json.Unmarshal(buf, &remote); err != nil {
+		slog.Warn("cluster: malformed state from peer", "err", err)
+		return
+	}
+	for _, targets := range remote {
+		for _, p := range targets {
+			d.mgr.OnStateReceived(p)
+		}
+	}
+}
+
+// ── eventDelegate (implements memberlist.EventDelegate) ───────────────────────
+
+type eventDelegate struct {
+	mgr *Manager
+}
+
+func (e *eventDelegate) NotifyJoin(node *memberlist.Node) {
+	slog.Info("cluster member joined", "node", node.Name, "addr", node.Addr)
+	// updateRing calls list.Members() which acquires nodeLock.RLock.
+	// memberlist calls NotifyJoin while holding nodeLock.WLock, so calling
+	// list.Members() here would deadlock. Run asynchronously instead.
+	go e.mgr.updateRing()
+}
+
+func (e *eventDelegate) NotifyLeave(node *memberlist.Node) {
+	slog.Info("cluster member left", "node", node.Name, "addr", node.Addr)
+	nodeName := node.Name
+	go func() {
+		e.mgr.mu.Lock()
+		delete(e.mgr.peerStates, nodeName)
+		e.mgr.mu.Unlock()
+		e.mgr.updateRing()
+	}()
+}
+
+func (e *eventDelegate) NotifyUpdate(node *memberlist.Node) {
+	slog.Debug("cluster member updated", "node", node.Name)
+	go e.mgr.updateRing()
+}
+
+// ── Manager ───────────────────────────────────────────────────────────────────
+
+// PeerAlertHandler is implemented by the engine to let the cluster layer
+// trigger an alert for a target that this node does not probe locally.
+//
+// When a primary node receives a hard_down gossip payload for a target that
+// is not in its own config, it cannot reach the alert through the normal
+// probe → processPending → shouldAlert path. Instead, OnStateReceived calls
+// this handler so the engine can dispatch the alert on behalf of the peer.
+//
+// HasLocalProbe returns true when the engine already handles alerting for
+// this target via its own probe loop — in that case the callback is skipped
+// to avoid double-alerting.
+type PeerAlertHandler interface {
+	HasLocalProbe(targetID string) bool
+	DispatchPeerAlert(payload GossipPayload)
+}
+
+// Manager owns the memberlist instance and all cluster state.
+type Manager struct {
+	cfg      Config
+	list     *memberlist.Memberlist
+	delegate *gossipDelegate
+
+	mu sync.RWMutex
+	// peerStates: nodeName → targetID → latest GossipPayload from that node.
+	// Protected by mu. Does NOT include this node's own state (the engine
+	// holds that in lastKnown).
+	peerStates map[string]map[string]GossipPayload
+
+	// peerAlerted tracks the highest seq for which a peer-driven alert was
+	// already dispatched. Prevents duplicate alerts when the same hard_down
+	// payload arrives via both UDP gossip and TCP push/pull.
+	// Protected by mu.
+	peerAlerted map[string]uint64 // targetID → last alerted seq
+
+	// isolated is set true when quorum is lost; cleared on recovery.
+	// Written by runQuorumLoop, read by IsolatedMode().
+	isolated atomic.Bool
+
+	// stopQuorum cancels the quorum background goroutine.
+	// Called by Leave() to prevent goroutine leak after shutdown.
+	stopQuorum func()
+
+	// ringMu protects ring. Updated on every NotifyJoin/Leave/Update event.
+	ringMu sync.RWMutex
+	// ring is the sorted list of alive node names used by the hash ring.
+	// Kept sorted lexicographically so all nodes agree on the same ordering.
+	ring []string
+
+	// stateProvider bridges back to the engine for anti-entropy push-pull.
+	// Set via SetStateProvider() after New() returns; nil until wired up.
+	stateProvider AntiEntropyProvider
+
+	// peerAlertHandler is set by the engine to handle alerts for targets this
+	// node does not probe locally. nil until SetPeerAlertHandler is called.
+	peerAlertHandler PeerAlertHandler
+}
+
+// New creates and starts the cluster manager.
+// Returns (nil, nil) when cfg.Enabled is false — callers treat nil as no-op.
+func New(cfg Config) (*Manager, error) {
+	if !cfg.Enabled {
+		return nil, nil
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+
+	m := &Manager{
+		cfg:         cfg,
+		peerStates:  make(map[string]map[string]GossipPayload),
+		peerAlerted: make(map[string]uint64),
+	}
+
+	mlCfg := memberlist.DefaultLANConfig()
+	mlCfg.Name = cfg.NodeName
+	mlCfg.Logger = log.New(os.Stderr, "", 0) // memberlist internal logs suppressed
+
+	if cfg.BindAddr != "" {
+		mlCfg.BindAddr = cfg.BindAddr
+	}
+	if cfg.BindPort > 0 {
+		mlCfg.BindPort = cfg.BindPort
+	}
+	if cfg.AdvertiseAddr != "" {
+		mlCfg.AdvertiseAddr = cfg.AdvertiseAddr
+	}
+	if cfg.AdvertisePort > 0 {
+		mlCfg.AdvertisePort = cfg.AdvertisePort
+	}
+
+	// AES keyring — optional but strongly recommended in production.
+	if len(cfg.Keyring) > 0 {
+		keys := make([][]byte, 0, len(cfg.Keyring))
+		for i, k := range cfg.Keyring {
+			raw, err := base64.StdEncoding.DecodeString(k)
+			if err != nil {
+				return nil, fmt.Errorf("cluster keyring[%d]: %w", i, err)
+			}
+			keys = append(keys, raw)
+		}
+		kr, err := memberlist.NewKeyring(keys, keys[0])
+		if err != nil {
+			return nil, fmt.Errorf("cluster keyring: %w", err)
+		}
+		mlCfg.Keyring = kr
+	}
+
+	delegate := &gossipDelegate{
+		mgr: m,
+		broadcasts: &memberlist.TransmitLimitedQueue{
+			NumNodes:       func() int { return m.list.NumMembers() },
+			RetransmitMult: mlCfg.RetransmitMult,
+		},
+	}
+	m.delegate = delegate
+	mlCfg.Delegate = delegate
+	mlCfg.Events = &eventDelegate{mgr: m}
+
+	list, err := memberlist.Create(mlCfg)
+	if err != nil {
+		return nil, fmt.Errorf("cluster create: %w", err)
+	}
+	m.list = list
+
+	// Seed the ring with the local node before joining peers.
+	m.updateRing()
+
+	if len(cfg.Peers) > 0 {
+		n, err := list.Join(cfg.Peers)
+		if err != nil {
+			slog.Warn("cluster join partial — continuing",
+				"contacted", n, "of", len(cfg.Peers), "err", err)
+		} else {
+			slog.Info("cluster joined", "contacted", n, "peers", cfg.Peers)
+		}
+	}
+
+	local := list.LocalNode()
+	slog.Info("cluster started",
+		"node", cfg.NodeName,
+		"addr", net.JoinHostPort(local.Addr.String(), fmt.Sprintf("%d", local.Port)),
+		"members", list.NumMembers(),
+	)
+
+	// Start quorum watcher only when expected_node_count is configured.
+	// Without it there is nothing to calculate quorum against.
+	if cfg.ExpectedNodeCount > 0 {
+		m.startQuorumLoop()
+	}
+
+	// Background rejoin loop — retries joining peers every 5s while this node
+	// has fewer than 2 members (i.e. it is isolated). Needed when all nodes start
+	// simultaneously and the initial Join() is refused by peers not yet ready.
+	if len(cfg.Peers) > 0 {
+		go m.runRejoinLoop(cfg.Peers)
+	}
+
+	return m, nil
+}
+
+// runRejoinLoop retries list.Join every 5 s as long as the node is alone.
+// Stops when the node has more than 1 member or when Leave() is called.
+func (m *Manager) runRejoinLoop(peers []string) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		if m.list == nil || m.list.NumMembers() > 1 {
+			return
+		}
+		n, err := m.list.Join(peers)
+		if err != nil {
+			slog.Debug("cluster rejoin attempt failed", "contacted", n, "err", err)
+		} else if n > 0 {
+			slog.Info("cluster rejoined", "contacted", n)
+			return
+		}
+	}
+}
+
+// Broadcast queues a GossipPayload for UDP gossip delivery to all members.
+// A newer payload for the same (node, target) automatically invalidates the
+// previous queued entry, so only the latest state is transmitted.
+func (m *Manager) Broadcast(p GossipPayload) {
+	b, err := newBroadcast(p)
+	if err != nil {
+		slog.Error("cluster broadcast marshal", "err", err)
+		return
+	}
+	m.delegate.broadcasts.QueueBroadcast(b)
+}
+
+// BroadcastReliable sends a GossipPayload to every member via TCP.
+// Use for critical state transitions where guaranteed delivery is needed.
+func (m *Manager) BroadcastReliable(p GossipPayload) {
+	data, err := json.Marshal(p)
+	if err != nil {
+		slog.Error("cluster broadcast reliable marshal", "err", err)
+		return
+	}
+	local := m.list.LocalNode()
+	for _, member := range m.list.Members() {
+		if member.Name == local.Name {
+			continue
+		}
+		if err := m.list.SendReliable(member, data); err != nil {
+			slog.Warn("cluster reliable send failed", "to", member.Name, "err", err)
+		}
+	}
+}
+
+// OnStateReceived merges an incoming payload into peerStates using Lamport
+// ordering (higher seq wins; equal seq uses lexicographic NodeName tie-break).
+//
+// After a successful merge, if this node is the consistent-hash primary for
+// the target AND the new state is hard_down, it calls the registered
+// PeerAlertHandler so the engine can dispatch an alert for targets that this
+// node does not probe locally. This is the "primary-forwards-peer-alert" path
+// that ensures exactly-once alerting works even when different nodes have
+// different target configs.
+func (m *Manager) OnStateReceived(p GossipPayload) {
+	m.mu.Lock()
+
+	if m.peerStates[p.NodeName] == nil {
+		m.peerStates[p.NodeName] = make(map[string]GossipPayload)
+	}
+	existing, ok := m.peerStates[p.NodeName][p.TargetID]
+	accepted := !ok || p.Seq > existing.Seq ||
+		(p.Seq == existing.Seq && p.NodeName > existing.NodeName)
+
+	if accepted {
+		m.peerStates[p.NodeName][p.TargetID] = p
+		slog.Debug("cluster state accepted",
+			"from", p.NodeName, "target", p.TargetID,
+			"state", p.State, "seq", p.Seq)
+	}
+
+	// Peer-alert path: fire only when all three conditions hold:
+	//   1. This node is the primary responsible for alerting on this target.
+	//   2. The payload carries a new hard_down with a higher seq than the last
+	//      peer-alert we dispatched (prevents duplicates from UDP + TCP paths).
+	//   3. Quorum is healthy (isolated nodes must not alert).
+	shouldDispatch := accepted &&
+		p.State == "hard_down" &&
+		!m.isolated.Load() &&
+		m.IsResponsible(p.TargetID) &&
+		p.Seq > m.peerAlerted[p.TargetID]
+
+	handler := m.peerAlertHandler
+	if shouldDispatch {
+		m.peerAlerted[p.TargetID] = p.Seq
+	}
+
+	m.mu.Unlock()
+
+	if shouldDispatch && handler != nil && !handler.HasLocalProbe(p.TargetID) {
+		slog.Debug("cluster: peer-alert dispatch (no local probe)",
+			"target", p.TargetID, "from", p.NodeName, "seq", p.Seq)
+		go handler.DispatchPeerAlert(p)
+	}
+}
+
+// Members returns a snapshot of all currently known cluster members.
+func (m *Manager) Members() []MemberInfo {
+	local := m.list.LocalNode()
+	members := m.list.Members()
+	out := make([]MemberInfo, 0, len(members))
+	for _, mem := range members {
+		out = append(out, MemberInfo{
+			Name:   mem.Name,
+			Addr:   mem.Addr.String(),
+			Port:   mem.Port,
+			Status: nodeStateStr(mem.State),
+			Self:   mem.Name == local.Name,
+		})
+	}
+	return out
+}
+
+// Snapshot returns a full view of cluster state for the /cluster/state endpoint.
+func (m *Manager) Snapshot() ClusterStateSnapshot {
+	m.mu.RLock()
+	// deep copy peerStates so the caller holds an immutable snapshot
+	ps := make(map[string]map[string]GossipPayload, len(m.peerStates))
+	for node, targets := range m.peerStates {
+		tc := make(map[string]GossipPayload, len(targets))
+		for tid, p := range targets {
+			tc[tid] = p
+		}
+		ps[node] = tc
+	}
+	m.mu.RUnlock()
+
+	return ClusterStateSnapshot{
+		LocalNode:  m.cfg.NodeName,
+		Members:    m.Members(),
+		PeerStates: ps,
+	}
+}
+
+// NodeName returns the name this node is known by in the cluster.
+func (m *Manager) NodeName() string { return m.cfg.NodeName }
+
+// ── Hash ring — responsible-node selection ────────────────────────────────────
+
+// updateRing rebuilds the sorted alive-member list from the current memberlist
+// state. Called by eventDelegate on every Join/Leave/Update and once in New().
+func (m *Manager) updateRing() {
+	if m.list == nil {
+		return
+	}
+	members := m.list.Members()
+	names := make([]string, 0, len(members))
+	for _, mem := range members {
+		if mem.State == memberlist.StateAlive {
+			names = append(names, mem.Name)
+		}
+	}
+	sort.Strings(names)
+
+	m.ringMu.Lock()
+	m.ring = names
+	m.ringMu.Unlock()
+}
+
+// hashTarget returns a stable FNV-32a hash of targetID.
+func hashTarget(targetID string) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(targetID))
+	return h.Sum32()
+}
+
+// GetResponsibleNode returns the primary and secondary node names responsible
+// for alerting on targetID.
+//
+// The ring is sorted lexicographically so every node computes the same result.
+// If the ring has fewer than 2 members the secondary is returned as "".
+func (m *Manager) GetResponsibleNode(targetID string) (primary, secondary string) {
+	m.ringMu.RLock()
+	ring := make([]string, len(m.ring))
+	copy(ring, m.ring)
+	m.ringMu.RUnlock()
+
+	n := len(ring)
+	if n == 0 {
+		return "", ""
+	}
+	idx := int(hashTarget(targetID)) % n
+	primary = ring[idx]
+	if n < 2 {
+		return primary, ""
+	}
+	secondary = ring[(idx+1)%n]
+	return primary, secondary
+}
+
+// IsResponsible returns true when this node is the primary responsible node
+// for targetID. Only the primary sends alerts. When the primary leaves, the
+// ring is updated via NotifyLeave → updateRing(), and the next node becomes
+// the new primary — natural failover without dual-sending.
+func (m *Manager) IsResponsible(targetID string) bool {
+	primary, _ := m.GetResponsibleNode(targetID)
+	return m.cfg.NodeName == primary
+}
+
+// PeerStatesForTarget returns the most recent GossipPayload from every peer
+// that has reported a state for targetID. Does NOT include this node's own
+// state (the engine holds that in lastKnown).
+func (m *Manager) PeerStatesForTarget(targetID string) []GossipPayload {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []GossipPayload
+	for _, targets := range m.peerStates {
+		if p, ok := targets[targetID]; ok {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// Leave performs a graceful shutdown, announcing the departure to peers.
+// Call this before process exit so other nodes update their membership tables.
+func (m *Manager) Leave(timeout time.Duration) error {
+	// Stop the quorum goroutine before shutting down memberlist so it does
+	// not fire on the transitional member count during Leave().
+	if m.stopQuorum != nil {
+		m.stopQuorum()
+	}
+	if m.list == nil {
+		return nil
+	}
+	slog.Info("cluster leaving", "node", m.cfg.NodeName)
+	if err := m.list.Leave(timeout); err != nil {
+		return fmt.Errorf("cluster leave: %w", err)
+	}
+	return m.list.Shutdown()
+}
+
+// SetStateProvider registers an AntiEntropyProvider on the manager.
+// Must be called before the first push-pull cycle occurs (i.e., in Engine.Init
+// immediately after cluster.New returns). It is safe to call even when the
+// manager was not created via New() (e.g. in tests with NewTestManager).
+func (m *Manager) SetStateProvider(p AntiEntropyProvider) {
+	m.stateProvider = p
+}
+
+// SetPeerAlertHandler registers the engine callback used to dispatch alerts
+// for targets this node does not probe locally. See PeerAlertHandler.
+// Must be called in Engine.Init after cluster.New returns, before gossip
+// messages can arrive.
+func (m *Manager) SetPeerAlertHandler(h PeerAlertHandler) {
+	m.mu.Lock()
+	m.peerAlertHandler = h
+	m.mu.Unlock()
+}
+
+// ── Quorum ────────────────────────────────────────────────────────────────────
+
+// AliveCount returns the number of cluster members currently in StateAlive.
+func (m *Manager) AliveCount() int {
+	count := 0
+	for _, node := range m.list.Members() {
+		if node.State == memberlist.StateAlive {
+			count++
+		}
+	}
+	return count
+}
+
+// checkQuorum returns true when the number of alive members meets the minimum
+// required by the configured quorum formula:
+//
+//	needed = floor(ExpectedNodeCount * MinQuorumRatio) + 1
+//
+// When ExpectedNodeCount is 0 (not configured) quorum is always considered
+// healthy — this preserves standalone and two-node setups.
+func (m *Manager) checkQuorum() bool {
+	if m.cfg.ExpectedNodeCount <= 0 {
+		return true
+	}
+	ratio := m.cfg.MinQuorumRatio
+	if ratio <= 0 {
+		ratio = 0.5
+	}
+	needed := int(math.Floor(float64(m.cfg.ExpectedNodeCount)*ratio)) + 1
+	return m.AliveCount() >= needed
+}
+
+// startQuorumLoop creates a background goroutine that monitors quorum every 5s.
+// The goroutine exits when the returned context is cancelled (on Leave).
+func (m *Manager) startQuorumLoop() {
+	ctx, cancel := context.WithCancel(context.Background())
+	m.stopQuorum = cancel
+	go m.runQuorumLoop(ctx)
+}
+
+// runQuorumLoop is the quorum-monitoring goroutine.
+// It logs transitions and flips the isolated flag accordingly.
+func (m *Manager) runQuorumLoop(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	// Seed initial state without logging — avoids false "quorum lost" on startup
+	// when not all peers have joined yet.
+	wasHealthy := m.checkQuorum()
+	m.isolated.Store(!wasHealthy)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			healthy := m.checkQuorum()
+			switch {
+			case !healthy && wasHealthy:
+				ratio := m.cfg.MinQuorumRatio
+				if ratio <= 0 {
+					ratio = 0.5
+				}
+				needed := int(math.Floor(float64(m.cfg.ExpectedNodeCount)*ratio)) + 1
+				slog.Warn("[CLUSTER] quorum lost",
+					"active", m.AliveCount(),
+					"needed", needed,
+					"expected_total", m.cfg.ExpectedNodeCount,
+				)
+				m.isolated.Store(true)
+			case healthy && !wasHealthy:
+				slog.Info("[CLUSTER] quorum recovered",
+					"active", m.AliveCount(),
+					"expected_total", m.cfg.ExpectedNodeCount,
+				)
+				m.isolated.Store(false)
+				m.startAntiEntropy()
+			}
+			wasHealthy = healthy
+		}
+	}
+}
+
+// IsolatedMode returns true when this node has lost cluster quorum and should
+// suppress alert sending. Phase 8 gates alarm dispatch on this flag.
+func (m *Manager) IsolatedMode() bool {
+	return m.isolated.Load()
+}
+
+// startAntiEntropy is called when quorum recovers.
+// The actual state reconciliation happens automatically via memberlist's
+// push-pull mechanism: the next push-pull cycle with join=true will call
+// LocalState → FullState and MergeRemoteState → ApplyRemoteState on all
+// peers, driven by the registered AntiEntropyProvider (Phase 9).
+func (m *Manager) startAntiEntropy() {
+	slog.Info("[CLUSTER] anti-entropy triggered — push-pull sync will reconcile state")
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+func nodeStateStr(s memberlist.NodeStateType) string {
+	switch s {
+	case memberlist.StateAlive:
+		return "alive"
+	case memberlist.StateSuspect:
+		return "suspect"
+	case memberlist.StateDead:
+		return "dead"
+	case memberlist.StateLeft:
+		return "left"
+	default:
+		return "unknown"
+	}
+}

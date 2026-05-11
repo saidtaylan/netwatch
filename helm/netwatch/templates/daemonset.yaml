@@ -1,0 +1,116 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "netwatch.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "netwatch.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "netwatch.selectorLabels" . | nindent 6 }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        {{- include "netwatch.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Roll pods when the ConfigMap changes.
+        checksum/config: {{ .Values.config | sha256sum }}
+    spec:
+      # hostNetwork exposes the real node IP to the probe goroutines and
+      # makes the gossip port reachable between DaemonSet pods on different nodes.
+      hostNetwork: {{ .Values.hostNetwork }}
+      dnsPolicy:   {{ .Values.dnsPolicy }}
+
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      containers:
+        - name: netwatch
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+          args:
+            - "--config"
+            - "/etc/netwatch/config.yaml"
+
+          env:
+            # Downward API: expose node name and IP for cluster.node_name /
+            # cluster.advertise_addr substitution in config.yaml.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+            - name: gossip
+              containerPort: {{ .Values.gossip.port }}
+              protocol: TCP
+            - name: gossip-udp
+              containerPort: {{ .Values.gossip.port }}
+              protocol: UDP
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+
+          volumeMounts:
+            - name: config
+              mountPath: /etc/netwatch
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/netwatch
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "netwatch.fullname" . }}
+        - name: state
+          emptyDir: {}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}

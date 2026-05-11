@@ -1,0 +1,16 @@
+.git
+.gitignore
+*.exe
+network-prober-linux
+network-prober-linux/
+network-prober-windows/
+windows/
+linux/
+k8s/
+*.md
+*.txt
+Jenkinsfile*
+.DS_Store
+state.json
+prober.log
+credentials.env

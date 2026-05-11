@@ -1,0 +1,104 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# netwatch Helm chart — default values
+# Override with: helm install netwatch ./helm/netwatch -f my-values.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+
+image:
+  repository: netwatch
+  tag:        "latest"
+  pullPolicy: IfNotPresent
+
+# nameOverride / fullnameOverride follow standard Helm conventions.
+nameOverride:     ""
+fullnameOverride: ""
+
+# ── DaemonSet scheduling ──────────────────────────────────────────────────────
+# hostNetwork: true is required so that:
+#   1. ICMP raw sockets (ping) can reach the host network stack.
+#   2. Gossip ports are accessible between nodes on the real node IP.
+hostNetwork: true
+dnsPolicy:   ClusterFirstWithHostNet
+
+nodeSelector: {}
+tolerations: []
+affinity:    {}
+
+# ── Container security ────────────────────────────────────────────────────────
+securityContext:
+  capabilities:
+    add:
+      - NET_RAW     # required for ICMP ping probes
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot:           false   # raw sockets need root or CAP_NET_RAW + ambient
+  runAsUser:              0
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+resources:
+  requests:
+    cpu:    "50m"
+    memory: "64Mi"
+  limits:
+    cpu:    "200m"
+    memory: "128Mi"
+
+# ── Service (ClusterIP for Prometheus scraping) ────────────────────────────────
+service:
+  type: ClusterIP
+  port: 10240
+
+# ── Headless service for gossip peer discovery ────────────────────────────────
+gossip:
+  port: 7946
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+# config: raw netwatch config.yaml content (will be placed in a ConfigMap).
+# At minimum you must provide targets: and cluster: sections.
+config: |
+  app_name: "netwatch-agent"
+  port: "10240"
+  state_file: "/tmp/state.json"
+  timeout: 5
+  max_retries: 3
+  retry_interval_sec: 30
+  probe_interval_sec: 60
+  ticker_interval_sec: 5
+  reload_interval_sec: 30
+
+  notifications: {}
+  default_notify: []
+
+  targets:
+    - name: example-tcp
+      type: tcp
+      target: "127.0.0.1:22"
+
+  cluster:
+    enabled: true
+    node_name: "$(NODE_NAME)"
+    bind_addr: "0.0.0.0"
+    bind_port: 7946
+    advertise_addr: "$(HOST_IP)"
+    peers: []               # populated automatically via headless service DNS
+    expected_node_count: 3
+    min_quorum_ratio: 0.5
+
+# ── Keyring secret ───────────────────────────────────────────────────────────
+# Base64-encoded AES keys for gossip encryption.
+# To generate: openssl rand -base64 32
+# Set to [] to disable encryption (not recommended for production).
+keyring:
+  - "REPLACE_WITH_BASE64_AES_KEY="
+
+# ── Extra environment variables ───────────────────────────────────────────────
+extraEnv: []
+# - name: SLACK_WEBHOOK_URL
+#   valueFrom:
+#     secretKeyRef:
+#       name: netwatch-secrets
+#       key: slack-webhook-url
+
+# ── Extra volumes / mounts (e.g. credentials file, notification scripts) ──────
+extraVolumes: []
+extraVolumeMounts: []

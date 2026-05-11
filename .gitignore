@@ -1,0 +1,29 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build artifacts
+bin/
+*.exe
+*.test
+*.out
+
+# Runtime / generated
+*.log
+state.json
+*.tmp
+demo/
+
+# Local secrets / credentials
+credentials.env
+*.pem
+*.key
+
+# Local Claude state (keep instructions; ignore session settings)
+.claude/settings.local.json

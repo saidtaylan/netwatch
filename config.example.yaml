@@ -1,0 +1,240 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# netwatch — full configuration reference
+# Copy to /etc/netwatch/config.yaml and adjust to your environment.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Agent identity ────────────────────────────────────────────────────────────
+app_name: "netwatch-agent"       # Appears in metrics labels and alert env vars.
+port:     "10240"                # HTTP port for /metrics, /health, /status.
+
+# ── File paths ────────────────────────────────────────────────────────────────
+state_file:       "/var/lib/netwatch/state.json"
+log_path:         "/var/log/netwatch/agent.log"   # empty → stdout
+credentials_file: "/etc/netwatch/credentials.env" # ${VAR} source file (KEY=VALUE)
+
+# ── Probe timings ─────────────────────────────────────────────────────────────
+timeout:             5   # Per-probe TCP/HTTP/DNS/SQL connect timeout (seconds).
+max_retries:         3   # Soft-down retries before hard-down is declared.
+retry_interval_sec: 30   # Pause between individual retry probes.
+probe_interval_sec: 60   # Default probe interval per target.
+ticker_interval_sec:  5  # Internal scheduler resolution — do not set below 2.
+reload_interval_sec: 30  # Re-read config.yaml this often (0 = disabled).
+
+# ── Watchdog ──────────────────────────────────────────────────────────────────
+# If Prometheus does not scrape /metrics within this many seconds, emit a
+# [WATCHDOG] log entry and set network_probe_prometheus_connected=0.
+# Set to 0 (default) to disable.
+watchdog_threshold_sec: 120
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Notification channels
+# ─────────────────────────────────────────────────────────────────────────────
+
+notifications:
+
+  # ── Script channel ──────────────────────────────────────────────────────────
+  ops-script:
+    type: script
+    parameters:
+      script: "/etc/netwatch/notifications/alert.sh"
+      # The script is called with all alert env vars exported:
+      # NAME, TARGET, HOST, PORT, STATUS (unreachable|reachable),
+      # TYPE, SEQ, ERROR_CODE, NODE_NAME, APP_NAME,
+      # AFFECTED_APPS, OWNER_TEAMS (if apps: is configured)
+
+  # ── Mail channel ────────────────────────────────────────────────────────────
+  email-ops:
+    type: mail
+    parameters:
+      smtp_host:    "smtp.company.local"
+      smtp_port:    "587"
+      from:         "netwatch@company.local"
+      to:           "sre-team@company.local"
+      tls_mode:     "starttls"        # starttls | tls | none
+      tls_insecure: "false"
+      # ca_cert:    "/etc/ssl/certs/company-ca.pem"
+      username:     "${SMTP_USER}"    # resolved from credentials_file
+      password:     "${SMTP_PASS}"
+
+  # ── Webhook — generic JSON ───────────────────────────────────────────────────
+  slack-hook:
+    type: webhook
+    parameters:
+      url:            "${SLACK_WEBHOOK_URL}"
+      format:         "generic"       # generic (default) | alertmanager
+      timeout_sec:    "10"
+      tls_insecure:   "false"
+      # Custom headers: prefix any header name with header_
+      # header_Authorization: "Bearer ${MY_TOKEN}"
+
+  # ── Webhook — Prometheus Alertmanager format ─────────────────────────────────
+  alertmanager:
+    type: webhook
+    parameters:
+      url:            "http://alertmanager.monitoring.svc:9093/api/v2/alerts"
+      format:         "alertmanager"
+      timeout_sec:    "10"
+
+# Default channels used when a target has no notify: list and no app reference.
+default_notify:
+  - ops-script
+  - email-ops
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Targets
+# ─────────────────────────────────────────────────────────────────────────────
+# Each target runs its own probe loop. id: is optional but required for
+# app→target indirection (apps.uses). If omitted, name: is used as the key.
+
+targets:
+
+  # ── TCP ─────────────────────────────────────────────────────────────────────
+  - id:     "postgres-primary"
+    name:   "Postgres Primary"
+    type:   tcp
+    target: "db.internal:5432"
+    interval_sec: 30       # override global probe_interval_sec
+    notify: ["ops-script"]
+
+  # ── HTTP/HTTPS ───────────────────────────────────────────────────────────────
+  - id:     "payment-api-health"
+    name:   "Payment API /health"
+    type:   http
+    target: "https://api.payments.internal/health"
+    options:
+      method:          "GET"
+      expected_status:
+        in: [200, 204]   # accept 200 or 204
+      body_contains:    "\"status\":\"ok\""
+      follow_redirects: true
+      timeout_sec:      10
+      # headers:
+      #   Authorization: "Bearer ${API_TOKEN}"
+
+  # ── HTTP with status range ────────────────────────────────────────────────
+  - name:   "Ingress 2xx Check"
+    type:   http
+    target: "http://10.0.0.1/healthz"
+    options:
+      expected_status:
+        lte: 299   # operators: eq, in, lt, lte, gt, gte, between
+        gte: 200
+
+  # ── ICMP ping ────────────────────────────────────────────────────────────────
+  # Requires CAP_NET_RAW or root. Remove on containers without the capability.
+  - name:   "Core Router"
+    type:   ping
+    target: "10.0.0.1"
+    options:
+      count:          3    # packets per probe
+      timeout_sec:    2
+
+  # ── DNS ──────────────────────────────────────────────────────────────────────
+  - name:   "Internal DNS"
+    type:   dns
+    target: "api.payments.internal"
+    options:
+      nameserver:   "10.0.0.53:53"  # optional; uses OS resolver if omitted
+      expected_ips:
+        - "10.0.1.10"
+        - "10.0.1.11"
+
+  # ── SQL — PostgreSQL ─────────────────────────────────────────────────────────
+  - id:   "payments-db"
+    name: "Payments DB"
+    type: sql
+    target: "db-payments.internal:5432"
+    options:
+      driver:   "postgres"
+      username: "${PG_USER}"
+      password: "${PG_PASS}"
+      database: "payments"
+      ssl_mode: "require"    # disable | require | verify-full
+      query:    "SELECT 1"   # optional validation query
+
+  # ── SQL — MySQL ──────────────────────────────────────────────────────────────
+  - name:   "Inventory MySQL"
+    type:   sql
+    target: "mysql-inventory.internal:3306"
+    options:
+      driver:   "mysql"
+      username: "${MYSQL_USER}"
+      password: "${MYSQL_PASS}"
+      database: "inventory"
+
+  # ── SQL — Oracle ─────────────────────────────────────────────────────────────
+  - name:   "ERP Oracle"
+    type:   sql
+    target: "oracle-erp.internal:1521"
+    options:
+      driver:       "oracle"
+      username:     "${ORA_USER}"
+      password:     "${ORA_PASS}"
+      service_name: "ERPPROD"
+
+  # ── SQL — SQL Server ─────────────────────────────────────────────────────────
+  - name:   "Analytics MSSQL"
+    type:   sql
+    target: "mssql-analytics.internal:1433"
+    options:
+      driver:   "mssql"
+      username: "${MSSQL_USER}"
+      password: "${MSSQL_PASS}"
+      database: "analytics"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Apps (optional — service ownership and alert routing)
+# ─────────────────────────────────────────────────────────────────────────────
+# Apps group targets under a named service and team. When an alert fires,
+# AFFECTED_APPS and OWNER_TEAMS env vars are injected into all channels.
+# Notification channels are the union of app.notifications + target.notify.
+
+apps:
+  - name:       "payment-gateway"
+    owner_team: "fintech-sre"
+    uses:
+      - "postgres-primary"
+      - "payment-api-health"
+      - "payments-db"
+    notifications:
+      - "email-ops"
+      - "alertmanager"
+
+  - name:       "inventory-service"
+    owner_team: "logistics-dev"
+    uses:
+      - "Inventory MySQL"   # can reference target by name if id: is not set
+    notifications:
+      - "slack-hook"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cluster (optional — gossip-based distributed monitoring)
+# ─────────────────────────────────────────────────────────────────────────────
+# Remove or set enabled: false for standalone / single-node operation.
+
+cluster:
+  enabled:    true
+  node_name:  "node-1"          # Must be unique across all cluster members.
+  bind_addr:  "0.0.0.0"
+  bind_port:  7946              # TCP+UDP; open this port between all nodes.
+
+  # advertise_addr is what other nodes will use to reach this node.
+  # Required when running behind NAT or in a container with a private IP.
+  # advertise_addr: "192.168.1.100"
+
+  # Seed peers — at least one must be reachable on first join.
+  # The list is best-effort; if all seeds are temporarily down,
+  # this node will retry joining in the background.
+  peers:
+    - "192.168.1.101:7946"
+    - "192.168.1.102:7946"
+
+  # AES keyring for gossip encryption (base64-encoded 16/24/32-byte keys).
+  # The first key is used for encryption; all keys are tried for decryption
+  # (zero-downtime key rotation: add new key first, then remove old key).
+  keyring:
+    - "c2VjcmV0LWtleS0zMi1ieXRlcy1sb25nLWhlcmUhISE="
+
+  # Quorum (Phase 7): minimum live nodes to allow alarm dispatch.
+  expected_node_count: 3
+  min_quorum_ratio:    0.5    # at least floor(3 * 0.5) + 1 = 2 alive nodes required

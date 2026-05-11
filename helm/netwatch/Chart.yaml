@@ -1,0 +1,20 @@
+apiVersion: v2
+name: netwatch
+description: >
+  Distributed network monitoring agent — probes TCP/HTTP/ICMP/DNS/SQL targets,
+  exports Prometheus metrics, and runs a gossip-based cluster for quorum-gated,
+  exactly-once alerting.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - monitoring
+  - prometheus
+  - network
+  - cluster
+  - gossip
+home: https://github.com/saidtaylan/netwatch
+sources:
+  - https://github.com/saidtaylan/netwatch
+maintainers:
+  - name: saidtaylan
