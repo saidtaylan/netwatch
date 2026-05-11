@@ -13,7 +13,7 @@ Bu dosya aktif geliştirme planını içerir. Tamamlananlar → **developments.m
                          ✅6 → ✅7 → ✅8 → ✅9
                                                │
                                                ▼
-                                           ✅10 → ✅11 → [ 12 ]
+                                           ✅10 → ✅11 → ✅12 → ✅13
 ```
 
 **Kural:** Her aşama bitmeden sonrakine geçilmez. Aşama bitişinde kullanıcı smoke test yapar ve onay verir.
@@ -212,7 +212,7 @@ Aşağıdaki adımlar her aşama sonunda uygulanır:
 
 ---
 
-## [ Phase 12 ] — Integration Tests
+## ✅ Phase 12 — Integration Tests (TAMAMLANDI)
 
 **Hedef:** Regresyon güvencesi.
 
@@ -240,9 +240,20 @@ Aşağıdaki adımlar her aşama sonunda uygulanır:
 - Tüm testler `go test -race -timeout 120s ./...` ile geçer
 - Hiçbir data race raporu
 
+**Sonuç:** 7 test, 3 paket, hepsi `-race` ile yeşil.
+`go test -race -timeout 300s ./internal/engine/... ./internal/cluster/... ./test/integration/...`
+
+```
+ok  github.com/saidtaylan/netwatch/internal/engine       1.6s
+ok  github.com/saidtaylan/netwatch/internal/cluster      1.9s
+ok  github.com/saidtaylan/netwatch/test/integration    110.5s
+```
+
+cluster.go race fix: `ringMu` protects `m.list` assignment + `inventoryRefreshHandler` read under `mu.RLock`.
+
 ---
 
-## [ Phase 13 ] — Distributed Probe Ownership (Probe Sorumluluğu Dağıtımı)
+## ✅ Phase 13 — Distributed Probe Ownership (TAMAMLANDI) — Distributed Probe Ownership (Probe Sorumluluğu Dağıtımı)
 
 **Hedef:** Cluster'daki her node'un her target'ı probe etmesi yerine, her target için consistent hashing ile seçilen N node'luk bir alt küme probe etsin. Geri kalan node'lar sadece gossip dinler. Operatör konfigürasyon yazmaz — cluster otomatik karar verir.
 

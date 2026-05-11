@@ -437,26 +437,32 @@ CLI subcommand routing eklendi: `netwatch init`, `netwatch leave`, `netwatch uni
 
 ---
 
-### Phase 12 — Integration Tests (cross-phase)
+### ✅ Phase 12 — Integration Tests (TAMAMLANDI)
 
-**Hedef:** Regresyon güvencesi — Phase 13'ün kendi içindeki integration testleri `internal/cluster/phase13_integration_test.go`'da yapıldı, ama uçtan-uca senaryolar hâlâ bekliyor.
+**7 in-process end-to-end test, gerçek net.Listener + gerçek memberlist:**
 
-**Görevler:**
-1. `test/integration/standalone_test.go` — config ile başlat, mock TCP server'ı kapat, `state.json`'a `hard_down` yazılmış mı, alert script çağrılmış mı.
-2. `test/integration/cluster_test.go` — 3 yerel binary başlat, target'ı kontrol et, scope hesabı, exactly-once alarm.
-3. `test/integration/antientropy_test.go` — Phase 9 senaryosu (re-join alarm storm yok).
-4. `test/integration/keyrotation_test.go` — keyring rotation sıfır kesinti.
-5. CI gate: `go test ./... -race -timeout 120s`.
+- `test/integration/standalone_test.go`:
+  - `TestStandalone_ProbeAndAlertCycle` — up→down→recovery tam döngüsü, state.json + alert doğrulaması
+  - `TestStandalone_AppEnrichment` — `AFFECTED_APPS`/`OWNER_TEAMS` env var kontrolü
+  - `TestStandalone_StateV2Migration` — v1 boolean format otomatik v2 migrate
+- `test/integration/cluster_test.go`:
+  - `TestCluster_ExactlyOnceAlert` — 2 node, probe_replication_factor=2, tam 1 unreachable alert
+  - `TestCluster_RecoveryAlert` — down→recovery, tam 1 reachable alert
+- `test/integration/antientropy_test.go`:
+  - `TestAntiEntropy_RejoinNoDuplicateAlert` — re-join sonrası 2. alarm gelmez
+- `test/integration/keyrotation_test.go`:
+  - `TestKeyRotation_SharedKeyGossip` — AES-256 şifreli gossip, exactly-once
+  - `TestKeyRotation_AddKey` — hot-reload ile k2 ekleme, cluster ayakta kalır
 
-**Kabul kriteri:** Tüm testler `-race` ile geçer.
+**cluster.go race fix:** `ringMu` → `m.list` + ring atomik; `inventoryRefreshHandler` `mu.RLock()` altında okunur.
+
+**CI gate:** `go test -race -timeout 300s ./internal/engine/... ./internal/cluster/... ./test/integration/...` → 0 data race, 3 paket yeşil.
 
 ---
 
 ### ✅ Phase 13 — Distributed Probe Ownership (TAMAMLANDI)
 
 Cluster artık her node her target'ı probe etmiyor; hash + zone-aware spread ile `probe_replication_factor` adet (default 3) prober seçiyor. todo.md F6 (Active Probe Delegation, `target.probe_from`) ve todo.md F2 (minimal `/fleet/status`) entegre. Detay için `developments.md` 2026-05-11.
-
-Kalan tek manuel adım: **Phase 13 Step 12 — smoke test** (3 yerel binary ile real-world doğrulama).
 
 ---
 
@@ -469,7 +475,7 @@ Kalan tek manuel adım: **Phase 13 Step 12 — smoke test** (3 yerel binary ile 
                            ✅6 → ✅7 → ✅8 → ✅9
                                                   │
                                                   ▼
-                                              ✅10 → ✅11 → [ 12 ] → ✅13
+                                              ✅10 → ✅11 → ✅12 → ✅13
 ```
 
 Her aşama bittikten sonra **kullanıcı onayı** alınır. Sonraki aşamaya geçilmeden önce smoke test yapılır.

@@ -18,6 +18,39 @@ Bu belge, netwatch projesinin günlük güncellemelerini ve teknik detaylarını
 
 ## 2026-05-11
 
+- [test] [altyapi] **Phase 12 tamamlandı — 7 entegrasyon testi + 3 cluster data race düzeltmesi.**
+
+  **test/integration/standalone_test.go (3 test):**
+  - `TestStandalone_ProbeAndAlertCycle`: TCP mock server up→down→up tam döngüsü, `state.json` hard_down + recovery doğrulaması, alert script `STATUS/SEQ/NAME` env kontrolü.
+  - `TestStandalone_AppEnrichment`: `apps:` config ile alert env'de `AFFECTED_APPS=payment-service` + `OWNER_TEAMS=fintech-sre` doğrulaması.
+  - `TestStandalone_StateV2Migration`: v1 `{"id":bool}` formatı engine Init'te otomatik v2'ye migrate ediliyor mu; `version:2 + state:"up"/"hard_down"` kontrolü.
+
+  **test/integration/cluster_test.go (2 test):**
+  - `TestCluster_ExactlyOnceAlert`: 2 node, `probe_replication_factor=2`, target down → tam olarak 1 "unreachable" alert (Phase 8 exactly-once garantisi).
+  - `TestCluster_RecoveryAlert`: target down → up → tam olarak 1 "reachable" alert.
+
+  **test/integration/antientropy_test.go (1 test):**
+  - `TestAntiEntropy_RejoinNoDuplicateAlert`: node1 dur → target down (1 alert) → node1 yeniden başlat → re-join sırasında 2. "unreachable" GELMEZ (Phase 9 anti-entropy garantisi).
+
+  **test/integration/keyrotation_test.go (2 test):**
+  - `TestKeyRotation_SharedKeyGossip`: AES-256 keyring ile 2 node cluster, şifreli gossip üzerinden exactly-once alert.
+  - `TestKeyRotation_AddKey`: k2 ekleme (hot-reload simülasyonu) sonrası cluster ayakta + alert çalışıyor.
+
+  **cluster.go data race fix (3 düzeltme, `-race` ile tespit edildi):**
+  - `m.list` assignment in `New()` artık `ringMu.Lock()` altında — `NotifyJoin` goroutine'nin `updateRing()` içindeki nil check ile race'i engeller.
+  - `updateRing()` tam body'si `ringMu.Lock()` altında — nil check + `Members()` + ring assignment atomic.
+  - `NotifyJoin` goroutine `inventoryRefreshHandler` okurken `mu.RLock()` kullanıyor — `SetInventoryRefreshHandler()` ile race'i engeller.
+
+  **Test sonuçları:** `go test -race -timeout 300s ./internal/engine/... ./internal/cluster/... ./test/integration/...`
+  ```
+  ok  github.com/saidtaylan/netwatch/internal/engine       1.6s
+  ok  github.com/saidtaylan/netwatch/internal/cluster      1.9s
+  ok  github.com/saidtaylan/netwatch/test/integration    110.5s  (7 test)
+  ```
+  **Data race raporu: 0**
+
+---
+
 - [backend] [altyapi] **Phase 13 Step 12 tamamlandı + 5 production bug fix. Smoke test: 3 node (istanbul/ankara/izmir), zone-aware spread, failover, quorum-loss, tam doğrulama.**
 
   **Step 12 — Smoke test:** 3 yerel binary farklı gossip portları (7951/7952/7953), HTTP portları (10301/10302/10303), zone'lar (istanbul/ankara/izmir). Factor=2 ile 2 target için prober seçimi, tüm başarı kriterleri:
