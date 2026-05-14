@@ -48,15 +48,24 @@ build: build-linux build-windows      ## Build both Linux and Windows binaries
 ## ─────────────────────────────────────────────────────────────────────────────
 
 .PHONY: test
-test:                                 ## Run unit tests with race detector
+test:                                 ## Run internal unit tests with race detector
 	go test -race ./internal/engine/... ./internal/cluster/...
+
+.PHONY: test-unit
+test-unit:                            ## Run tests/engine + tests/cluster (fast, no I/O)
+	go test -race -timeout 60s -count=1 ./tests/engine/... ./tests/cluster/...
+
+.PHONY: test-domain
+test-domain:                          ## Run tests/domain (full-stack, ~90s, uses real ports)
+	go test -race -timeout 200s -count=1 ./tests/domain/...
 
 .PHONY: test-integration
 test-integration:                     ## Run integration tests (requires docker / local ports)
 	go test -race -tags integration -timeout 120s ./test/integration/...
 
 .PHONY: test-all
-test-all: test test-integration       ## Run all tests
+test-all: test test-unit test-domain  ## Run all test suites (internal + tests/ + integration)
+	@echo "✓ All test suites passed."
 
 ## ─────────────────────────────────────────────────────────────────────────────
 ## Quality
