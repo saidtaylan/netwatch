@@ -471,6 +471,10 @@ func (e *Engine) runSLOChecker(ctx context.Context) {
 	}
 	e.sloMgr.PruneOldIncidents(sloCfg.retentionDays())
 
+	// Run an initial check immediately so Prometheus SLO gauges are populated
+	// from the first scrape — without this, metrics only appear after 1 hour.
+	e.checkSLOBreaches()
+
 	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
 

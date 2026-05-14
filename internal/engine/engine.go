@@ -1723,11 +1723,14 @@ func (e *Engine) HasLocalProbe(targetID string) bool {
 // TargetType (populated by the probing node) and fall back to the target ID
 // when those fields are absent (older payload format).
 func (e *Engine) DispatchPeerAlert(p cluster.GossipPayload) {
-	if e.syncing.Load() {
-		slog.Debug("peer-alert suppressed: anti-entropy sync in progress",
-			"target", p.TargetID)
-		return
-	}
+	// NOTE: syncing guard intentionally omitted here. DispatchPeerAlert is called
+	// when a peer gossips a hard_down state to the responsible primary node.
+	// Unlike probe-based alerts (runCheck / processPending), this path originates
+	// from an already-confirmed peer state, NOT from a local probe that could be
+	// racing with anti-entropy state merges. Suppressing it during sync would cause
+	// alerts to be lost entirely when the primary restarts and re-joins while a
+	// target is already down. The peerAlerted dedup map (in cluster/cluster.go)
+	// prevents duplicate dispatches even without the syncing guard.
 
 	name := p.TargetName
 	if name == "" {
