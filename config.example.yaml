@@ -258,6 +258,18 @@ cluster:
   # to a number larger than the cluster size, e.g. 999.
   probe_replication_factor: 3
 
+  # Minimum number of probers that must independently reach hard_down
+  # before the responsible node fires an alert. Default 0 (treated as 1).
+  #
+  # Use-case: a prober with a broken uplink to a specific target will
+  # declare it hard_down while all other probers see it as UP. With
+  # min_probe_confirmations: 2 the alert is suppressed until a second
+  # prober also reaches hard_down — eliminating single-node false alerts.
+  #
+  # Trade-off: setting this higher adds alert latency (you wait for N
+  # independent retry cycles to complete). Recommended: 2 with factor 3.
+  # min_probe_confirmations: 2
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 13 — Per-target probe pinning (Active Probe Delegation)
 # ─────────────────────────────────────────────────────────────────────────────

@@ -200,6 +200,7 @@ cluster:
   min_quorum_ratio: 0.5           # Phase 7: varsayılan basit çoğunluk
   zone: "istanbul"                # Phase 13: opsiyonel; node-level label, hostname'den türetilmez
   probe_replication_factor: 3     # Phase 13: per-target prober cap; varsayılan 3
+  min_probe_confirmations: 2      # opsiyonel; N prober hard_down görmeden alarm atılmaz; varsayılan 0 (=1)
 ```
 
 **Phase 13 — Distributed Probe Ownership:**
