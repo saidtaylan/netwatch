@@ -105,6 +105,16 @@ type Config struct {
 	// ConfigSync holds gossip-based config drift detection settings (P1.5).
 	// When nil or Enabled=false, no config hash is broadcast.
 	ConfigSync *ConfigSyncConfig `json:"config_sync,omitempty"`
+
+	// MinProbeConfirmations is the minimum number of probers that must
+	// independently confirm hard_down before the responsible node dispatches
+	// an alert. 0 or 1 (default) preserves the current behaviour — alert as
+	// soon as any single prober declares hard_down. Set to 2 to require two
+	// independent confirmations, which suppresses false positives caused by a
+	// single prober losing connectivity to the target while other probers still
+	// see it as up. Trade-off: higher values reduce false alerts but increase
+	// detection latency by up to one probe_interval_sec.
+	MinProbeConfirmations int `json:"min_probe_confirmations,omitempty"`
 }
 
 // effectiveReplicationFactor returns ProbeReplicationFactor when set, else the
@@ -180,13 +190,18 @@ type GossipPayload struct {
 	TargetID   string    `json:"target_id"`
 	TargetName string    `json:"target_name,omitempty"` // display name (config: name:)
 	TargetType string    `json:"target_type,omitempty"` // probe type: tcp/http/ping/dns/sql
-	State      string    `json:"state"`                 // "up" | "hard_down"
-	Seq        uint64    `json:"seq"`                   // Lamport sequence from engine
+	State      string    `json:"state"`                 // "up" | "hard_down" | "soft_down"
+	Seq        uint64    `json:"seq"`                   // Lamport sequence from engine (0 for soft_down signals)
 	ErrorCode  string    `json:"error_code,omitempty"`
 	NodeName   string    `json:"node_name"`             // originating node
 	// Latency is the last measured round-trip in seconds (P1.6).
 	// 0 means not measured / not applicable (failure probes, bootstrap).
-	Latency   float64   `json:"latency,omitempty"`
+	Latency float64 `json:"latency,omitempty"`
+	// RetryNum is set only when State=="soft_down". It indicates how many
+	// retry attempts have occurred so far, giving co-probers a sense of urgency.
+	// soft_down payloads are never stored in peerStates — they are transient
+	// suspect signals that trigger immediate co-prober verification.
+	RetryNum  int       `json:"retry_num,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
 }
 
@@ -442,6 +457,21 @@ type PeerAlertHandler interface {
 	DispatchPeerAlert(payload GossipPayload)
 }
 
+// SoftDownNotifier is implemented by the engine to receive soft-down suspect
+// signals from co-probers. When a prober enters soft-down for a target it
+// broadcasts a State="soft_down" payload. Other probers for the same target
+// receive this via OnStateReceived and call NotifyCoProberSoftDown so the
+// engine can trigger an immediate verification probe — shortening detection
+// latency and providing coverage if the original prober crashes before it
+// reaches hard_down.
+//
+// The signal is fire-and-forget: soft_down payloads are never stored in
+// peerStates (they carry no Lamport seq). Duplicate signals are dropped
+// harmlessly by the buffered channel in the probe loop.
+type SoftDownNotifier interface {
+	NotifyCoProberSoftDown(targetID string)
+}
+
 // InventoryRefreshHandler is implemented by the engine to re-broadcast all
 // local target states when a new peer joins the cluster. This ensures that
 // late-joining nodes catch up with already-running probers, since gossip
@@ -489,6 +519,10 @@ type Manager struct {
 	// peerAlertHandler is set by the engine to handle alerts for targets this
 	// node does not probe locally. nil until SetPeerAlertHandler is called.
 	peerAlertHandler PeerAlertHandler
+
+	// softDownNotifier is set by the engine to receive co-prober soft-down
+	// suspect signals. nil until SetSoftDownNotifier is called.
+	softDownNotifier SoftDownNotifier
 
 	// inventoryRefreshHandler is called on NotifyJoin so the engine
 	// re-broadcasts its local target states to late-joining peers.
@@ -722,6 +756,22 @@ func (m *Manager) BroadcastReliable(p GossipPayload) {
 // that ensures exactly-once alerting works even when different nodes have
 // different target configs.
 func (m *Manager) OnStateReceived(p GossipPayload) {
+	// soft_down is a transient suspect signal, not a Lamport-versioned state.
+	// Never stored in peerStates. If we are a co-prober for this target we
+	// trigger an immediate verification probe so detection latency stays low
+	// even if the originating prober crashes before reaching hard_down.
+	if p.State == "soft_down" {
+		if p.NodeName != m.cfg.NodeName && m.IsLocalProber(p.TargetID) {
+			m.mu.Lock()
+			n := m.softDownNotifier
+			m.mu.Unlock()
+			if n != nil {
+				go n.NotifyCoProberSoftDown(p.TargetID)
+			}
+		}
+		return
+	}
+
 	m.mu.Lock()
 
 	if m.peerStates[p.NodeName] == nil {
@@ -1058,6 +1108,15 @@ func (m *Manager) SetPeerAlertHandler(h PeerAlertHandler) {
 	m.mu.Unlock()
 }
 
+// SetSoftDownNotifier registers the engine callback invoked when this node
+// receives a soft_down suspect signal from a co-prober. Must be called in
+// Engine.Init after cluster.New, before gossip messages can arrive.
+func (m *Manager) SetSoftDownNotifier(n SoftDownNotifier) {
+	m.mu.Lock()
+	m.softDownNotifier = n
+	m.mu.Unlock()
+}
+
 // SetInventoryRefreshHandler registers the engine callback invoked on each
 // NotifyJoin event so the engine re-broadcasts its target states to
 // late-joining peers. Must be called in Engine.Init after cluster.New.
@@ -1185,6 +1244,14 @@ func (m *Manager) QuorumHealthy() bool {
 // ReplicationFactor returns the configured probe_replication_factor (default 3).
 func (m *Manager) ReplicationFactor() int {
 	return m.cfg.effectiveReplicationFactor()
+}
+
+// MinProbeConfirmations returns the configured min_probe_confirmations (default 0 = 1).
+// A value > 1 means shouldAlert requires that many probers to agree on hard_down
+// before dispatching a notification — useful to avoid false alerts from a single
+// node with a flaky network path.
+func (m *Manager) MinProbeConfirmations() int {
+	return m.cfg.MinProbeConfirmations
 }
 
 // startAntiEntropy is called when quorum recovers.

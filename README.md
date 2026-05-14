@@ -521,6 +521,7 @@ Default port: `10240`
 | `network_probe_cluster_status` | Gauge | name, target, type, source_host, app_name | Consensus: 1 if all nodes UP, 0 if any node DOWN |
 | `network_probe_local_assigned` | Gauge | name, target, type | 1 = this node is probing the target; 0 = another node was assigned |
 | `network_probe_prober_count` | Gauge | name, target, type | Total nodes currently probing this target |
+| `network_probe_prober_underreplicated` | Gauge | name, target, type | 1 = fewer probers than `probe_replication_factor` but not zero (degraded coverage) |
 | `network_probe_inventory_peers` | Gauge | — | Distinct peers seen via gossip |
 | `network_probe_target_orphaned` | Gauge | name, target, type | 1 = no node is probing this target (config mismatch / bad probe_from) |
 | `network_prober_quorum_healthy` | Gauge | — | 1 = quorum present, 0 = quorum lost |
@@ -597,6 +598,7 @@ By default the cluster automatically distributes probing — not every node prob
 cluster:
   probe_replication_factor: 3   # max nodes that probe any single target (default 3)
   zone: "istanbul"              # optional node label for zone-aware spread
+  min_probe_confirmations: 2    # optional: require N probers to agree on hard_down before alerting (default 1)
 ```
 
 **Selection logic:**
@@ -627,6 +629,7 @@ Useful when reachability or credentials are restricted to specific nodes, or for
 - `GET /fleet/status` — cluster-wide rollup with zone-tagged member list.
 - `network_probe_local_assigned{...}` — Prometheus check from each node.
 - `network_probe_target_orphaned{...}` — fires when no node is probing a target (bad `probe_from` / zone mismatch).
+- `network_probe_prober_underreplicated{...}` — fires when fewer than `probe_replication_factor` nodes are probing (degraded coverage, e.g. a prober recently left).
 
 ### Quorum
 
@@ -844,15 +847,17 @@ Yes — exactly 3 nodes probe each target. The other 47 are passive listeners: t
 
 Here is the complete flow for a target going down:
 
-1. The 3 designated prober nodes independently run their probe loops. Node A tries to connect to the target, gets "connection refused", and declares it `soft_down` after the first failure. After `max_retries` more failures it declares `hard_down` and broadcasts a `GossipPayload` via gossip.
-2. Nodes B and C do the same independently. All 3 broadcast their own `hard_down` declaration.
-3. The other 47 nodes receive these gossip messages via `NotifyMsg`. They store the state in their `peerStates` map. They do not start probing. They never open a connection to the target.
+1. The 3 designated prober nodes independently run their probe loops. Node A tries to connect to the target, gets "connection refused", and enters `soft_down` after the first failure. **It immediately broadcasts a `soft_down` gossip signal to co-probers B and C.** B and C receive this and fire an immediate out-of-schedule probe (without waiting for their ticker) via a fast-check channel.
+2. After `max_retries` more failures, Node A declares `hard_down` and broadcasts a `hard_down` `GossipPayload` via gossip. B and C do the same independently based on their own probe results.
+3. The other 47 nodes receive the `hard_down` gossip messages via `NotifyMsg`. They store the state in their `peerStates` map. They do not start probing. They never open a connection to the target.
 4. The consistent-hash ring determines which node is *primary* for this target. The primary checks: is the target `hard_down`? Is quorum healthy? Am I responsible? If yes to all three, it fires the alert. Once.
 5. The other 49 nodes know about the outage via `peerStates` and can report it in `/fleet/status` and `/status` — but they do not alert.
 
 The key insight: **probing is decoupled from alerting**. The 3 probers gather evidence. The hash-ring primary decides whether to alert based on that evidence.
 
-If one of the 3 probers leaves the cluster, the assignment is recomputed on all nodes (triggered by `NotifyLeave`). The hash ring selects a replacement prober from the remaining candidates. The new prober begins its probe loop within `probe_interval_sec`.
+**What happens if a prober crashes mid-soft-down?** If Node A is killed during its retry phase (soft-down), the `soft_down` gossip signal it already sent ensures B and C have already launched their own fast-checks. They will independently reach hard-down and broadcast the state — the outage is not lost. This is the purpose of the soft-down gossip signal: the evidence is distributed immediately, not held privately until hard-down.
+
+If one of the 3 probers leaves the cluster, the assignment is recomputed on all nodes (triggered by `NotifyLeave`). The hash ring selects a replacement prober from the remaining candidates. The new prober begins its probe loop within `probe_interval_sec`. Until the replacement arrives, the `network_probe_prober_underreplicated` metric fires (coverage is degraded but not zero).
 
 The 47 non-probing nodes are not idle — they still probe other targets for which they are in the designated 3. In a 50-node cluster with 100 targets, each node probes roughly `100 × 3 / 50 = 6` targets (on average). The rest of the targets they know about via gossip.
 
@@ -973,6 +978,58 @@ HARD_DOWN → UP    probe succeeds again → "reachable" alert fired, Seq++
 ```
 
 The `Seq` counter (Lamport sequence) increments on every HARD_DOWN and every recovery. It lets you correlate alert pairs: `seq=1` unreachable and `seq=2` reachable belong to the same incident.
+
+In cluster mode, the SOFT_DOWN phase is now broadcast to co-probers as a suspect signal. Co-probers immediately fire an out-of-schedule probe (the fast-check) without waiting for their next ticker tick. This means that even if the original prober crashes mid-retry, the co-probers already have enough evidence to reach HARD_DOWN independently — the failure is not silently lost.
+
+---
+
+### When is the hash ring recalculated? How stable are the 3 designated probers?
+
+The hash ring is rebuilt only on membership changes: `NotifyJoin`, `NotifyLeave`, and `NotifyUpdate` (which fires when a node's metadata changes, e.g. after a zone/region hot-reload). Between these events the ring is completely stable — the same 3 nodes probe the same target indefinitely.
+
+In a steady-state production cluster this means the ring rarely changes. If your cluster has 50 nodes and no topology changes occur, the same 3 nodes probe each target for days or weeks.
+
+When a node leaves, only the assignments that included that node are affected. If Node-A was one of 3 probers for a target and leaves, the remaining 2 still probe it (underreplicated but not orphaned). The ring picks a new third prober from the remaining candidates within the same gossip round that delivered `NotifyLeave`. The new prober starts its probe loop immediately via `StartProbing()`.
+
+**Stability in numbers:** In a 50-node cluster with 100 targets at `factor=3`:
+- A single node join/leave affects `100 × 3 / 50 = 6` targets on average (the ones that had that node as one of their 3 probers).
+- The other 94 targets see no change.
+- The recomputation itself is a local CPU operation (sort + hash), takes microseconds, and produces no network traffic.
+
+---
+
+### What is `min_probe_confirmations` and when should I use it?
+
+By default, a single prober reaching HARD_DOWN is sufficient to trigger an alert (subject to the primary/responsibility check). This is fine for most setups.
+
+However, if a prober node has a flaky uplink — it can reach the cluster peers just fine, but its path to a specific target is intermittently broken — it will declare the target HARD_DOWN while every other prober sees it as UP. This results in a false alert.
+
+`min_probe_confirmations` requires that N probers independently agree on HARD_DOWN before the primary dispatches the notification:
+
+```yaml
+cluster:
+  min_probe_confirmations: 2   # require 2 probers to agree (default: 1)
+```
+
+With `min_probe_confirmations: 2`, the flow for a 3-prober target is:
+
+```
+Prober-A: hard_down → broadcast
+Prober-B: hard_down → broadcast
+Primary (say A): confirmCount = 2 (A + B) → threshold met → alert sent
+
+vs.
+
+Prober-A alone: hard_down → broadcast
+Prober-B, C: still UP
+Primary: confirmCount = 1 → threshold NOT met → alert suppressed
+```
+
+**Trade-off:** Higher confirmation thresholds reduce false alerts from single-node network issues but also add latency — the alert fires only after `min_probe_confirmations` probers have all independently failed their full retry cycles. Set this equal to `probe_replication_factor` and alert latency is the worst-case time for all probers to exhaust their retries.
+
+**Recommendation:** `min_probe_confirmations: 2` with `probe_replication_factor: 3` is a good balance. You tolerate one isolated prober misbehaving, but two independent failure observations still alert quickly.
+
+Default: `0` (treated as `1`). When the cluster layer is disabled or `min_probe_confirmations ≤ 1`, the existing behavior is preserved exactly.
 
 ---
 

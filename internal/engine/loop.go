@@ -43,6 +43,10 @@ func (e *Engine) startProbeLoop(t Target) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	e.probeCancel[t.key()] = cancel
+	// Buffered channel (cap 1): co-prober soft-down signals trigger an
+	// immediate out-of-schedule probe without blocking the sender.
+	fastCheckCh := make(chan struct{}, 1)
+	e.probeFastCheck[t.key()] = fastCheckCh
 	e.probesMu.Unlock()
 
 	go func() {
@@ -65,6 +69,13 @@ func (e *Engine) startProbeLoop(t Target) {
 				return
 			case <-ticker.C:
 				e.runCheck(ctx, t)
+			case <-fastCheckCh:
+				// A co-prober just entered soft-down for this target. Probe
+				// immediately so we can confirm or deny the failure quickly,
+				// reducing the window where a crashed prober leaves the target
+				// in an unobserved soft-down limbo.
+				slog.Debug("fast-check triggered by co-prober soft-down", "target", t.key())
+				e.runCheck(ctx, t)
 			}
 		}
 	}()
@@ -77,6 +88,7 @@ func (e *Engine) stopProbeLoop(key string) {
 		cancel()
 		delete(e.probeCancel, key)
 	}
+	delete(e.probeFastCheck, key)
 	e.probesMu.Unlock()
 }
 
@@ -153,6 +165,8 @@ func (e *Engine) runCheck(ctx context.Context, t Target) {
 			interval := e.effectiveRetryInterval(t)
 			if e.enqueue(pkey, t, interval, errCode) {
 				slog.Warn("probe failed, queued for retry", "name", t.key(), "target", t.Target, "err", probeErr, "latency", elapsed)
+				// Broadcast soft_down to co-probers so they can fast-check.
+				e.broadcastSoftDown(t, 0)
 			}
 		}
 		GaugeUp.With(labels).Set(0)
@@ -272,6 +286,9 @@ func (e *Engine) processPending(ctx context.Context) {
 			}
 			e.stateMu.Unlock()
 			slog.Warn("probe retry failed", "name", t.key(), "target", t.Target, "retry", newCount, "max", maxRetries, "next_in", retryInterval)
+			// Re-broadcast soft_down with updated retry count so co-probers
+			// can escalate their urgency accordingly.
+			e.broadcastSoftDown(t, newCount)
 		}
 	}
 }
@@ -431,6 +448,29 @@ func (e *Engine) broadcastStateByID(targetID string, ps PersistedState) {
 		ErrorCode: ps.ErrorCode,
 		NodeName:  e.clusterNodeName(),
 		Timestamp: time.Now(),
+	})
+}
+
+// broadcastSoftDown sends a fire-and-forget soft_down suspect signal to cluster
+// peers via gossip. Unlike hard_down / up payloads, soft_down signals are NOT
+// stored in peerStates and carry seq=0 — they are purely a co-prober hint to
+// trigger an immediate out-of-schedule verification probe.
+//
+// The signal is only sent when the cluster layer is active (clusterMgr != nil).
+// In standalone mode this is a no-op since there are no co-probers to notify.
+func (e *Engine) broadcastSoftDown(t Target, retryNum int) {
+	if e.clusterMgr == nil {
+		return
+	}
+	e.clusterMgr.Broadcast(cluster.GossipPayload{
+		TargetID:   t.key(),
+		TargetName: t.Name,
+		TargetType: t.Type,
+		State:      "soft_down",
+		Seq:        0, // not a Lamport-versioned state — transient hint only
+		RetryNum:   retryNum,
+		NodeName:   e.clusterNodeName(),
+		Timestamp:  time.Now(),
 	})
 }
 

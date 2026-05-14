@@ -351,6 +351,16 @@ var (
 		Name: "network_probe_target_orphaned",
 		Help: "1 = no cluster member is currently assigned to probe this target (check probe_from / probe_from_regions / cluster.zone)",
 	}, []string{"name", "target", "type"})
+
+	// GaugeProberUnderreplicated is 1 when the actual number of assigned probers
+	// is below probe_replication_factor but above zero. Unlike orphaned (which
+	// means nobody probes), underreplicated means coverage is degraded — fewer
+	// probers than intended are watching the target. Typically caused by node
+	// failures or probe_from pin lists with insufficient alive candidates.
+	GaugeProberUnderreplicated = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "network_probe_prober_underreplicated",
+		Help: "1 = target has fewer assigned probers than probe_replication_factor (coverage degraded but not zero)",
+	}, []string{"name", "target", "type"})
 )
 
 // RegisterMetrics registers the core (non-cluster) metrics with reg.
@@ -367,7 +377,7 @@ func RegisterMetrics(reg *prometheus.Registry) {
 func RegisterClusterMetrics(reg *prometheus.Registry) {
 	reg.MustRegister(GaugeQuorumHealthy, GaugeIsolated, GaugeClusterSize, GaugeClusterStatus)
 	reg.MustRegister(GaugeLocalAssigned, GaugeProberCount, GaugeInventoryPeers)
-	reg.MustRegister(GaugeTargetOrphaned)
+	reg.MustRegister(GaugeTargetOrphaned, GaugeProberUnderreplicated)
 	// P1.5 config drift metric.
 	reg.MustRegister(cluster.GaugeConfigDrift)
 	// P1.6 geo-latency metrics.
@@ -576,8 +586,9 @@ type Engine struct {
 	pending   map[string]PendingEntry   // soft-down queue; RAM only; key = target.typeKey()
 
 	// Per-target probe goroutine management.
-	probesMu    sync.Mutex
-	probeCancel map[string]context.CancelFunc // key = target.key()
+	probesMu      sync.Mutex
+	probeCancel   map[string]context.CancelFunc // key = target.key()
+	probeFastCheck map[string]chan struct{}       // key = target.key(); co-prober soft-down trigger
 
 	// retryStop cancels the background retry-loop goroutine.
 	retryStop func()
@@ -731,9 +742,10 @@ func New(hostname string, runner AlertRunner, configPath string) *Engine {
 		hostname:    hostname,
 		alertRunner: runner,
 		configPath:  configPath,
-		lastKnown:   make(map[string]PersistedState),
-		pending:     make(map[string]PendingEntry),
-		probeCancel: make(map[string]context.CancelFunc),
+		lastKnown:      make(map[string]PersistedState),
+		pending:        make(map[string]PendingEntry),
+		probeCancel:    make(map[string]context.CancelFunc),
+		probeFastCheck: make(map[string]chan struct{}),
 	}
 	hck := &httpChecker{client: hc}
 	e.checkers = map[string]Checker{
@@ -1098,6 +1110,10 @@ func (e *Engine) Init() error {
 		// layer will call StartProbing / StopProbing as membership changes
 		// shift prober responsibilities on and off this node.
 		e.clusterMgr.SetProberAssignmentListener(e)
+		// Wire soft-down notifier: when a co-prober broadcasts a soft_down
+		// suspect signal, NotifyCoProberSoftDown triggers an immediate out-of-
+		// schedule verification probe on this node without waiting for the ticker.
+		e.clusterMgr.SetSoftDownNotifier(e)
 		// Wire inventory refresh handler (Phase 13): cluster calls
 		// BroadcastInventory on each NotifyJoin so late-joining peers
 		// receive this node's current target states.
@@ -1256,6 +1272,14 @@ func (e *Engine) updateClusterMetrics() {
 		} else {
 			GaugeLocalAssigned.With(ownerLabels).Set(0)
 		}
+
+		// Underreplicated: assigned probers fewer than factor but not zero.
+		factor := e.clusterMgr.ReplicationFactor()
+		if len(probers) > 0 && len(probers) < factor {
+			GaugeProberUnderreplicated.With(ownerLabels).Set(1)
+		} else {
+			GaugeProberUnderreplicated.With(ownerLabels).Set(0)
+		}
 	}
 
 	// Inventory-peer count: distinct peer names with at least one broadcast
@@ -1393,6 +1417,7 @@ func (e *Engine) computeScope(targetID string, localDown bool) string {
 //   - Standalone (no cluster): always true
 //   - Isolated mode: always false — suppress until quorum recovers
 //   - Cluster + quorum: only the responsible node (primary or secondary) alerts
+//   - min_probe_confirmations > 1: requires N probers to agree on hard_down
 func (e *Engine) shouldAlert(targetID string) bool {
 	if e.clusterMgr == nil {
 		return true
@@ -1405,7 +1430,58 @@ func (e *Engine) shouldAlert(targetID string) bool {
 		slog.Debug("alert suppressed: not responsible", "target", targetID)
 		return false
 	}
+	// min_probe_confirmations guard: wait until enough probers agree on hard_down.
+	// This prevents a single node with a flaky network path from alerting on its own.
+	minConf := e.effectiveMinConfirmations()
+	if minConf > 1 {
+		confirmCount := 0
+		e.stateMu.RLock()
+		if e.lastKnown[targetID].State == "hard_down" {
+			confirmCount++
+		}
+		e.stateMu.RUnlock()
+		for _, peer := range e.clusterMgr.PeerStatesForTarget(targetID) {
+			if peer.State == "hard_down" && peer.NodeName != e.hostname {
+				confirmCount++
+			}
+		}
+		if confirmCount < minConf {
+			slog.Debug("alert suppressed: insufficient confirmations",
+				"target", targetID, "confirmations", confirmCount, "required", minConf)
+			return false
+		}
+	}
 	return true
+}
+
+// effectiveMinConfirmations returns the configured min_probe_confirmations for
+// the cluster, defaulting to 1 (no multi-confirmation requirement).
+func (e *Engine) effectiveMinConfirmations() int {
+	if e.clusterMgr == nil {
+		return 1
+	}
+	if v := e.clusterMgr.MinProbeConfirmations(); v > 1 {
+		return v
+	}
+	return 1
+}
+
+// NotifyCoProberSoftDown implements cluster.SoftDownNotifier. Called by the
+// cluster layer when a co-prober node broadcasts a soft_down suspect signal for
+// targetID. Sends a non-blocking signal to the probe loop's fast-check channel
+// so the loop fires an immediate out-of-schedule verification probe without
+// waiting for the next ticker tick.
+func (e *Engine) NotifyCoProberSoftDown(targetID string) {
+	e.probesMu.Lock()
+	ch, ok := e.probeFastCheck[targetID]
+	e.probesMu.Unlock()
+	if !ok {
+		return
+	}
+	select {
+	case ch <- struct{}{}:
+	default: // already signaled; the probe loop will pick it up
+	}
 }
 
 // ── LocalTargetProvider (cluster.LocalTargetProvider) ────────────────────────

@@ -18,6 +18,66 @@ Bu belge, netwatch projesinin günlük güncellemelerini ve teknik detaylarını
 
 ## 2026-05-14
 
+- [backend] **Soft-down gossip, fast-check probe, underreplicated metric, min_probe_confirmations.**
+
+  Dört bağlantılı problem çözüldü:
+
+  **Problem 1 — Soft-down kaybolursa ne olur?**
+  Bir prober node soft-down aldıktan sonra hard-down'a escalate edemeden kill/leave olursa, cluster başka hiçbir node'un haberi olmadan o target hakkında belirsizlikte kalıyor.
+
+  **Çözüm — Soft-down gossip sinyali:**
+  - `internal/engine/loop.go`: `broadcastSoftDown(t Target, retryNum int)` yeni fonksiyon — `State="soft_down"`, `Seq=0` (Lamport versiyonsuz), `RetryNum` dahil, fire-and-forget payload ile cluster.Broadcast
+  - `runCheck`: target ilk kez soft-down'a girdiğinde (`enqueue` true döndüğünde) `broadcastSoftDown(t, 0)` çağrılıyor
+  - `processPending`: her başarısız retry sonrasında `broadcastSoftDown(t, newCount)` çağrılıyor (retry sayısı co-probers için urgency göstergesi)
+  - `internal/cluster/cluster.go`: `OnStateReceived` soft_down için erken dönüş — peerStates'e yazılmıyor, sadece `SoftDownNotifier` tetikleniyor
+  - `cluster.SoftDownNotifier` interface: `NotifyCoProberSoftDown(targetID string)` — engine bu interface'i implement ediyor
+
+  **Problem 2 — Co-prober nasıl tepki verir?**
+  Soft-down sinyali alan co-prober, bir sonraki ticker tick'ini beklemeden anında probe yapmalı.
+
+  **Çözüm — Fast-check channel:**
+  - `internal/engine/engine.go`: `Engine.probeFastCheck map[string]chan struct{}` — per-target buffered(1) channel
+  - `startProbeLoop`: `fastCheckCh := make(chan struct{}, 1)` oluşturuyor, `probeFastCheck[t.key()]` map'ine yazıyor; probe goroutine'i `case <-fastCheckCh:` select branch'i ile anında probe tetikleyebilir
+  - `stopProbeLoop`: `delete(e.probeFastCheck, key)` ile cleanup
+  - `NotifyCoProberSoftDown(targetID)`: `probeFastCheck[targetID]` channel'a non-blocking send — channel dolu ise drop (zaten sinyal var)
+
+  **Problem 3 — Tek node'un network problemi yanlış alarm üretir (split-brain light).**
+  Bir node'un kendi network bağlantısı bozuksa hard-down'a geçip alarm atar ama diğer probers target'ı sağlıklı görüyor olabilir.
+
+  **Çözüm — `min_probe_confirmations`:**
+  - `internal/cluster/cluster.go`: `Config.MinProbeConfirmations int` yeni config alanı
+  - `Manager.MinProbeConfirmations() int` getter
+  - `internal/engine/engine.go`: `effectiveMinConfirmations()` helper; `shouldAlert()` — `minConf > 1` iken tüm probers'ın hard_down count'u toplanıyor, yeterli confirmation yoksa alarm suppressed + debug log
+  - Default 0 (=1 confirmation = mevcut davranış korunur, geriye uyumlu)
+
+  **Problem 4 — Underreplicated coverage tespiti.**
+  `factor=3` ama yalnızca 2 node probe ediyorsa (biri yeni join etmedi, biri leave etti) orphan değil ama degraded.
+
+  **Çözüm — `network_probe_prober_underreplicated` metric:**
+  - `internal/engine/engine.go`: `GaugeProberUnderreplicated` GaugeVec — `1 = len(probers)>0 && len(probers)<factor`
+  - `RegisterClusterMetrics` + `updateClusterMetrics` loop'una eklendi
+  - Label'lar: `name`, `target`, `type` (ownership set — host/app değil)
+
+  **Özet akış (50 node, factor=3, target down):**
+  ```
+  Prober-A: soft_down → broadcastSoftDown → gossip(State="soft_down")
+  Prober-B/C: OnStateReceived → NotifyCoProberSoftDown → probeFastCheck←signal
+  Prober-B/C goroutine: case <-fastCheckCh → runCheck (anında, ticker beklenmez)
+  Eğer minConf=2: Prober-A hard_down aldı, B de hard_down alırsa → shouldAlert=true
+                  Sadece A hard_down gördüyse → shouldAlert=false (suppressed)
+  ```
+
+  **Değiştirilen dosyalar:**
+  - `internal/cluster/cluster.go`: `Config.MinProbeConfirmations`, `GossipPayload.RetryNum`, `SoftDownNotifier` interface, `Manager.softDownNotifier`, `SetSoftDownNotifier()`, `Manager.MinProbeConfirmations()`, `OnStateReceived` soft_down early-return
+  - `internal/engine/engine.go`: `probeFastCheck` field + init, `GaugeProberUnderreplicated` + register, `NotifyCoProberSoftDown()`, `effectiveMinConfirmations()`, `shouldAlert()` min-conf guard, `updateClusterMetrics` underreplicated gauge, `Init()` `SetSoftDownNotifier(e)` wiring
+  - `internal/engine/loop.go`: `startProbeLoop` fastCheckCh + select branch, `stopProbeLoop` cleanup, `broadcastSoftDown()` yeni fonksiyon, `runCheck` + `processPending` call sites
+
+  **Build + Test:**
+  ```
+  go build ./internal/engine/ ./internal/cluster/ ./cmd/linux/  ✓
+  go test -race -timeout 120s ./internal/engine/... ./internal/cluster/...  ✓
+  ```
+
 - [backend] [test] **Windows/Linux parity + comprehensive E2E test suite (31 tests, all pass with -race).**
 
   İki büyük iş tamamlandı:
