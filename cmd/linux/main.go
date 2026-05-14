@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -33,6 +34,10 @@ func main() {
 		switch os.Args[1] {
 		case "init":
 			cmdInit(os.Args[2:])
+		case "join":
+			cmdJoin(os.Args[2:])
+		case "keyring":
+			cmdKeyring(os.Args[2:])
 		case "leave":
 			cmdLeave(os.Args[2:])
 		case "uninstall":
@@ -40,12 +45,8 @@ func main() {
 		case "validate":
 			cmdValidate(os.Args[2:])
 		default:
-			fmt.Fprintf(os.Stderr, "unknown subcommand %q\n\nUsage:\n", os.Args[1])
-			fmt.Fprintf(os.Stderr, "  %s [--config FILE]            start the monitoring agent\n", engine.BinaryName)
-			fmt.Fprintf(os.Stderr, "  %s init [--config-dir DIR]    generate config skeleton + systemd unit\n", engine.BinaryName)
-			fmt.Fprintf(os.Stderr, "  %s validate [--config FILE]   validate config without starting\n", engine.BinaryName)
-			fmt.Fprintf(os.Stderr, "  %s leave [--port PORT]        tell a running agent to leave the cluster\n", engine.BinaryName)
-			fmt.Fprintf(os.Stderr, "  %s uninstall                  stop service, remove unit, optionally delete config\n", engine.BinaryName)
+			fmt.Fprintf(os.Stderr, "unknown subcommand %q\n\n", os.Args[1])
+			printUsage(os.Stderr)
 			os.Exit(1)
 		}
 		return
@@ -209,20 +210,6 @@ func main() {
 		}
 	})
 
-	// /cluster/config returns the P1.5 config-sync snapshot: this node's hash
-	// and each peer's hash with an in-sync flag. 503 when cluster is disabled.
-	mux.HandleFunc("/cluster/config", func(w http.ResponseWriter, _ *http.Request) {
-		mgr := e.ClusterManager()
-		if mgr == nil {
-			http.Error(w, `{"error":"cluster disabled"}`, http.StatusServiceUnavailable)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(mgr.ConfigSyncSnapshot()); err != nil {
-			slog.Error("cluster/config encode error", "err", err)
-		}
-	})
-
 	// /geo/latency/{targetID} returns the P1.6 per-node latency view for a
 	// specific target, including region labels and the anomaly flag.
 	mux.HandleFunc("/geo/latency/", func(w http.ResponseWriter, r *http.Request) {
@@ -322,13 +309,27 @@ func main() {
 		}
 	})
 
-	// PUT /cluster/config — distribute a partial SharedConfig to all nodes.
-	// Body: JSON or YAML (Content-Type: application/json or application/x-yaml).
+	// GET  /cluster/config — P1.5 config-sync snapshot (hash + per-peer drift).
+	// PUT  /cluster/config — distribute a partial SharedConfig to all nodes.
+	// PUT body: JSON or YAML (Content-Type: application/json or application/x-yaml).
 	// Only shared fields are applied; node-specific fields are always ignored.
-	// Requires admin.token auth if configured.
+	// PUT requires admin.token auth if configured.
 	mux.HandleFunc("/cluster/config", func(w http.ResponseWriter, r *http.Request) {
+		mgr := e.ClusterManager()
+		// GET: drift snapshot (open for read).
+		if r.Method == http.MethodGet || r.Method == "" {
+			if mgr == nil {
+				http.Error(w, `{"error":"cluster disabled"}`, http.StatusServiceUnavailable)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(mgr.ConfigSyncSnapshot()); err != nil {
+				slog.Error("cluster/config encode error", "err", err)
+			}
+			return
+		}
 		if r.Method != http.MethodPut {
-			http.Error(w, `{"error":"use PUT"}`, http.StatusMethodNotAllowed)
+			http.Error(w, `{"error":"use GET or PUT"}`, http.StatusMethodNotAllowed)
 			return
 		}
 		if !checkAdminAuth(e, w, r) {
@@ -336,7 +337,6 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "application/json")
 
-		mgr := e.ClusterManager()
 		if mgr == nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_ = json.NewEncoder(w).Encode(map[string]string{
@@ -447,6 +447,12 @@ func main() {
 	port := e.Port()
 	slog.Info(engine.BinaryName+" listening", "port", port, "alias", e.NodeAlias(), "host", hostname)
 
+	// Cluster startup banner — printed once, after memberlist has chosen its
+	// advertise address. Helps operators copy-paste the join command for new nodes.
+	if mgr := e.ClusterManager(); mgr != nil {
+		printJoinBanner(e)
+	}
+
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		slog.Error("server error", "err", err)
 		os.Exit(1)
@@ -456,9 +462,24 @@ func main() {
 // ── Subcommands ───────────────────────────────────────────────────────────────
 
 // cmdInit generates a config skeleton, a credentials file, and a systemd unit.
+//
+// Flags:
+//
+//	--config-dir DIR  destination directory (default /etc/netwatch)
+//	--cluster         enable cluster mode in the generated config, auto-generate
+//	                  a random AES-256 keyring, and print a `netwatch join`
+//	                  command that other nodes can copy-paste to join.
+//	--bind-port N     gossip port for cluster mode (default 7946)
+//
+// If config.yaml already exists at the destination, an interactive prompt
+// asks whether to overwrite. The default is "no" — pass --force to skip the
+// prompt and overwrite unconditionally.
 func cmdInit(args []string) {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
 	configDir := fs.String("config-dir", filepath.Join("/etc", engine.BinaryName), "directory to write config files")
+	cluster := fs.Bool("cluster", false, "generate a cluster-enabled config with a random keyring + join command")
+	bindPort := fs.Int("bind-port", 7946, "gossip bind port when --cluster is set")
+	force := fs.Bool("force", false, "overwrite an existing config without prompting")
 	_ = fs.Parse(args)
 
 	if err := os.MkdirAll(*configDir, 0755); err != nil {
@@ -471,11 +492,44 @@ func cmdInit(args []string) {
 	unitDir := "/etc/systemd/system"
 	unitFile := filepath.Join(unitDir, engine.BinaryName+".service")
 
-	writeIfAbsent(configFile, configSkeleton(*configDir))
+	// Overwrite confirmation for the main config file.
+	if _, err := os.Stat(configFile); err == nil && !*force {
+		fmt.Printf("Config already exists at %s\n", configFile)
+		if !promptYesNo("Overwrite?", false) {
+			fmt.Println("Aborted. Re-run with --force to overwrite without prompting.")
+			os.Exit(1)
+		}
+	}
+
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = engine.BinaryName + "-node"
+	}
+
+	var keyringKey string
+	if *cluster {
+		k, err := engine.GenerateKeyringKey()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error generating keyring: %v\n", err)
+			os.Exit(1)
+		}
+		keyringKey = k
+	}
+
+	// Write config (always overwrites here; we already prompted above).
+	cfg := configSkeleton(*configDir)
+	if *cluster {
+		cfg = clusterConfigSkeleton(*configDir, hostname, *bindPort, keyringKey)
+	}
+	if err := os.WriteFile(configFile, []byte(cfg), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "error writing %s: %v\n", configFile, err)
+		os.Exit(1)
+	}
+	fmt.Printf("  (written) %s\n", configFile)
+
 	writeIfAbsent(credsFile, credsSkeleton)
 
 	// Write the systemd unit only when the systemd directory exists.
-	// On non-systemd systems (macOS, Alpine with OpenRC, etc.) print a hint instead.
 	systemdAvailable := false
 	if info, err := os.Stat(unitDir); err == nil && info.IsDir() {
 		writeIfAbsent(unitFile, systemdUnit(*configDir))
@@ -495,7 +549,7 @@ func cmdInit(args []string) {
 	}
 	fmt.Println()
 	fmt.Printf("Next steps:\n")
-	fmt.Printf("  1. Edit %s\n", configFile)
+	fmt.Printf("  1. Edit %s (add targets, notifications, etc.)\n", configFile)
 	if systemdAvailable {
 		fmt.Printf("  2. sudo systemctl daemon-reload\n")
 		fmt.Printf("  3. sudo systemctl enable --now %s\n", engine.BinaryName)
@@ -503,6 +557,61 @@ func cmdInit(args []string) {
 		fmt.Printf("  2. Copy the .service file to your init system's unit directory\n")
 		fmt.Printf("  3. Enable and start the service\n")
 	}
+
+	if *cluster {
+		advertiseAddr := defaultAdvertiseAddr()
+		joinAddr := fmt.Sprintf("%s:%d", advertiseAddr, *bindPort)
+		fmt.Println()
+		fmt.Println("─────────────────────────────────────────────────────────")
+		fmt.Println("  Cluster enabled — keep this keyring SECRET")
+		fmt.Println()
+		fmt.Printf("  Keyring: %s\n", keyringKey)
+		fmt.Printf("  Node   : %s\n", hostname)
+		fmt.Printf("  Addr   : %s   (auto-detected; override in config if needed)\n", joinAddr)
+		fmt.Println()
+		fmt.Println("  To add another node, run on it:")
+		fmt.Println()
+		fmt.Printf("    %s join \\\n", engine.BinaryName)
+		fmt.Printf("      --keyring %s \\\n", keyringKey)
+		fmt.Printf("      --addr %s\n", joinAddr)
+		fmt.Println("─────────────────────────────────────────────────────────")
+	}
+}
+
+// defaultAdvertiseAddr returns a reasonable advertise IP for the join command
+// printed by `init --cluster`. Prefers a non-loopback IPv4 address.
+func defaultAdvertiseAddr() string {
+	addrs, err := netInterfaceAddrs()
+	if err != nil {
+		return "<your-ip>"
+	}
+	for _, a := range addrs {
+		if a != "" && !strings.HasPrefix(a, "127.") && !strings.HasPrefix(a, "169.254.") {
+			return a
+		}
+	}
+	return "<your-ip>"
+}
+
+// promptYesNo asks the user a yes/no question. Returns true on "y"/"yes",
+// false on anything else (including empty input). The default is appended
+// to the prompt in [Y/n] / [y/N] form.
+func promptYesNo(prompt string, defaultYes bool) bool {
+	suffix := "[y/N]"
+	if defaultYes {
+		suffix = "[Y/n]"
+	}
+	fmt.Printf("%s %s: ", prompt, suffix)
+	rd := bufio.NewReader(os.Stdin)
+	line, err := rd.ReadString('\n')
+	if err != nil {
+		return defaultYes
+	}
+	s := strings.ToLower(strings.TrimSpace(line))
+	if s == "" {
+		return defaultYes
+	}
+	return s == "y" || s == "yes"
 }
 
 // cmdLeave sends a graceful-leave request to a running agent over HTTP.
@@ -949,4 +1058,304 @@ func parseSharedConfigBody(body []byte, contentType string) (json.RawMessage, er
 		}
 		return json.RawMessage(body), nil
 	}
+}
+
+// ── join / keyring subcommands ────────────────────────────────────────────────
+
+// cmdJoin writes a cluster-enabled config to disk so this node joins the
+// cluster identified by the given keyring + seed address. Flags:
+//
+//	--keyring K       base64 AES key shared by the cluster (required)
+//	--addr  H:P       any existing peer's bind address    (required)
+//	--config PATH     destination config.yaml             (default: auto-detect)
+//	--bind-port N     this node's gossip port             (default 7946)
+//	--node-name NAME  cluster identity for this node      (default: hostname)
+//
+// Behaviour:
+//   - If the config file does not exist, a minimal skeleton is created.
+//   - If it exists, only the cluster.* fields are overwritten — targets,
+//     notifications, slo, etc. are preserved.
+//   - The agent is NOT started here. If one is already running, its hot-reload
+//     loop picks up the new config within reload_interval_sec (default 30 s).
+func cmdJoin(args []string) {
+	fs := flag.NewFlagSet("join", flag.ExitOnError)
+	keyring := fs.String("keyring", "", "base64 AES key (required)")
+	addr := fs.String("addr", "", "any peer's bind address as host:port (required)")
+	cfgPath := fs.String("config", "", "destination config.yaml (default: auto-detect)")
+	bindPort := fs.Int("bind-port", 7946, "this node's gossip bind port")
+	nodeName := fs.String("node-name", "", "cluster identity for this node (default: hostname)")
+	_ = fs.Parse(args)
+
+	// Validate inputs.
+	if *keyring == "" {
+		fmt.Fprintln(os.Stderr, "error: --keyring is required")
+		os.Exit(1)
+	}
+	if *addr == "" {
+		fmt.Fprintln(os.Stderr, "error: --addr is required (e.g. --addr 192.168.1.10:7946)")
+		os.Exit(1)
+	}
+	if _, _, err := net.SplitHostPort(*addr); err != nil {
+		fmt.Fprintf(os.Stderr, "error: --addr is not host:port — %v\n", err)
+		os.Exit(1)
+	}
+	if !validKeyringKey(*keyring) {
+		fmt.Fprintln(os.Stderr, "error: --keyring is not a valid base64 AES key (16, 24, or 32 raw bytes)")
+		os.Exit(1)
+	}
+
+	// Resolve config path.
+	path := *cfgPath
+	if path == "" {
+		path = filepath.Join("/etc", engine.BinaryName, "config.yaml")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "error creating config dir: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Resolve node name.
+	name := *nodeName
+	if name == "" {
+		h, _ := os.Hostname()
+		if h == "" {
+			h = engine.BinaryName + "-node"
+		}
+		name = h
+	}
+
+	// Load existing config if present (preserve targets, notifications, etc.).
+	var m map[string]interface{}
+	if raw, err := os.ReadFile(path); err == nil {
+		_ = sigs_yaml.Unmarshal(raw, &m)
+	}
+	if m == nil {
+		// Fresh skeleton.
+		m = map[string]interface{}{
+			"port":              "10240",
+			"state_file":        filepath.Join(filepath.Dir(path), "state.json"),
+			"log_path":          filepath.Join(filepath.Dir(path), "agent.log"),
+			"credentials_file":  filepath.Join(filepath.Dir(path), "credentials.env"),
+			"timeout":           5,
+			"max_retries":       2,
+			"retry_interval_sec": 30,
+			"probe_interval_sec": 60,
+			"ticker_interval_sec": 5,
+			"reload_interval_sec": 30,
+			"notifications":      map[string]interface{}{},
+			"default_notify":     []string{},
+			"targets":            []interface{}{},
+		}
+	}
+
+	// Overwrite cluster section.
+	m["cluster"] = map[string]interface{}{
+		"enabled":   true,
+		"node_name": name,
+		"bind_port": *bindPort,
+		"peers":     []string{*addr},
+		"keyring":   []string{*keyring},
+	}
+
+	out, err := sigs_yaml.Marshal(m)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error marshalling config: %v\n", err)
+		os.Exit(1)
+	}
+
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "error writing temp config: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		fmt.Fprintf(os.Stderr, "error renaming config: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("✓ Config written to %s\n", path)
+	fmt.Printf("  cluster.enabled  : true\n")
+	fmt.Printf("  cluster.node_name: %s\n", name)
+	fmt.Printf("  cluster.bind_port: %d\n", *bindPort)
+	fmt.Printf("  cluster.peers    : [%s]\n", *addr)
+	fmt.Printf("  cluster.keyring  : %s (%d bytes)\n", maskKeyring(*keyring), keyringRawLen(*keyring))
+	fmt.Println()
+	fmt.Println("If netwatch is already running:")
+	fmt.Printf("  → hot-reload picks this up within reload_interval_sec (~30s)\n")
+	fmt.Println()
+	fmt.Println("Otherwise start it:")
+	fmt.Printf("  sudo systemctl start %s\n", engine.BinaryName)
+	fmt.Printf("    (or: %s --config %s)\n", engine.BinaryName, path)
+}
+
+// cmdKeyring dispatches `keyring` subcommands. Currently only `generate`.
+func cmdKeyring(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: netwatch keyring <generate>")
+		os.Exit(1)
+	}
+	switch args[0] {
+	case "generate":
+		k, err := engine.GenerateKeyringKey()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(k)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown keyring subcommand %q (try: generate)\n", args[0])
+		os.Exit(1)
+	}
+}
+
+// validKeyringKey checks that s is base64-encoded and decodes to 16/24/32 bytes.
+func validKeyringKey(s string) bool {
+	raw, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		raw, err = base64.RawStdEncoding.DecodeString(s)
+		if err != nil {
+			return false
+		}
+	}
+	return len(raw) == 16 || len(raw) == 24 || len(raw) == 32
+}
+
+func keyringRawLen(s string) int {
+	raw, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		raw, _ = base64.RawStdEncoding.DecodeString(s)
+	}
+	return len(raw)
+}
+
+func maskKeyring(s string) string {
+	if len(s) <= 8 {
+		return "****"
+	}
+	return "****" + s[len(s)-6:]
+}
+
+// netInterfaceAddrs returns non-loopback IPv4 addresses on this host.
+func netInterfaceAddrs() ([]string, error) {
+	ifaces, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, a := range ifaces {
+		ipnet, ok := a.(*net.IPNet)
+		if !ok || ipnet.IP.IsLoopback() {
+			continue
+		}
+		if ip4 := ipnet.IP.To4(); ip4 != nil {
+			out = append(out, ip4.String())
+		}
+	}
+	return out, nil
+}
+
+// printUsage prints the CLI help summary.
+func printUsage(w io.Writer) {
+	bn := engine.BinaryName
+	fmt.Fprintf(w, "Usage:\n")
+	fmt.Fprintf(w, "  %s [--config FILE]                  start the monitoring agent\n", bn)
+	fmt.Fprintf(w, "  %s init [--cluster] [--config-dir DIR] [--bind-port N] [--force]\n", bn)
+	fmt.Fprintf(w, "                                      generate config skeleton (and join command if --cluster)\n")
+	fmt.Fprintf(w, "  %s join --keyring K --addr H:P [--config PATH] [--bind-port N] [--node-name N]\n", bn)
+	fmt.Fprintf(w, "                                      join an existing cluster\n")
+	fmt.Fprintf(w, "  %s keyring generate                 print a fresh AES-256 keyring key (base64)\n", bn)
+	fmt.Fprintf(w, "  %s validate [--config FILE]         validate config without starting\n", bn)
+	fmt.Fprintf(w, "  %s leave [--port PORT]              tell a running agent to leave the cluster\n", bn)
+	fmt.Fprintf(w, "  %s uninstall                        stop service, remove unit, optionally delete config\n", bn)
+}
+
+// printJoinBanner writes the operator-facing cluster banner to stdout.
+// Called once at agent startup when cluster mode is enabled.
+func printJoinBanner(e *engine.Engine) {
+	addr := e.LocalClusterAddr()
+	key := e.ClusterPrimaryKey()
+	if addr == "" || key == "" {
+		// Cluster manager exists but advertise address / keyring unavailable
+		// (e.g. encryption disabled). Skip the banner — the join command would
+		// be incomplete or misleading.
+		return
+	}
+	members := e.ClusterMemberCount()
+	fmt.Println()
+	fmt.Println("=========================================================")
+	fmt.Println("  netwatch cluster ready")
+	fmt.Println()
+	fmt.Printf("  Node     : %s\n", e.ClusterManager().NodeName())
+	fmt.Printf("  Address  : %s\n", addr)
+	fmt.Printf("  Members  : %d\n", members)
+	fmt.Println()
+	fmt.Println("  To add another node, run on it:")
+	fmt.Println()
+	fmt.Printf("    %s join \\\n", engine.BinaryName)
+	fmt.Printf("      --keyring %s \\\n", key)
+	fmt.Printf("      --addr %s\n", addr)
+	fmt.Println()
+	fmt.Println("=========================================================")
+}
+
+// clusterConfigSkeleton returns a config.yaml with cluster.enabled=true and
+// a pre-generated keyring. Used by `init --cluster`.
+func clusterConfigSkeleton(cfgDir, nodeName string, bindPort int, keyringKey string) string {
+	type tdata struct {
+		BinaryName, CfgDir, NodeName, KeyringKey string
+		BindPort                                 int
+	}
+	tmpl := template.Must(template.New("clusterCfg").Parse(
+		`# {{.BinaryName}} configuration — cluster mode
+# Full reference: https://github.com/saidtaylan/netwatch
+
+# Optional human-readable label for this agent.
+# node_alias: "{{.NodeName}}"
+
+port: "10240"
+state_file: "{{.CfgDir}}/state.json"
+log_path:   "{{.CfgDir}}/agent.log"
+credentials_file: "{{.CfgDir}}/credentials.env"
+
+timeout:            5
+max_retries:        2
+retry_interval_sec: 30
+probe_interval_sec: 60
+ticker_interval_sec: 5
+reload_interval_sec: 30
+
+notifications: {}
+
+default_notify: []
+
+targets:
+  - name: example-tcp
+    type: tcp
+    target: "127.0.0.1:22"
+
+cluster:
+  enabled: true
+  node_name: "{{.NodeName}}"
+  bind_port: {{.BindPort}}
+  # advertise_addr: ""        # leave empty for memberlist auto-detect
+  peers: []                   # other nodes will be added via 'netwatch join'
+  keyring:
+    - "{{.KeyringKey}}"
+  expected_node_count: 1      # bump as more nodes join
+  min_quorum_ratio: 0.5
+  probe_replication_factor: 3
+
+# admin:
+#   token: "${ADMIN_TOKEN}"   # required for write-capable HTTP endpoints
+`))
+	var sb strings.Builder
+	_ = tmpl.Execute(&sb, tdata{
+		BinaryName: engine.BinaryName,
+		CfgDir:     cfgDir,
+		NodeName:   nodeName,
+		BindPort:   bindPort,
+		KeyringKey: keyringKey,
+	})
+	return sb.String()
 }

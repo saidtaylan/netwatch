@@ -772,6 +772,31 @@ slo:
 
 ---
 
+## ✅ CLI Join Workflow + Startup Banner (TAMAMLANDI — 2026-05-14)
+
+**Hedef:** Operatörün cluster'a node eklemesi için tek komutluk akış. kubeadm/elasticsearch tarzı.
+
+**Tamamlanan görevler:**
+
+1. `netwatch init --cluster` — cluster-enabled config skeleton + random AES-256 keyring + copy-paste join komutu çıktısı
+2. `netwatch join --keyring K --addr H:P [--bind-port N] [--node-name N] [--config PATH]` — config yoksa skeleton, varsa cluster.* override, atomik yazım
+3. `netwatch keyring generate` — base64 AES-256 key basar
+4. Startup banner: `cluster.enabled=true` agent başladıktan sonra stdout'a node adı + LocalAddr + keyring ile join komutunu basar
+5. `internal/engine/join.go` — `GenerateKeyringKey()`, `LocalClusterAddr()`, `ClusterPrimaryKey()`, `ClusterMemberCount()`
+6. `cluster.Manager.LocalAddr()`, `Manager.PrimaryKey()` — memberlist LocalNode() üzerinden gerçek advertise adresi
+7. cmd/linux + cmd/windows: yeni subcommand'lar + helper'lar (`promptYesNo`, `validKeyringKey`, `maskKeyring`, `defaultAdvertiseAddr`)
+8. `/cluster/config` GET (drift snapshot) ve PUT (config push) handler'ları tek mux pattern'a birleştirildi (mux conflict bug fix)
+9. Init overwrite prompt: config varsa "Overwrite? [y/N]" default hayır, `--force` ile bypass
+
+**Build + Test:**
+```
+go build ./internal/engine/ ./internal/cluster/ ./cmd/linux/  ✓
+GOOS=windows go build ./cmd/windows/                          ✓
+go test -race -count=1 -timeout 120s ./internal/...           ✓
+```
+
+---
+
 ## ✅ Config Push/Sync + node_alias + Admin Auth (TAMAMLANDI — 2026-05-14)
 
 **Hedef:** Bir node'dan ortak konfigürasyonu tüm cluster'a dağıtabilme.

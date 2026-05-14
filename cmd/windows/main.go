@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -35,6 +36,12 @@ func main() {
 		switch os.Args[1] {
 		case "service":
 			cmdService(os.Args[2:])
+		case "init":
+			cmdInit(os.Args[2:])
+		case "join":
+			cmdJoin(os.Args[2:])
+		case "keyring":
+			cmdKeyring(os.Args[2:])
 		case "leave":
 			cmdLeave(os.Args[2:])
 		case "validate":
@@ -42,13 +49,8 @@ func main() {
 		case "uninstall":
 			cmdUninstall(os.Args[2:])
 		default:
-			fmt.Fprintf(os.Stderr, "unknown subcommand %q\n\nUsage:\n", os.Args[1])
-			fmt.Fprintf(os.Stderr, "  %s [--config FILE]              start the monitoring agent\n", engine.BinaryName)
-			fmt.Fprintf(os.Stderr, "  %s validate [--config FILE]     validate config without starting\n", engine.BinaryName)
-			fmt.Fprintf(os.Stderr, "  %s service install [--config F] register as a Windows Service\n", engine.BinaryName)
-			fmt.Fprintf(os.Stderr, "  %s service remove               unregister the Windows Service\n", engine.BinaryName)
-			fmt.Fprintf(os.Stderr, "  %s leave [--port PORT]          tell a running agent to leave the cluster\n", engine.BinaryName)
-			fmt.Fprintf(os.Stderr, "  %s uninstall [--port PORT]      stop service, remove it, optionally delete config\n", engine.BinaryName)
+			fmt.Fprintf(os.Stderr, "unknown subcommand %q\n\n", os.Args[1])
+			printUsage(os.Stderr)
 			os.Exit(1)
 		}
 		return
@@ -451,6 +453,10 @@ func runAgent(configPath string, leaveCh chan string) {
 
 	port := e.Port()
 	slog.Info(engine.BinaryName+" listening", "port", port, "alias", e.NodeAlias(), "host", hostname)
+
+	if mgr := e.ClusterManager(); mgr != nil {
+		printJoinBanner(e)
+	}
 
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		slog.Error("server error", "err", err)
@@ -937,4 +943,388 @@ func parseSharedConfigBody(body []byte, contentType string) (json.RawMessage, er
 		}
 		return json.RawMessage(body), nil
 	}
+}
+
+// ── init / join / keyring subcommands (Windows) ──────────────────────────────
+
+// cmdInit generates a config skeleton at the chosen directory. With --cluster
+// it enables cluster mode, generates a fresh keyring, and prints a copy-paste
+// `netwatch join` command for other nodes.
+func cmdInit(args []string) {
+	fs := flag.NewFlagSet("init", flag.ExitOnError)
+	defaultDir := filepath.Join(os.Getenv("PROGRAMDATA"), engine.BinaryName)
+	if defaultDir == engine.BinaryName {
+		defaultDir = filepath.Join("C:\\ProgramData", engine.BinaryName)
+	}
+	configDir := fs.String("config-dir", defaultDir, "directory to write config files")
+	cluster := fs.Bool("cluster", false, "generate a cluster-enabled config with a random keyring + join command")
+	bindPort := fs.Int("bind-port", 7946, "gossip bind port when --cluster is set")
+	force := fs.Bool("force", false, "overwrite an existing config without prompting")
+	_ = fs.Parse(args)
+
+	if err := os.MkdirAll(*configDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "error creating config dir: %v\n", err)
+		os.Exit(1)
+	}
+
+	configFile := filepath.Join(*configDir, "config.yaml")
+	credsFile := filepath.Join(*configDir, "credentials.env")
+
+	if _, err := os.Stat(configFile); err == nil && !*force {
+		fmt.Printf("Config already exists at %s\n", configFile)
+		if !promptYesNo("Overwrite?", false) {
+			fmt.Println("Aborted. Re-run with --force to overwrite without prompting.")
+			os.Exit(1)
+		}
+	}
+
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = engine.BinaryName + "-node"
+	}
+
+	var keyringKey string
+	if *cluster {
+		k, err := engine.GenerateKeyringKey()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error generating keyring: %v\n", err)
+			os.Exit(1)
+		}
+		keyringKey = k
+	}
+
+	cfg := configSkeleton(*configDir)
+	if *cluster {
+		cfg = clusterConfigSkeleton(*configDir, hostname, *bindPort, keyringKey)
+	}
+	if err := os.WriteFile(configFile, []byte(cfg), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "error writing %s: %v\n", configFile, err)
+		os.Exit(1)
+	}
+	fmt.Printf("  (written) %s\n", configFile)
+
+	writeIfAbsent(credsFile, credsSkeleton)
+
+	fmt.Println()
+	fmt.Printf("Config dir   : %s\n", *configDir)
+	fmt.Printf("Config file  : %s\n", configFile)
+	fmt.Printf("Credentials  : %s\n", credsFile)
+	fmt.Println()
+	fmt.Println("Next steps:")
+	fmt.Printf("  1. Edit %s (add targets, notifications, etc.)\n", configFile)
+	fmt.Printf("  2. Register as a Windows Service:\n")
+	fmt.Printf("     %s service install --config %s\n", engine.BinaryName, configFile)
+
+	if *cluster {
+		advertiseAddr := defaultAdvertiseAddr()
+		joinAddr := fmt.Sprintf("%s:%d", advertiseAddr, *bindPort)
+		fmt.Println()
+		fmt.Println("─────────────────────────────────────────────────────────")
+		fmt.Println("  Cluster enabled — keep this keyring SECRET")
+		fmt.Println()
+		fmt.Printf("  Keyring: %s\n", keyringKey)
+		fmt.Printf("  Node   : %s\n", hostname)
+		fmt.Printf("  Addr   : %s   (auto-detected; override in config if needed)\n", joinAddr)
+		fmt.Println()
+		fmt.Println("  To add another node, run on it:")
+		fmt.Println()
+		fmt.Printf("    %s join ^\n", engine.BinaryName)
+		fmt.Printf("      --keyring %s ^\n", keyringKey)
+		fmt.Printf("      --addr %s\n", joinAddr)
+		fmt.Println("─────────────────────────────────────────────────────────")
+	}
+}
+
+// cmdJoin writes a cluster-enabled config so this node joins an existing cluster.
+func cmdJoin(args []string) {
+	fs := flag.NewFlagSet("join", flag.ExitOnError)
+	keyring := fs.String("keyring", "", "base64 AES key (required)")
+	addr := fs.String("addr", "", "any peer's bind address as host:port (required)")
+	cfgPath := fs.String("config", "", "destination config.yaml (default: %PROGRAMDATA%\\netwatch\\config.yaml)")
+	bindPort := fs.Int("bind-port", 7946, "this node's gossip bind port")
+	nodeName := fs.String("node-name", "", "cluster identity for this node (default: hostname)")
+	_ = fs.Parse(args)
+
+	if *keyring == "" {
+		fmt.Fprintln(os.Stderr, "error: --keyring is required")
+		os.Exit(1)
+	}
+	if *addr == "" {
+		fmt.Fprintln(os.Stderr, "error: --addr is required (e.g. --addr 192.168.1.10:7946)")
+		os.Exit(1)
+	}
+	if _, _, err := net.SplitHostPort(*addr); err != nil {
+		fmt.Fprintf(os.Stderr, "error: --addr is not host:port — %v\n", err)
+		os.Exit(1)
+	}
+	if !validKeyringKey(*keyring) {
+		fmt.Fprintln(os.Stderr, "error: --keyring is not a valid base64 AES key (16, 24, or 32 raw bytes)")
+		os.Exit(1)
+	}
+
+	path := *cfgPath
+	if path == "" {
+		path = filepath.Join(os.Getenv("PROGRAMDATA"), engine.BinaryName, "config.yaml")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "error creating config dir: %v\n", err)
+		os.Exit(1)
+	}
+
+	name := *nodeName
+	if name == "" {
+		h, _ := os.Hostname()
+		if h == "" {
+			h = engine.BinaryName + "-node"
+		}
+		name = h
+	}
+
+	var m map[string]interface{}
+	if raw, err := os.ReadFile(path); err == nil {
+		_ = sigs_yaml.Unmarshal(raw, &m)
+	}
+	if m == nil {
+		m = map[string]interface{}{
+			"port":                "10240",
+			"state_file":          filepath.Join(filepath.Dir(path), "state.json"),
+			"log_path":            filepath.Join(filepath.Dir(path), "agent.log"),
+			"credentials_file":    filepath.Join(filepath.Dir(path), "credentials.env"),
+			"timeout":             5,
+			"max_retries":         2,
+			"retry_interval_sec":  30,
+			"probe_interval_sec":  60,
+			"ticker_interval_sec": 5,
+			"reload_interval_sec": 30,
+			"notifications":       map[string]interface{}{},
+			"default_notify":      []string{},
+			"targets":             []interface{}{},
+		}
+	}
+
+	m["cluster"] = map[string]interface{}{
+		"enabled":   true,
+		"node_name": name,
+		"bind_port": *bindPort,
+		"peers":     []string{*addr},
+		"keyring":   []string{*keyring},
+	}
+
+	out, err := sigs_yaml.Marshal(m)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error marshalling config: %v\n", err)
+		os.Exit(1)
+	}
+
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "error writing temp config: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		fmt.Fprintf(os.Stderr, "error renaming config: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("✓ Config written to %s\n", path)
+	fmt.Printf("  cluster.enabled  : true\n")
+	fmt.Printf("  cluster.node_name: %s\n", name)
+	fmt.Printf("  cluster.bind_port: %d\n", *bindPort)
+	fmt.Printf("  cluster.peers    : [%s]\n", *addr)
+	fmt.Printf("  cluster.keyring  : %s (%d bytes)\n", maskKeyring(*keyring), keyringRawLen(*keyring))
+	fmt.Println()
+	fmt.Println("If netwatch is already running:")
+	fmt.Println("  → hot-reload picks this up within reload_interval_sec (~30s)")
+	fmt.Println()
+	fmt.Println("Otherwise start the Windows Service:")
+	fmt.Printf("  sc start %s\n", engine.BinaryName)
+	fmt.Println("  (or register first via: netwatch service install)")
+}
+
+// cmdKeyring dispatches `keyring` subcommands.
+func cmdKeyring(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: netwatch keyring <generate>")
+		os.Exit(1)
+	}
+	switch args[0] {
+	case "generate":
+		k, err := engine.GenerateKeyringKey()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(k)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown keyring subcommand %q (try: generate)\n", args[0])
+		os.Exit(1)
+	}
+}
+
+// printJoinBanner writes the operator-facing cluster banner to stdout.
+func printJoinBanner(e *engine.Engine) {
+	addr := e.LocalClusterAddr()
+	key := e.ClusterPrimaryKey()
+	if addr == "" || key == "" {
+		return
+	}
+	members := e.ClusterMemberCount()
+	fmt.Println()
+	fmt.Println("=========================================================")
+	fmt.Println("  netwatch cluster ready")
+	fmt.Println()
+	fmt.Printf("  Node     : %s\n", e.ClusterManager().NodeName())
+	fmt.Printf("  Address  : %s\n", addr)
+	fmt.Printf("  Members  : %d\n", members)
+	fmt.Println()
+	fmt.Println("  To add another node, run on it:")
+	fmt.Println()
+	fmt.Printf("    %s join ^\n", engine.BinaryName)
+	fmt.Printf("      --keyring %s ^\n", key)
+	fmt.Printf("      --addr %s\n", addr)
+	fmt.Println()
+	fmt.Println("=========================================================")
+}
+
+// ── helpers shared by subcommands (Windows) ──────────────────────────────────
+
+func promptYesNo(prompt string, defaultYes bool) bool {
+	suffix := "[y/N]"
+	if defaultYes {
+		suffix = "[Y/n]"
+	}
+	fmt.Printf("%s %s: ", prompt, suffix)
+	rd := bufio.NewReader(os.Stdin)
+	line, err := rd.ReadString('\n')
+	if err != nil {
+		return defaultYes
+	}
+	s := strings.ToLower(strings.TrimSpace(line))
+	if s == "" {
+		return defaultYes
+	}
+	return s == "y" || s == "yes"
+}
+
+func validKeyringKey(s string) bool {
+	raw, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		raw, err = base64.RawStdEncoding.DecodeString(s)
+		if err != nil {
+			return false
+		}
+	}
+	return len(raw) == 16 || len(raw) == 24 || len(raw) == 32
+}
+
+func keyringRawLen(s string) int {
+	raw, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		raw, _ = base64.RawStdEncoding.DecodeString(s)
+	}
+	return len(raw)
+}
+
+func maskKeyring(s string) string {
+	if len(s) <= 8 {
+		return "****"
+	}
+	return "****" + s[len(s)-6:]
+}
+
+func defaultAdvertiseAddr() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "<your-ip>"
+	}
+	for _, a := range addrs {
+		ipnet, ok := a.(*net.IPNet)
+		if !ok || ipnet.IP.IsLoopback() {
+			continue
+		}
+		if ip4 := ipnet.IP.To4(); ip4 != nil {
+			if s := ip4.String(); !strings.HasPrefix(s, "169.254.") {
+				return s
+			}
+		}
+	}
+	return "<your-ip>"
+}
+
+func printUsage(w io.Writer) {
+	bn := engine.BinaryName
+	fmt.Fprintf(w, "Usage:\n")
+	fmt.Fprintf(w, "  %s [--config FILE]                  start the monitoring agent\n", bn)
+	fmt.Fprintf(w, "  %s init [--cluster] [--config-dir DIR] [--bind-port N] [--force]\n", bn)
+	fmt.Fprintf(w, "                                      generate config skeleton (and join command if --cluster)\n")
+	fmt.Fprintf(w, "  %s join --keyring K --addr H:P [--config PATH] [--bind-port N] [--node-name N]\n", bn)
+	fmt.Fprintf(w, "                                      join an existing cluster\n")
+	fmt.Fprintf(w, "  %s keyring generate                 print a fresh AES-256 keyring key (base64)\n", bn)
+	fmt.Fprintf(w, "  %s validate [--config FILE]         validate config without starting\n", bn)
+	fmt.Fprintf(w, "  %s service install [--config FILE]  register as a Windows Service\n", bn)
+	fmt.Fprintf(w, "  %s service remove                   unregister the Windows Service\n", bn)
+	fmt.Fprintf(w, "  %s leave [--port PORT]              tell a running agent to leave the cluster\n", bn)
+	fmt.Fprintf(w, "  %s uninstall [--port PORT]          stop service, remove it, optionally delete config\n", bn)
+}
+
+// ── Cluster config template (Windows) ────────────────────────────────────────
+
+func clusterConfigSkeleton(cfgDir, nodeName string, bindPort int, keyringKey string) string {
+	type tdata struct {
+		BinaryName, CfgDir, NodeName, KeyringKey string
+		BindPort                                 int
+	}
+	tmpl := template.Must(template.New("clusterCfg").Parse(
+		`# {{.BinaryName}} configuration — cluster mode
+# Full reference: https://github.com/saidtaylan/netwatch
+
+# Optional human-readable label for this agent.
+# node_alias: "{{.NodeName}}"
+
+port: "10240"
+state_file: "{{.CfgDir}}/state.json"
+log_path:   "{{.CfgDir}}/agent.log"
+credentials_file: "{{.CfgDir}}/credentials.env"
+
+timeout:            5
+max_retries:        2
+retry_interval_sec: 30
+probe_interval_sec: 60
+ticker_interval_sec: 5
+reload_interval_sec: 30
+
+notifications: {}
+
+default_notify: []
+
+targets:
+  - name: example-tcp
+    type: tcp
+    target: "127.0.0.1:22"
+
+cluster:
+  enabled: true
+  node_name: "{{.NodeName}}"
+  bind_port: {{.BindPort}}
+  # advertise_addr: ""        # leave empty for memberlist auto-detect
+  peers: []                   # other nodes will be added via 'netwatch join'
+  keyring:
+    - "{{.KeyringKey}}"
+  expected_node_count: 1      # bump as more nodes join
+  min_quorum_ratio: 0.5
+  probe_replication_factor: 3
+
+# admin:
+#   token: "${ADMIN_TOKEN}"   # required for write-capable HTTP endpoints
+`))
+	var sb strings.Builder
+	_ = tmpl.Execute(&sb, tdata{
+		BinaryName: engine.BinaryName,
+		CfgDir:     cfgDir,
+		NodeName:   nodeName,
+		BindPort:   bindPort,
+		KeyringKey: keyringKey,
+	})
+	return sb.String()
 }

@@ -38,9 +38,19 @@
 
 ## Entry Points / URLs / Endpoints
 
-Binary tek `--config` flag'i alır:
+### CLI Subcommands
+
 ```
-netwatch --config /path/to/config.yaml
+netwatch [--config FILE]                          start the monitoring agent
+netwatch init [--cluster] [--config-dir DIR] [--bind-port N] [--force]
+                                                  generate config skeleton (cluster mode includes random AES-256 keyring + copy-paste join command)
+netwatch join --keyring K --addr H:P [--config PATH] [--bind-port N] [--node-name N]
+                                                  one-command join: writes minimal config with cluster.enabled=true and gossip seed
+netwatch keyring generate                         print a fresh AES-256 base64 key (32 raw bytes) — for rotation or manual setup
+netwatch validate [--config FILE]                 validate config without starting
+netwatch leave [--port PORT]                      tell a running agent to gracefully leave the cluster
+netwatch uninstall                                stop service, remove unit, optionally delete config
+netwatch service install|remove   (Windows only)  register/unregister the Windows Service
 ```
 
 ### HTTP Endpoints

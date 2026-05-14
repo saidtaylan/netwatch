@@ -424,6 +424,65 @@ Temel garantiler:
 - **Quorum kaybında** alarmlar baskılanır (izole node yanlış alarm atmaz)
 - Node restart edildiğinde **alarm fırtınası olmaz** (anti-entropy sync)
 
+### Hızlı Cluster Kurulumu (önerilen)
+
+İki komutla cluster ayağa kalkar. Önce ilk node'da:
+
+```bash
+$ netwatch init --cluster
+# ... çıktının sonunda:
+#
+#   To add another node, run on it:
+#
+#     netwatch join \
+#       --keyring 9TtmlRYcubbE++DW9WYnf6bUwNOeR8PLAwh8cWu7jHM= \
+#       --addr 10.0.1.10:7946
+
+$ sudo systemctl start netwatch
+```
+
+İkinci ve sonraki node'larda yukarıdaki komutu olduğu gibi yapıştır:
+
+```bash
+$ netwatch join \
+    --keyring 9TtmlRYcubbE++DW9WYnf6bUwNOeR8PLAwh8cWu7jHM= \
+    --addr 10.0.1.10:7946
+
+$ sudo systemctl start netwatch
+```
+
+Her node başlatıldığında stdout'a benzer bir banner basar (operatör kopyalayabilir):
+
+```
+=========================================================
+  netwatch cluster ready
+
+  Node     : machine2
+  Address  : 10.0.1.11:7946
+  Members  : 2
+
+  To add another node, run on it:
+    netwatch join \
+      --keyring ... \
+      --addr 10.0.1.10:7946
+=========================================================
+```
+
+**Faydalı yan komutlar:**
+
+```bash
+$ netwatch keyring generate       # yeni AES-256 base64 key — keyring rotation için
+$ netwatch validate -config ...   # config doğrulama
+$ netwatch leave                  # graceful cluster ayrılışı
+```
+
+İlk node doğru kurulduğunda diğerlerinde `sync` ile ortak alanları (notifications, default_notify, keyring, timing) tek seferde yayabilirsin:
+
+```bash
+$ curl -X POST http://10.0.1.10:10240/cluster/config/sync \
+    -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
 ### Minimal 3-node cluster
 
 `node-1/config.yaml`:
@@ -646,11 +705,24 @@ Restart gerekmez. `reload_interval_sec: 0` ile hot-reload kapatılabilir.
 # Konfigürasyonu doğrula (çalıştırmadan)
 netwatch validate -config config.yaml
 
-# Systemd unit dosyası + örnek config oluştur
+# Standalone config skeleton + systemd unit
 netwatch init --config-dir /etc/netwatch
 
+# Cluster ilk node: random keyring + join komutu çıktısı
+netwatch init --cluster
+netwatch init --cluster --bind-port 7946 --force   # üzerine yaz, prompt'suz
+
+# Mevcut cluster'a katıl
+netwatch join \
+  --keyring <base64-key> \
+  --addr <peer-host>:<gossip-port> \
+  --node-name <opsiyonel>
+
+# Yeni AES-256 keyring base64 üret (rotation için)
+netwatch keyring generate
+
 # Cluster'dan graceful ayrıl (çalışan agent'a HTTP gönderir)
-netwatch leave --addr http://localhost:10240
+netwatch leave --port 10240
 
 # Tümünü kaldır (leave + servis + dosyalar)
 netwatch uninstall

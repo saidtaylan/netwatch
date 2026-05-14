@@ -18,6 +18,70 @@ Bu belge, netwatch projesinin günlük güncellemelerini ve teknik detaylarını
 
 ## 2026-05-14
 
+- [backend] [dokuman] **CLI join workflow — `netwatch init --cluster`, `netwatch join`, `netwatch keyring generate` + startup banner.**
+
+  Elasticsearch/kubeadm tarzı tek komutlu cluster join akışı:
+
+  **1. `netwatch init --cluster [--bind-port N] [--force]`**
+  - Cluster-enabled config skeleton üretir, random 32-byte AES-256 keyring otomatik
+  - Config zaten varsa interaktif overwrite prompt (default: hayır)
+  - Çıktıda copy-paste edilebilir `netwatch join --keyring ... --addr ...` komutu
+  - `defaultAdvertiseAddr()` ile non-loopback IPv4 otomatik tespiti
+
+  **2. `netwatch join --keyring K --addr H:P [--config PATH] [--bind-port N] [--node-name N]`**
+  - Tek komutla cluster'a katılma
+  - Config yoksa minimal skeleton üretir
+  - Config varsa sadece `cluster.*` bölümünü override eder; targets/notifications/slo vs. korunur
+  - Atomik yazım (`.tmp` + rename)
+  - Agent başlatmaz — operatör `systemctl start` yapar veya hot-reload bekler
+  - Validation: keyring base64 + 16/24/32 byte; addr `host:port` format
+
+  **3. `netwatch keyring generate`**
+  - Yeni 32-byte AES-256 base64 key basar
+  - Keyring rotation veya manuel kurulum için
+
+  **4. Startup banner**
+  - `cluster.enabled=true` agent başlatıldığında stdout'a basılır
+  - Node adı, `LocalAddr` (memberlist'in seçtiği gerçek advertise adresi), aktif üye sayısı
+  - Operatörün kopyalayabileceği tam `netwatch join` komutu
+
+  **Yeni dosyalar:** `internal/engine/join.go` (`GenerateKeyringKey`, `LocalClusterAddr`, `ClusterPrimaryKey`, `ClusterMemberCount`)
+
+  **cluster.go eklemeleri:**
+  - `Manager.LocalAddr() string` — memberlist `LocalNode()` üzerinden advertise edilen `host:port`
+  - `Manager.PrimaryKey() string` — keyring[0] (base64), banner için
+
+  **cmd/linux/main.go + cmd/windows/main.go:**
+  - `cmdInit` → `--cluster`, `--bind-port`, `--force` flag'leri + overwrite prompt + cluster config skeleton template
+  - `cmdJoin`, `cmdKeyring` yeni subcommand'lar
+  - `printJoinBanner(e)` — `runAgent` sonunda cluster aktifse çağrılır
+  - `validKeyringKey`, `keyringRawLen`, `maskKeyring`, `defaultAdvertiseAddr`, `promptYesNo` helper'ları
+  - `/cluster/config` GET ve PUT handler'ları **tek mux pattern**'da birleştirildi (mux pattern conflict bug fix)
+
+  **Akış:**
+  ```
+  Node-1: netwatch init --cluster
+          → keyring otomatik üretildi
+          → join komutu çıktıda
+
+  Node-2: netwatch join --keyring ... --addr 10.0.0.1:7946
+          → config.yaml yazıldı, cluster.enabled=true
+
+  Her node: systemctl start netwatch
+          → banner stdout'a basılır, copy-paste hazır
+  ```
+
+  **Build + Test + Smoke:**
+  ```
+  go build ./internal/engine/ ./internal/cluster/ ./cmd/linux/  ✓
+  GOOS=windows go build ./cmd/windows/                          ✓
+  go test -race -count=1 -timeout 120s ./internal/...           ✓
+  netwatch init --cluster → keyring + join cmd output           ✓
+  netwatch join --keyring K --addr A → config.yaml written      ✓
+  netwatch keyring generate → fresh base64 key                  ✓
+  Agent start → banner with real LocalAddr + keyring            ✓
+  ```
+
 - [backend] [dokuman] **Config push/sync endpoint'leri + `node_alias` rename + admin bearer token auth.**
 
   **1. Shared config push/sync — `PUT /cluster/config` + `POST /cluster/config/sync`**

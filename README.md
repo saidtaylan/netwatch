@@ -35,19 +35,42 @@
 
 ## Quick Start
 
+### Standalone
+
 ```bash
-# 1. Build
 make build-linux
-# or: go build -o bin/netwatch ./cmd/linux/
-
-# 2. Generate a config skeleton
-./bin/netwatch init --config-dir /etc/netwatch
-
-# 3. Edit the generated config
+./bin/netwatch init --config-dir /etc/netwatch     # creates config.yaml skeleton
 $EDITOR /etc/netwatch/config.yaml
-
-# 4. Run
 ./bin/netwatch --config /etc/netwatch/config.yaml
+```
+
+### Cluster (single command per node)
+
+```bash
+# Node 1: generate cluster config with a fresh random keyring
+$ netwatch init --cluster
+# ... output ends with:
+#
+#   To add another node, run on it:
+#     netwatch join \
+#       --keyring <base64-key> \
+#       --addr 10.0.1.10:7946
+
+$ sudo systemctl start netwatch
+
+# Node 2 (and 3, 4, ...): paste the printed join command verbatim
+$ netwatch join \
+    --keyring <base64-key> \
+    --addr 10.0.1.10:7946
+$ sudo systemctl start netwatch
+```
+
+After all nodes are running, push shared settings (notifications, intervals, default_notify, etc.)
+from the first node to every peer in one call:
+
+```bash
+$ curl -X POST http://10.0.1.10:10240/cluster/config/sync \
+    -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
 ```bash

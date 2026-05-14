@@ -496,6 +496,14 @@ Engine `e.appIndex` field'ında tutar, `e.mu` ile korunur.
 
 CLI subcommand routing eklendi: `netwatch init`, `netwatch validate`, `netwatch leave`, `netwatch uninstall`, Windows için `service install/remove`. `/cluster/leave` HTTP endpoint'i eklendi. Detay için `developments.md` 2026-05-07.
 
+**2026-05-14 — CLI cluster join workflow eklendi:**
+
+- `netwatch init --cluster [--bind-port N] [--force]` — cluster-enabled config + random AES-256 keyring + copy-paste join command output
+- `netwatch join --keyring K --addr H:P [--config PATH] [--bind-port N] [--node-name N]` — tek komutla cluster'a katılma; mevcut config'in `cluster.*` bölümünü override eder, diğer alanları korur
+- `netwatch keyring generate` — yeni AES-256 base64 key basar
+- Startup banner: cluster aktifse agent başladığında stdout'a node bilgileri + `netwatch join` komutu basar
+- Yardımcı: `engine.GenerateKeyringKey()`, `Engine.LocalClusterAddr()`, `Engine.ClusterPrimaryKey()`, `Manager.LocalAddr()`, `Manager.PrimaryKey()`
+
 ---
 
 ### ✅ Phase 11 — Deployment Artifacts (TAMAMLANDI)

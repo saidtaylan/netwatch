@@ -944,6 +944,31 @@ func (m *Manager) AllPeerStates() []GossipPayload {
 // NodeName returns the name this node is known by in the cluster.
 func (m *Manager) NodeName() string { return m.cfg.NodeName }
 
+// LocalAddr returns this node's advertised address as "host:port", suitable
+// for inclusion in a `netwatch join --addr <addr>` command shown to operators.
+// Returns an empty string when memberlist has not yet started.
+func (m *Manager) LocalAddr() string {
+	if m == nil || m.list == nil {
+		return ""
+	}
+	local := m.list.LocalNode()
+	if local == nil {
+		return ""
+	}
+	return net.JoinHostPort(local.Addr.String(), fmt.Sprintf("%d", local.Port))
+}
+
+// PrimaryKey returns the base64-encoded primary AES key (the key used for
+// outgoing encryption). Empty when the cluster runs without encryption.
+//
+// Suitable for inclusion in the operator-facing join command. Treat as a secret.
+func (m *Manager) PrimaryKey() string {
+	if m == nil || len(m.cfg.Keyring) == 0 {
+		return ""
+	}
+	return m.cfg.Keyring[0]
+}
+
 // ── Hash ring — responsible-node selection ────────────────────────────────────
 
 // updateRing rebuilds the sorted alive-member list from the current memberlist

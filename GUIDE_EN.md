@@ -423,6 +423,66 @@ When multiple netwatch nodes monitor the same infrastructure, cluster mode provi
 - Alerts are **suppressed during quorum loss** (an isolated node never false-alerts)
 - **No alert storm on node restart** (anti-entropy sync before resuming alarms)
 
+### Quick Cluster Setup (recommended)
+
+Two commands bring a cluster up. On the first node:
+
+```bash
+$ netwatch init --cluster
+# ... the output ends with:
+#
+#   To add another node, run on it:
+#
+#     netwatch join \
+#       --keyring 9TtmlRYcubbE++DW9WYnf6bUwNOeR8PLAwh8cWu7jHM= \
+#       --addr 10.0.1.10:7946
+
+$ sudo systemctl start netwatch
+```
+
+On every other node, copy-paste that command:
+
+```bash
+$ netwatch join \
+    --keyring 9TtmlRYcubbE++DW9WYnf6bUwNOeR8PLAwh8cWu7jHM= \
+    --addr 10.0.1.10:7946
+
+$ sudo systemctl start netwatch
+```
+
+Each agent prints a banner like this on startup (operators can copy from any node):
+
+```
+=========================================================
+  netwatch cluster ready
+
+  Node     : machine2
+  Address  : 10.0.1.11:7946
+  Members  : 2
+
+  To add another node, run on it:
+    netwatch join \
+      --keyring ... \
+      --addr 10.0.1.10:7946
+=========================================================
+```
+
+**Useful side commands:**
+
+```bash
+$ netwatch keyring generate       # fresh AES-256 key for rotation
+$ netwatch validate -config ...   # validate without starting
+$ netwatch leave                  # graceful cluster departure
+```
+
+Once the first node is fully configured (notifications, default_notify, timing tweaks),
+you can propagate those shared fields to every other node with one call:
+
+```bash
+$ curl -X POST http://10.0.1.10:10240/cluster/config/sync \
+    -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
 ### Minimal 3-node cluster
 
 `node-1/config.yaml`:
@@ -653,11 +713,24 @@ a replacement has not yet been assigned. It is distinct from `target_orphaned`
 # Validate configuration without running
 netwatch validate -config config.yaml
 
-# Generate systemd unit file + skeleton config
+# Standalone skeleton + systemd unit
 netwatch init --config-dir /etc/netwatch
 
-# Gracefully leave the cluster (sends HTTP to the running agent)
-netwatch leave --addr http://localhost:10240
+# First cluster node: random keyring + ready-to-paste join command
+netwatch init --cluster
+netwatch init --cluster --bind-port 7946 --force   # overwrite without prompt
+
+# Join an existing cluster
+netwatch join \
+  --keyring <base64-key> \
+  --addr <peer-host>:<gossip-port> \
+  --node-name <optional>
+
+# Generate a fresh AES-256 keyring key (for rotation)
+netwatch keyring generate
+
+# Gracefully leave the cluster
+netwatch leave --port 10240
 
 # Remove everything (leave + service + files)
 netwatch uninstall
