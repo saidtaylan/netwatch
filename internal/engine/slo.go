@@ -560,7 +560,7 @@ func (e *Engine) sendSLOBreachAlert(targetID string, result SLOResult, sloNotify
 		"NAME":                    targetName,
 		"TARGET":                  targetAddr,
 		"TYPE":                    targetType,
-		"APP_NAME":                e.AppName(),
+		"APP_NAME":                e.NodeAlias(),
 		"NODE_NAME":               e.hostname,
 		"STATUS":                  "slo_breached",
 		"SLO_TARGET_UPTIME":       fmt.Sprintf("%.4f", result.TargetUptime),

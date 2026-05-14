@@ -180,13 +180,10 @@ func (t Target) typeKey() string { return t.Type + "|" + t.key() }
 // Config is the top-level configuration structure.
 type Config struct {
 	Port      string `json:"port"`
-	// NodeAlias is a human-readable label for this agent instance.
-	// It appears in Prometheus metric labels (as "app_name" for dashboard compat)
-	// and in alert env vars (NODE_ALIAS + APP_NAME for backward compat).
-	NodeAlias string `json:"node_alias"`
-	// AppNameLegacy accepts the old "app_name" config key and is migrated to
-	// NodeAlias at load time with a deprecation warning. Do not use directly.
-	AppNameLegacy string `json:"app_name,omitempty"`
+	// NodeAlias is an optional human-readable label for this agent instance.
+	// Appears in Prometheus metric labels (label name "app_name") and alert env vars
+	// (NODE_ALIAS). Omitting it is fine — metrics and alerts still work without it.
+	NodeAlias string `json:"node_alias,omitempty"`
 	LogPath   string `json:"log_path"`   // state-change log file; empty = stdout only
 	StateFile string `json:"state_file"` // persisted target states; prevents spurious alarms after restart
 	Timeout   int    `json:"timeout"`
@@ -807,10 +804,6 @@ func (e *Engine) NodeAlias() string {
 	return e.cfg.NodeAlias
 }
 
-// AppName is a deprecated alias for NodeAlias; kept for internal call-sites
-// that haven't been migrated yet. Will be removed in a future version.
-func (e *Engine) AppName() string { return e.NodeAlias() }
-
 // clusterNodeName returns the cluster-configured node name when cluster is
 // enabled, and falls back to the OS hostname for standalone mode.
 // This value is the authoritative identity used in gossip payloads and must
@@ -956,14 +949,6 @@ func (e *Engine) LoadConfig() error {
 		return fmt.Errorf("parse config %s: %w", cfgPath, err)
 	}
 
-	// Migrate deprecated "app_name" → "node_alias" with one-time warning.
-	if newCfg.NodeAlias == "" && newCfg.AppNameLegacy != "" {
-		slog.Warn("config: 'app_name' is deprecated — rename to 'node_alias'",
-			"value", newCfg.AppNameLegacy)
-		newCfg.NodeAlias = newCfg.AppNameLegacy
-	}
-	newCfg.AppNameLegacy = "" // don't carry the legacy field further
-
 	newCfg.LogPath = resolvePath(newCfg.LogPath)
 	newCfg.StateFile = resolvePath(newCfg.StateFile)
 	if newCfg.CredentialsFile != "" {
@@ -1064,9 +1049,6 @@ func (e *Engine) LoadConfig() error {
 }
 
 func validateConfig(c Config) error {
-	if c.NodeAlias == "" {
-		return fmt.Errorf("node_alias is required (or deprecated app_name)")
-	}
 	if err := c.Cluster.Validate(); err != nil {
 		return err
 	}
@@ -1260,7 +1242,7 @@ func (e *Engine) Init() error {
 		}
 	}
 
-	slog.Info("agent started", "host", e.hostname, "app", e.AppName(), "targets", len(targets))
+	slog.Info("agent started", "host", e.hostname, "app", e.NodeAlias(), "targets", len(targets))
 	return nil
 }
 

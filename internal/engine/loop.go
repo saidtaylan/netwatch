@@ -106,7 +106,7 @@ func (e *Engine) runCheck(ctx context.Context, t Target) {
 		"target":      t.Target,
 		"type":        t.Type,
 		"source_host": e.hostname,
-		"app_name":   e.AppName(),
+		"app_name":   e.NodeAlias(),
 	}
 
 	start := time.Now()
