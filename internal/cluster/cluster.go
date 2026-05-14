@@ -315,14 +315,20 @@ func (d *gossipDelegate) NotifyMsg(b []byte) {
 	var peek struct {
 		MsgType string `json:"msg_type"`
 	}
-	if err := json.Unmarshal(b, &peek); err == nil && peek.MsgType == msgTypeConfig {
-		var cb ConfigBroadcast
-		if err := json.Unmarshal(b, &cb); err != nil {
-			slog.Warn("cluster: malformed config broadcast", "err", err)
+	if err := json.Unmarshal(b, &peek); err == nil {
+		switch peek.MsgType {
+		case msgTypeConfig:
+			var cb ConfigBroadcast
+			if err := json.Unmarshal(b, &cb); err != nil {
+				slog.Warn("cluster: malformed config broadcast", "err", err)
+				return
+			}
+			d.mgr.handleConfigBroadcast(cb)
+			return
+		case msgTypeConfigPush:
+			go d.mgr.handleConfigPush(b)
 			return
 		}
-		d.mgr.handleConfigBroadcast(cb)
-		return
 	}
 	var p GossipPayload
 	if err := json.Unmarshal(b, &p); err != nil {
@@ -523,6 +529,10 @@ type Manager struct {
 	// softDownNotifier is set by the engine to receive co-prober soft-down
 	// suspect signals. nil until SetSoftDownNotifier is called.
 	softDownNotifier SoftDownNotifier
+
+	// configPushHandler is set by the engine to apply incoming shared-config
+	// push payloads. nil until SetConfigPushHandler is called.
+	configPushHandler ConfigPushHandler
 
 	// inventoryRefreshHandler is called on NotifyJoin so the engine
 	// re-broadcasts its local target states to late-joining peers.

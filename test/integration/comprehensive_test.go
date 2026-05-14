@@ -1053,8 +1053,8 @@ apps:
 	if err != nil {
 		t.Fatalf("ValidateConfigFile unexpected error: %v", err)
 	}
-	if cfg.AppName != "valid-cfg" {
-		t.Errorf("AppName: got %q, want valid-cfg", cfg.AppName)
+	if cfg.NodeAlias != "valid-cfg" {
+		t.Errorf("NodeAlias: got %q, want valid-cfg", cfg.NodeAlias)
 	}
 	if len(cfg.Targets) != 1 {
 		t.Errorf("Targets: want 1, got %d", len(cfg.Targets))

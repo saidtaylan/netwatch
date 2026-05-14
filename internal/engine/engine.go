@@ -180,7 +180,13 @@ func (t Target) typeKey() string { return t.Type + "|" + t.key() }
 // Config is the top-level configuration structure.
 type Config struct {
 	Port      string `json:"port"`
-	AppName   string `json:"app_name"`   // agent identity label; used in metrics and alert scripts
+	// NodeAlias is a human-readable label for this agent instance.
+	// It appears in Prometheus metric labels (as "app_name" for dashboard compat)
+	// and in alert env vars (NODE_ALIAS + APP_NAME for backward compat).
+	NodeAlias string `json:"node_alias"`
+	// AppNameLegacy accepts the old "app_name" config key and is migrated to
+	// NodeAlias at load time with a deprecation warning. Do not use directly.
+	AppNameLegacy string `json:"app_name,omitempty"`
 	LogPath   string `json:"log_path"`   // state-change log file; empty = stdout only
 	StateFile string `json:"state_file"` // persisted target states; prevents spurious alarms after restart
 	Timeout   int    `json:"timeout"`
@@ -211,6 +217,11 @@ type Config struct {
 	// OWNER_TEAMS context. Configs without apps continue to work unchanged.
 	Apps []App `json:"apps,omitempty"`
 
+	// Admin holds authentication settings for write-capable HTTP endpoints
+	// (config push/sync, keyring rotation, cluster leave).
+	// When nil or Token is empty, those endpoints are unrestricted.
+	Admin *AdminConfig `json:"admin,omitempty"`
+
 	// Cluster holds gossip cluster settings. When Cluster.Enabled is false
 	// (the default) the entire cluster layer is a no-op.
 	Cluster cluster.Config `json:"cluster,omitempty"`
@@ -218,6 +229,32 @@ type Config struct {
 	// SLO holds the SLO tracking configuration.
 	// When nil or Enabled=false, incident tracking and /slo are disabled.
 	SLO *SLOConfig `json:"slo,omitempty"`
+}
+
+// AdminConfig controls access to write-capable HTTP endpoints.
+//
+// Designed for extensibility: the Token field covers the current single-secret
+// bearer-token scheme. When user management is added in a future release, a
+// Users []AdminUser field will be appended here without breaking existing configs.
+//
+// If Token is empty (default), write endpoints are unrestricted — appropriate
+// for deployments where network-level access controls are sufficient.
+type AdminConfig struct {
+	// Token is the required Bearer token for write-capable admin endpoints
+	// (PUT /cluster/config, POST /cluster/config/sync, POST /cluster/keyring/rotate,
+	// POST /cluster/leave). Supports ${VAR} substitution from credentials_file.
+	// When empty, those endpoints accept any request without authentication.
+	Token string `json:"token,omitempty"`
+}
+
+// AdminToken returns the configured admin token (empty = no auth required).
+func (e *Engine) AdminToken() string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.cfg.Admin == nil {
+		return ""
+	}
+	return e.cfg.Admin.Token
 }
 
 func (c Config) globalMaxRetries() int {
@@ -631,6 +668,11 @@ type Engine struct {
 	orphanedMu  sync.Mutex
 	orphanedSet map[string]bool
 
+	// rawConfigBytes holds the pre-credential-injection bytes of the last
+	// successfully loaded config file. Used by configpush /sync to export
+	// shared fields without leaking resolved secrets to peer nodes.
+	rawConfigBytes []byte
+
 	// Suppress repeated credential-load log entries.
 	credLogged bool
 
@@ -758,12 +800,16 @@ func New(hostname string, runner AlertRunner, configPath string) *Engine {
 	return e
 }
 
-// AppName returns the configured app_name (safe for concurrent use).
-func (e *Engine) AppName() string {
+// NodeAlias returns the configured node_alias (safe for concurrent use).
+func (e *Engine) NodeAlias() string {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	return e.cfg.AppName
+	return e.cfg.NodeAlias
 }
+
+// AppName is a deprecated alias for NodeAlias; kept for internal call-sites
+// that haven't been migrated yet. Will be removed in a future version.
+func (e *Engine) AppName() string { return e.NodeAlias() }
 
 // clusterNodeName returns the cluster-configured node name when cluster is
 // enabled, and falls back to the OS hostname for standalone mode.
@@ -898,10 +944,25 @@ func (e *Engine) LoadConfig() error {
 		return fmt.Errorf("config %s: %w", cfgPath, err)
 	}
 
+	// Store pre-injection bytes for config-push /sync (avoids leaking resolved
+	// credentials back to disk when exporting shared config to peers).
+	e.mu.Lock()
+	e.rawConfigBytes = make([]byte, len(raw))
+	copy(e.rawConfigBytes, raw)
+	e.mu.Unlock()
+
 	var newCfg Config
 	if err := yaml.Unmarshal(substituted, &newCfg); err != nil {
 		return fmt.Errorf("parse config %s: %w", cfgPath, err)
 	}
+
+	// Migrate deprecated "app_name" → "node_alias" with one-time warning.
+	if newCfg.NodeAlias == "" && newCfg.AppNameLegacy != "" {
+		slog.Warn("config: 'app_name' is deprecated — rename to 'node_alias'",
+			"value", newCfg.AppNameLegacy)
+		newCfg.NodeAlias = newCfg.AppNameLegacy
+	}
+	newCfg.AppNameLegacy = "" // don't carry the legacy field further
 
 	newCfg.LogPath = resolvePath(newCfg.LogPath)
 	newCfg.StateFile = resolvePath(newCfg.StateFile)
@@ -1003,8 +1064,8 @@ func (e *Engine) LoadConfig() error {
 }
 
 func validateConfig(c Config) error {
-	if c.AppName == "" {
-		return fmt.Errorf("app_name is required")
+	if c.NodeAlias == "" {
+		return fmt.Errorf("node_alias is required (or deprecated app_name)")
 	}
 	if err := c.Cluster.Validate(); err != nil {
 		return err
@@ -1114,6 +1175,10 @@ func (e *Engine) Init() error {
 		// suspect signal, NotifyCoProberSoftDown triggers an immediate out-of-
 		// schedule verification probe on this node without waiting for the ticker.
 		e.clusterMgr.SetSoftDownNotifier(e)
+		// Wire config-push handler: when a peer broadcasts a shared config
+		// update, ApplySharedConfigJSON merges it into this node's config.yaml
+		// and triggers Reload().
+		e.clusterMgr.SetConfigPushHandler(e)
 		// Wire inventory refresh handler (Phase 13): cluster calls
 		// BroadcastInventory on each NotifyJoin so late-joining peers
 		// receive this node's current target states.
@@ -1222,7 +1287,7 @@ func (e *Engine) updateClusterMetrics() {
 	// Per-target cluster consensus status.
 	e.mu.RLock()
 	targets := e.cfg.Targets
-	appName := e.cfg.AppName
+	appName := e.cfg.NodeAlias
 	e.mu.RUnlock()
 
 	for _, t := range targets {
@@ -1694,7 +1759,7 @@ func (e *Engine) DispatchPeerAlert(p cluster.GossipPayload) {
 	host, port, _ := strings.Cut(p.TargetID, ":")
 
 	e.mu.RLock()
-	appName := e.cfg.AppName
+	appName := e.cfg.NodeAlias
 	defaultNotify := e.cfg.DefaultNotify
 	// Best-effort app enrichment: the target may be referenced in our local
 	// apps index even if we don't probe it directly.

@@ -366,6 +366,8 @@ slo:
 | `GET /geo/latency/{targetID}` | Per-node latency + anomaly flag for a target |
 | `GET /cluster/keyring/rotate` | Active key information |
 | `POST /cluster/keyring/rotate` | Zero-downtime AES key rotation |
+| `PUT /cluster/config` | Distribute shared config fields to all nodes (JSON or YAML body) |
+| `POST /cluster/config/sync` | Push this node's shared config fields to all peers |
 | `POST /cluster/leave` | Graceful cluster leave + process exit |
 
 ---
@@ -502,6 +504,64 @@ cluster:
 
 Zero-downtime key rotation: add the new key to the front of the list, roll it out to all nodes,
 then remove the old key in a second pass.
+
+### Config Distribution (Push / Sync)
+
+When all cluster nodes need to share common configuration, you can distribute it from a single node.
+
+**Synchronised fields:** `timeout`, `max_retries`, `retry_interval_sec`, `ticker_interval_sec`, `probe_interval_sec`, `reload_interval_sec`, `watchdog_threshold_sec`, `notifications`, `default_notify`, `cluster.keyring`, `cluster.peers`, `cluster.expected_node_count`, `cluster.min_quorum_ratio`, `cluster.probe_replication_factor`, `cluster.min_probe_confirmations`
+
+**Never synchronised:** `port`, `node_alias`, `log_path`, `state_file`, `credentials_file`, `targets`, `apps`, `slo`, `cluster.node_name/bind_*/advertise_*/zone/region`
+
+**Push specific fields (`PUT /cluster/config`):**
+
+```bash
+# Update notification channels on all nodes
+curl -X PUT http://node-1:10240/cluster/config \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{
+    "notifications": {
+      "ops-pager": {"type": "script", "parameters": {"script": "/etc/netwatch/alert.sh"}}
+    },
+    "default_notify": ["ops-pager"]
+  }'
+```
+
+YAML is also accepted (`Content-Type: application/x-yaml`).
+
+**Push all shared fields from this node (`POST /cluster/config/sync`):**
+
+Once you have one node configured correctly, sync its shared config to all others:
+
+```bash
+curl -X POST http://node-1:10240/cluster/config/sync \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+Node-1's `notifications`, `default_notify`, timing fields, and shared cluster settings are propagated to every peer. Each peer atomically rewrites its `config.yaml` and calls `Reload()` — no restart needed.
+
+**Response:**
+
+```json
+{
+  "applied_locally": true,
+  "broadcast_to": ["node-2", "node-3"],
+  "failed_nodes": {},
+  "fields_applied": ["notifications", "default_notify", "cluster.*"],
+  "pushed_at": "2026-05-14T10:00:00Z"
+}
+```
+
+**Admin auth:**
+
+```yaml
+# config.yaml
+admin:
+  token: "${ADMIN_TOKEN}"  # empty = no auth required (default)
+```
+
+When a token is configured, `Authorization: Bearer <token>` is required for all write endpoints. Missing header → `401 Unauthorized`. Wrong token → `403 Forbidden`.
 
 ---
 

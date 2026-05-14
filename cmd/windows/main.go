@@ -23,6 +23,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/saidtaylan/netwatch/internal/engine"
+	sigs_yaml "sigs.k8s.io/yaml"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/eventlog"
 	"golang.org/x/sys/windows/svc/mgr"
@@ -248,16 +249,116 @@ func runAgent(configPath string, leaveCh chan string) {
 		}
 	})
 
-	mux.HandleFunc("/cluster/config", func(w http.ResponseWriter, _ *http.Request) {
+	// GET /cluster/config — config-sync drift snapshot (P1.5)
+	// PUT /cluster/config — push shared fields to all nodes
+	mux.HandleFunc("/cluster/config", func(w http.ResponseWriter, r *http.Request) {
 		mgr := e.ClusterManager()
-		if mgr == nil {
-			http.Error(w, `{"error":"cluster disabled"}`, http.StatusServiceUnavailable)
+		if r.Method == http.MethodGet || r.Method == "" {
+			if mgr == nil {
+				http.Error(w, `{"error":"cluster disabled"}`, http.StatusServiceUnavailable)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(mgr.ConfigSyncSnapshot()); err != nil {
+				slog.Error("cluster/config encode error", "err", err)
+			}
+			return
+		}
+		if r.Method == http.MethodPut {
+			if !checkAdminAuth(e, w, r) {
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if mgr == nil {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"error": "cluster mode disabled — config push requires cluster.enabled=true",
+				})
+				return
+			}
+			body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "read body: " + err.Error()})
+				return
+			}
+			scJSON, err := parseSharedConfigBody(body, r.Header.Get("Content-Type"))
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			applyErr := e.ApplySharedConfigJSON(scJSON)
+			appliedLocally := applyErr == nil
+			peerResults := mgr.BroadcastConfigPush(scJSON)
+			broadcastTo := make([]string, 0, len(peerResults))
+			failedNodes := make(map[string]string)
+			for node, sendErr := range peerResults {
+				broadcastTo = append(broadcastTo, node)
+				if sendErr != nil {
+					failedNodes[node] = sendErr.Error()
+				}
+			}
+			var sc engine.SharedConfig
+			_ = json.Unmarshal(scJSON, &sc)
+			_ = json.NewEncoder(w).Encode(engine.ConfigPushResult{
+				AppliedLocally: appliedLocally,
+				BroadcastTo:    broadcastTo,
+				FailedNodes:    failedNodes,
+				FieldsApplied:  engine.AppliedFields(sc),
+				PushedAt:       time.Now(),
+			})
+			return
+		}
+		http.Error(w, `{"error":"use GET or PUT"}`, http.StatusMethodNotAllowed)
+	})
+
+	// POST /cluster/config/sync — take this node's shared fields, push to all peers.
+	mux.HandleFunc("/cluster/config/sync", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"use POST"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAdminAuth(e, w, r) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(mgr.ConfigSyncSnapshot()); err != nil {
-			slog.Error("cluster/config encode error", "err", err)
+		mgr := e.ClusterManager()
+		if mgr == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "cluster mode disabled — config sync requires cluster.enabled=true",
+			})
+			return
 		}
+		sc, err := e.ExtractSharedConfig()
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		scJSON, err := json.Marshal(sc)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		peerResults := mgr.BroadcastConfigPush(scJSON)
+		broadcastTo := make([]string, 0, len(peerResults))
+		failedNodes := make(map[string]string)
+		for node, sendErr := range peerResults {
+			broadcastTo = append(broadcastTo, node)
+			if sendErr != nil {
+				failedNodes[node] = sendErr.Error()
+			}
+		}
+		_ = json.NewEncoder(w).Encode(engine.ConfigPushResult{
+			AppliedLocally: false,
+			BroadcastTo:    broadcastTo,
+			FailedNodes:    failedNodes,
+			FieldsApplied:  engine.AppliedFields(sc),
+			PushedAt:       time.Now(),
+		})
 	})
 
 	mux.HandleFunc("/geo/latency/", func(w http.ResponseWriter, r *http.Request) {
@@ -334,6 +435,9 @@ func runAgent(configPath string, leaveCh chan string) {
 	})
 
 	mux.HandleFunc("/cluster/leave", func(w http.ResponseWriter, r *http.Request) {
+		if !checkAdminAuth(e, w, r) {
+			return
+		}
 		reason := r.URL.Query().Get("reason")
 		slog.Info("cluster leave requested via HTTP", "reason", reason)
 		w.Header().Set("Content-Type", "application/json")
@@ -346,7 +450,7 @@ func runAgent(configPath string, leaveCh chan string) {
 	})
 
 	port := e.Port()
-	slog.Info(engine.BinaryName+" listening", "port", port, "app", e.AppName(), "host", hostname)
+	slog.Info(engine.BinaryName+" listening", "port", port, "alias", e.NodeAlias(), "host", hostname)
 
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		slog.Error("server error", "err", err)
@@ -446,7 +550,7 @@ func cmdValidate(args []string) {
 	}
 
 	fmt.Printf("OK  config is valid\n\n")
-	fmt.Printf("  app_name   : %s\n", cfg.AppName)
+	fmt.Printf("  node_alias : %s\n", cfg.NodeAlias)
 	fmt.Printf("  targets    : %d total, %d active\n", len(cfg.Targets), activeCount)
 	fmt.Printf("  apps       : %d\n", len(cfg.Apps))
 	fmt.Printf("  channels   : %d notification channels\n", len(cfg.Notifications))
@@ -588,7 +692,7 @@ func configSkeleton(cfgDir string) string {
 		`# {{.BinaryName}} configuration
 # Full reference: https://github.com/saidtaylan/netwatch
 
-app_name: "{{.BinaryName}}-agent"
+node_alias: "{{.BinaryName}}-agent"
 port: "10240"
 state_file: "{{.CfgDir}}\state.json"
 log_path:   "{{.CfgDir}}\agent.log"
@@ -781,4 +885,56 @@ func formatBudget(sec int64) string {
 		return fmt.Sprintf("%s%dm%02ds", sign, m, s)
 	}
 	return fmt.Sprintf("%s%ds", sign, s)
+}
+
+// checkAdminAuth validates the Authorization: Bearer <token> header.
+// Returns true when the request is authorised (or when no token is configured).
+func checkAdminAuth(e *engine.Engine, w http.ResponseWriter, r *http.Request) bool {
+	token := e.AdminToken()
+	if token == "" {
+		return true
+	}
+	auth := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if len(auth) <= len(prefix) || auth[:len(prefix)] != prefix {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="netwatch-admin"`)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "Authorization: Bearer <token> header required",
+		})
+		return false
+	}
+	if auth[len(prefix):] != token {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid token"})
+		return false
+	}
+	return true
+}
+
+// parseSharedConfigBody converts a JSON or YAML body to a json.RawMessage.
+func parseSharedConfigBody(body []byte, contentType string) (json.RawMessage, error) {
+	ct := strings.ToLower(strings.TrimSpace(contentType))
+	if idx := strings.IndexByte(ct, ';'); idx >= 0 {
+		ct = strings.TrimSpace(ct[:idx])
+	}
+	switch ct {
+	case "application/x-yaml", "text/yaml", "application/yaml":
+		var m interface{}
+		if err := sigs_yaml.Unmarshal(body, &m); err != nil {
+			return nil, fmt.Errorf("YAML parse: %w", err)
+		}
+		out, err := json.Marshal(m)
+		if err != nil {
+			return nil, fmt.Errorf("YAML→JSON: %w", err)
+		}
+		return json.RawMessage(out), nil
+	default:
+		if !json.Valid(body) {
+			return nil, fmt.Errorf("invalid JSON body")
+		}
+		return json.RawMessage(body), nil
+	}
 }

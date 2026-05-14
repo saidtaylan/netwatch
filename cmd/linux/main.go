@@ -23,6 +23,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/saidtaylan/netwatch/internal/engine"
+	sigs_yaml "sigs.k8s.io/yaml"
 )
 
 func main() {
@@ -307,20 +308,144 @@ func main() {
 	// /cluster/leave triggers a graceful cluster leave + process exit.
 	// Accepts an optional "reason" query parameter for the shutdown log.
 	mux.HandleFunc("/cluster/leave", func(w http.ResponseWriter, r *http.Request) {
+		if !checkAdminAuth(e, w, r) {
+			return
+		}
 		reason := r.URL.Query().Get("reason")
 		slog.Info("cluster leave requested via HTTP", "reason", reason)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "leaving"})
-		// Non-blocking send — ignore if a shutdown is already in progress.
 		select {
 		case leaveCh <- reason:
 		default:
 		}
 	})
 
+	// PUT /cluster/config — distribute a partial SharedConfig to all nodes.
+	// Body: JSON or YAML (Content-Type: application/json or application/x-yaml).
+	// Only shared fields are applied; node-specific fields are always ignored.
+	// Requires admin.token auth if configured.
+	mux.HandleFunc("/cluster/config", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			http.Error(w, `{"error":"use PUT"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAdminAuth(e, w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+
+		mgr := e.ClusterManager()
+		if mgr == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "cluster mode disabled — config push requires cluster.enabled=true",
+			})
+			return
+		}
+
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // 1 MiB max
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "read body: " + err.Error()})
+			return
+		}
+
+		// Accept JSON or YAML depending on Content-Type.
+		scJSON, err := parseSharedConfigBody(body, r.Header.Get("Content-Type"))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		// Apply to self.
+		applyErr := e.ApplySharedConfigJSON(scJSON)
+		appliedLocally := applyErr == nil
+		if applyErr != nil {
+			slog.Warn("config push: local apply failed", "err", applyErr)
+		}
+
+		// Broadcast to all peers.
+		peerResults := mgr.BroadcastConfigPush(scJSON)
+		broadcastTo := make([]string, 0, len(peerResults))
+		failedNodes := make(map[string]string)
+		for node, err := range peerResults {
+			broadcastTo = append(broadcastTo, node)
+			if err != nil {
+				failedNodes[node] = err.Error()
+			}
+		}
+
+		// Parse SharedConfig for fields_applied report.
+		var sc engine.SharedConfig
+		_ = json.Unmarshal(scJSON, &sc)
+
+		_ = json.NewEncoder(w).Encode(engine.ConfigPushResult{
+			AppliedLocally: appliedLocally,
+			BroadcastTo:    broadcastTo,
+			FailedNodes:    failedNodes,
+			FieldsApplied:  engine.AppliedFields(sc),
+			PushedAt:       time.Now(),
+		})
+	})
+
+	// POST /cluster/config/sync — take this node's shared fields and push to peers.
+	// No body required. Requires admin.token auth if configured.
+	mux.HandleFunc("/cluster/config/sync", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"use POST"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAdminAuth(e, w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+
+		mgr := e.ClusterManager()
+		if mgr == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "cluster mode disabled — config sync requires cluster.enabled=true",
+			})
+			return
+		}
+
+		sc, err := e.ExtractSharedConfig()
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		scJSON, err := json.Marshal(sc)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		peerResults := mgr.BroadcastConfigPush(scJSON)
+		broadcastTo := make([]string, 0, len(peerResults))
+		failedNodes := make(map[string]string)
+		for node, err := range peerResults {
+			broadcastTo = append(broadcastTo, node)
+			if err != nil {
+				failedNodes[node] = err.Error()
+			}
+		}
+
+		_ = json.NewEncoder(w).Encode(engine.ConfigPushResult{
+			AppliedLocally: false, // sync pushes to peers only, self is already up-to-date
+			BroadcastTo:    broadcastTo,
+			FailedNodes:    failedNodes,
+			FieldsApplied:  engine.AppliedFields(sc),
+			PushedAt:       time.Now(),
+		})
+	})
+
 	port := e.Port()
-	slog.Info(engine.BinaryName+" listening", "port", port, "app", e.AppName(), "host", hostname)
+	slog.Info(engine.BinaryName+" listening", "port", port, "alias", e.NodeAlias(), "host", hostname)
 
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		slog.Error("server error", "err", err)
@@ -476,7 +601,7 @@ func cmdValidate(args []string) {
 	}
 
 	fmt.Printf("OK  config is valid\n\n")
-	fmt.Printf("  app_name   : %s\n", cfg.AppName)
+	fmt.Printf("  node_alias : %s\n", cfg.NodeAlias)
 	fmt.Printf("  targets    : %d total, %d active\n", len(cfg.Targets), activeCount)
 	fmt.Printf("  apps       : %d\n", len(cfg.Apps))
 	fmt.Printf("  channels   : %d notification channels\n", len(cfg.Notifications))
@@ -528,7 +653,7 @@ func configSkeleton(cfgDir string) string {
 		`# {{.BinaryName}} configuration
 # Full reference: https://github.com/saidtaylan/netwatch
 
-app_name: "{{.BinaryName}}-agent"
+node_alias: "{{.BinaryName}}-agent"
 port: "10240"
 state_file: "{{.CfgDir}}/state.json"
 log_path:   "{{.CfgDir}}/agent.log"
@@ -759,4 +884,69 @@ func formatBudget(sec int64) string {
 		return fmt.Sprintf("%s%dm%02ds", sign, m, s)
 	}
 	return fmt.Sprintf("%s%ds", sign, s)
+}
+
+// ── Admin auth ────────────────────────────────────────────────────────────────
+
+// checkAdminAuth validates the Authorization: Bearer <token> header against
+// the configured admin.token. Returns true when the request is authorised.
+// When admin.token is empty, all requests are allowed (no auth required).
+//
+// Future extension: replace this function with a middleware chain that checks
+// a user/role map once user management is added to AdminConfig.
+func checkAdminAuth(e *engine.Engine, w http.ResponseWriter, r *http.Request) bool {
+	token := e.AdminToken()
+	if token == "" {
+		return true // no token configured → unrestricted
+	}
+	auth := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if len(auth) <= len(prefix) || auth[:len(prefix)] != prefix {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="netwatch-admin"`)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "Authorization: Bearer <token> header required",
+		})
+		return false
+	}
+	if auth[len(prefix):] != token {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid token"})
+		return false
+	}
+	return true
+}
+
+// parseSharedConfigBody parses a JSON or YAML body into a json.RawMessage
+// that represents an engine.SharedConfig. Content-Type determines the format:
+// "application/x-yaml" or "text/yaml" → YAML; everything else → JSON.
+func parseSharedConfigBody(body []byte, contentType string) (json.RawMessage, error) {
+	ct := strings.ToLower(strings.TrimSpace(contentType))
+	if ct != "" {
+		// Strip charset / params: "application/json; charset=utf-8" → "application/json"
+		if idx := strings.IndexByte(ct, ';'); idx >= 0 {
+			ct = strings.TrimSpace(ct[:idx])
+		}
+	}
+	switch ct {
+	case "application/x-yaml", "text/yaml", "application/yaml":
+		// Convert YAML → JSON so we have a canonical representation.
+		var m interface{}
+		if err := sigs_yaml.Unmarshal(body, &m); err != nil {
+			return nil, fmt.Errorf("YAML parse: %w", err)
+		}
+		out, err := json.Marshal(m)
+		if err != nil {
+			return nil, fmt.Errorf("YAML→JSON: %w", err)
+		}
+		return json.RawMessage(out), nil
+	default:
+		// Validate that the body is valid JSON.
+		if !json.Valid(body) {
+			return nil, fmt.Errorf("invalid JSON body")
+		}
+		return json.RawMessage(body), nil
+	}
 }

@@ -18,6 +18,68 @@ Bu belge, netwatch projesinin günlük güncellemelerini ve teknik detaylarını
 
 ## 2026-05-14
 
+- [backend] [dokuman] **Config push/sync endpoint'leri + `node_alias` rename + admin bearer token auth.**
+
+  **1. Shared config push/sync — `PUT /cluster/config` + `POST /cluster/config/sync`**
+
+  Bir node'un ortak konfigürasyon alanlarını tüm cluster'a yaymasını sağlayan iki yeni endpoint:
+
+  - `PUT /cluster/config` — Body'de kısmi veya tam SharedConfig (JSON veya YAML). Çağrıldığı node'a uygulanır + gossip TCP ile tüm diğer node'lara iletilir.
+  - `POST /cluster/config/sync` — Body yok. Bu node'un kendi diskindeki config'inden ortak alanlar okunur ve tüm peer'lara gönderilir. Self-apply yok (zaten güncel).
+  - Cluster disabled ise 503 + açıklayıcı mesaj.
+
+  **Ortak (eşitlenen) alanlar:** `timeout`, `max_retries`, `retry_interval_sec`, `ticker_interval_sec`, `probe_interval_sec`, `reload_interval_sec`, `watchdog_threshold_sec`, `notifications`, `default_notify`, `cluster.keyring`, `cluster.peers`, `cluster.expected_node_count`, `cluster.min_quorum_ratio`, `cluster.probe_replication_factor`, `cluster.min_probe_confirmations`.
+
+  **Node-specific (asla üzerine yazılmaz):** `port`, `node_alias`, `log_path`, `state_file`, `credentials_file`, `targets`, `apps`, `slo`, `cluster.node_name/bind_*/advertise_*/zone/region`.
+
+  **Transport:** Memberlist `SendReliable` (TCP, AES-encrypted). Her peer için ayrı sonuç döner. Başarısız delivery `failed_nodes` map'inde görünür.
+
+  **Persistence:** Peer node config.yaml'ını atomik yazar (`.tmp` + rename), ardından `Reload()` tetikler. Restart sonrasında değişiklik korunur.
+
+  **Response:**
+  ```json
+  {
+    "applied_locally": true,
+    "broadcast_to": ["node-2","node-3"],
+    "failed_nodes": {},
+    "fields_applied": ["notifications","default_notify","cluster.*"],
+    "pushed_at": "2026-05-14T10:00:00Z"
+  }
+  ```
+
+  **Credential safety:** `/sync` endpoint'i disk'teki raw (pre-injection) baytları okur — RAM'deki çözülmüş `${VAR}` değerlerini değil. Böylece `${SMTP_PASS}` gibi şifreler peer'lara sızmaz.
+
+  **Yeni dosyalar:** `internal/engine/configpush.go`, `internal/cluster/configpush.go`.
+
+  **2. `app_name` → `node_alias` rename**
+
+  - Config key: `app_name` → `node_alias`. Eski `app_name` anahtar varsa uyarıyla migrate edilir (backward compat).
+  - Struct field: `Config.AppName` → `Config.NodeAlias`. `AppName()` metodu deprecated wrapper olarak kaldı.
+  - Alert env: `NODE_ALIAS` eklendi, `APP_NAME` backward compat için korundu.
+  - Metric label adı `app_name` olarak kaldı (Grafana dashboard uyumu).
+  - `validate` output: `app_name` → `node_alias`.
+  - `init` template: `app_name` → `node_alias`.
+  - `config.yaml`, `config.example.yaml` güncellendi.
+
+  **3. Admin bearer token auth**
+
+  Yeni `admin` config section:
+  ```yaml
+  admin:
+    token: "${ADMIN_TOKEN}"  # boşsa endpoint'ler açık (mevcut davranış)
+  ```
+
+  Write-capable endpoint'ler (`PUT /cluster/config`, `POST /cluster/config/sync`, `POST /cluster/keyring/rotate`, `POST /cluster/leave`) artık token ayarlıysa `Authorization: Bearer <token>` header zorunlu.
+  - Token eşleşmezse: 403 Forbidden
+  - Header yoksa: 401 Unauthorized + `WWW-Authenticate: Bearer realm="netwatch-admin"`
+  - `AdminConfig` struct: ileride `Users []AdminUser` genişletmesine hazır tasarım.
+
+  **Build + Test:**
+  ```
+  go build ./internal/engine/ ./internal/cluster/ ./cmd/linux/  ✓
+  go test -race -count=1 -timeout 120s ./internal/engine/... ./internal/cluster/...  ✓
+  ```
+
 - [backend] **Soft-down gossip, fast-check probe, underreplicated metric, min_probe_confirmations.**
 
   Dört bağlantılı problem çözüldü:

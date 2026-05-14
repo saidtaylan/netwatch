@@ -56,6 +56,8 @@ netwatch --config /path/to/config.yaml
 | `/fleet/status` *(Phase 13)* | GET | Cluster-wide özet: members (zone'larla), quorum/isolated flag'leri, target counts (up/hard_down/unknown), down target ID listesi (cap=100); cluster kapalıysa 503 |
 | `/slo` *(P1.4)* | GET | SLO snapshot: per-target uptime ratio, error budget, breach status, incident history; `slo.enabled: false` → 503 |
 | `/cluster/config` *(P1.5)* | GET | Config-sync snapshot: this node's SHA-256 hash + each peer's hash + in-sync flag + drift count; cluster kapalıysa 503 |
+| `/cluster/config` | PUT | Shared config fields dağıt (JSON/YAML body) → self apply + gossip TCP ile tüm peer'lara. `admin.token` ayarlıysa auth zorunlu. |
+| `/cluster/config/sync` | POST | Bu node'un shared config'ini peer'lara dağıt. Body yok. `admin.token` ayarlıysa auth zorunlu. |
 | `/geo/latency/{targetID}` *(P1.6)* | GET | Per-node latency view for a target: region labels, last probe latency, anomaly flag (any node >3× min) |
 
 **Default port:** `10240` (config'den override edilebilir)

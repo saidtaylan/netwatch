@@ -4,7 +4,7 @@
 # Full reference: config.example.yaml
 # ─────────────────────────────────────────────────────────────────────────────
 
-app_name: "netwatch-agent"
+node_alias: "netwatch-agent"
 port:     "10240"
 
 state_file:       "state.json"

@@ -553,6 +553,8 @@ Cluster, SLO, and geo metrics are only registered when the respective feature is
 | `GET /cluster/state` | JSON: member list + raw peer target states; `503` if cluster disabled |
 | `GET /cluster/probers` | JSON: per-target prober assignments — selected probers, primary, candidate set, `probe_from` constraint, members with zones |
 | `GET /cluster/config` | JSON: this node's config hash + all peer hashes + drift count; `503` if cluster disabled |
+| `PUT /cluster/config` | Distribute shared config fields to all nodes. Body: JSON or YAML (`Content-Type` selects format). Auth required if `admin.token` is set. |
+| `POST /cluster/config/sync` | Take this node's shared config fields and push them to all peers. No body. Auth required if `admin.token` is set. |
 | `GET /geo/latency/{targetID}` | JSON: per-node latency with region labels and anomaly flag |
 | `GET /cluster/keyring/rotate` | JSON: keyring status — key count and primary key prefix |
 | `POST /cluster/keyring/rotate` | Zero-downtime AES key rotation: `{"action":"add|use|remove","key":"base64..."}` |

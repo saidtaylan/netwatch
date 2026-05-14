@@ -154,7 +154,8 @@ func (e *Engine) sendAlert(t Target, status string) {
 		"TARGET":     t.Target,
 		"HOST":       host,
 		"PORT":       port,
-		"APP_NAME":   e.AppName(),
+		"APP_NAME":   e.NodeAlias(), // deprecated name kept for script backward compat
+		"NODE_ALIAS": e.NodeAlias(),
 		"NODE_NAME":  e.hostname,
 		"STATUS":     status,
 		"TYPE":       t.Type,

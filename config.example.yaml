@@ -4,7 +4,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Agent identity ────────────────────────────────────────────────────────────
-app_name: "netwatch-agent"       # Appears in metrics labels and alert env vars.
+node_alias: "netwatch-agent"    # Human-readable label for this node. Appears in metrics (as 'app_name' label) and alert env vars (NODE_ALIAS + APP_NAME).
 port:     "10240"                # HTTP port for /metrics, /health, /status.
 
 # ── File paths ────────────────────────────────────────────────────────────────

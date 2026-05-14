@@ -92,6 +92,8 @@ config.yaml               # Canlı config (sample — içinde açıklamalar var)
 | `GET /topology` | Target dependency graph (depends_on ilişkileri): her target için direct deps, reverse deps, transitive cascading impact. |
 | `GET /slo` | SLO metrics: per-target uptime ratio, error budget, incident history, breach status. `slo.enabled: false` ise 503. |
 | `GET /cluster/config` | **P1.5:** Config-sync snapshot — this node's hash + peer hashes + drift count; cluster kapalıysa 503. |
+| `PUT /cluster/config` | Kısmi SharedConfig (JSON/YAML body) al, kendine uygula + tüm peer'lara gossip TCP ile dağıt. Auth gerektirir (`admin.token` ayarlıysa). |
+| `POST /cluster/config/sync` | Body yok. Bu node'un diskindeki shared field'larını peer'lara dağıt. Auth gerektirir. |
 | `GET /geo/latency/{targetID}` | **P1.6:** Per-node latency view: region labels, last probe latency, anomaly flag (max > 3× min). |
 | `GET /fleet/status?format=text` | Terminal-friendly ASCII tablo: cluster başlığı, summary, incidents, per-target state/scope/classification. |
 | `GET /slo?format=text` | Terminal-friendly ASCII tablo: per-target TARGET%, ACTUAL%, STATUS, BUDGET REMAINING. |
@@ -139,7 +141,7 @@ SLO metrikleri yalnızca `slo.enabled=true` iken `RegisterSLOMetrics` aracılı�
 
 ```yaml
 port: "10240"
-app_name: "my-agent"
+node_alias: "my-agent"         # eski "app_name" backward compat ile okunur, deprecated
 state_file: "state.json"
 log_path: "prober.log"        # boş bırakılırsa stdout
 timeout: 5
@@ -150,6 +152,10 @@ probe_interval_sec: 60        # per-target interval_sec ile override edilebilir
 reload_interval_sec: 30       # 0 = hot-reload kapalı
 watchdog_threshold_sec: 120   # scrape bu kadar sn gelmezse [WATCHDOG] log + metrik=0; 0 = devre dışı
 credentials_file: "credentials.env"  # ${VAR} injection için
+
+# Admin auth — write-capable endpoint'ler için opsiyonel bearer token
+admin:
+  token: "${ADMIN_TOKEN}"  # boşsa endpoint'ler açık (default)
 
 notifications:
   kanal-adi:
@@ -296,7 +302,8 @@ Alert env değişkenleri (script, mail ve webhook'un tümü alır):
 | `NAME` | target name | ✓ |
 | `TARGET` | host:port veya URL | ✓ |
 | `HOST`, `PORT` | parse edilmiş adres bileşenleri | ✓ |
-| `APP_NAME` | agent'ın app_name config değeri | ✓ |
+| `APP_NAME` | agent'ın `node_alias` değeri (eski ad, korundu) | ✓ |
+| `NODE_ALIAS` | agent'ın `node_alias` değeri | ✓ |
 | `NODE_NAME` | `os.Hostname()` çıktısı | ✓ |
 | `STATUS` | `unreachable` veya `reachable` | ✓ |
 | `TYPE` | tcp / http / ping / dns / sql | ✓ |

@@ -770,6 +770,47 @@ slo:
 
 ---
 
+---
+
+## ✅ Config Push/Sync + node_alias + Admin Auth (TAMAMLANDI — 2026-05-14)
+
+**Hedef:** Bir node'dan ortak konfigürasyonu tüm cluster'a dağıtabilme.
+
+**Tamamlanan görevler:**
+
+1. `PUT /cluster/config` endpoint'i — kısmi SharedConfig body (JSON veya YAML), kendine uygula + gossip TCP ile tüm peer'lara dağıt. `applied_locally`, `broadcast_to`, `failed_nodes`, `fields_applied` response.
+2. `POST /cluster/config/sync` endpoint'i — bu node'un diskindeki shared field'larını peer'lara dağıt (credential-safe: pre-injection bytes kullanır).
+3. `internal/engine/configpush.go` — `SharedConfig`, `SharedClusterConfig` struct'ları; `ExtractSharedConfig()`, `ApplySharedConfigJSON()`, `AppliedFields()`.
+4. `internal/cluster/configpush.go` — `ConfigPushPayload`, `ConfigPushHandler` interface, `BroadcastConfigPush()`, `handleConfigPush()`, `SetConfigPushHandler()`.
+5. `cluster.go` `NotifyMsg`'da `msg_type: "config_push"` dispatch eklendi.
+6. `engine.go` `Init()`'de `SetConfigPushHandler(e)` wiring.
+7. `app_name` → `node_alias` rename: `Config.NodeAlias`, backward compat migration, `AppName()` deprecated wrapper, `NODE_ALIAS` env var eklendi, `APP_NAME` korundu.
+8. `AdminConfig` struct + `admin.token` bearer auth: `checkAdminAuth()` helper, write-capable endpoint'lerde (`PUT /cluster/config`, `POST /cluster/config/sync`, `POST /cluster/keyring/rotate`, `POST /cluster/leave`) auth guard. Extensible tasarım (ileride `Users []AdminUser`).
+9. `cmd/linux/main.go` + `cmd/windows/main.go` — tüm endpoint'ler + `checkAdminAuth` + `parseSharedConfigBody` (JSON/YAML content-type dispatch).
+10. `config.example.yaml`, `config.yaml`, `GUIDE.md`, `GUIDE_EN.md`, `README.md`, `CLAUDE.md`, `developments.md`, `system_map.md` güncellendi.
+
+**Ortak (eşitlenen) alanlar:**
+```
+timeout, max_retries, retry_interval_sec, ticker_interval_sec, probe_interval_sec,
+reload_interval_sec, watchdog_threshold_sec, notifications, default_notify,
+cluster.keyring, cluster.peers, cluster.expected_node_count, cluster.min_quorum_ratio,
+cluster.probe_replication_factor, cluster.min_probe_confirmations
+```
+
+**Node-specific (asla üzerine yazılmaz):**
+```
+port, node_alias, log_path, state_file, credentials_file, targets, apps, slo,
+cluster.node_name/bind_*/advertise_*/zone/region/config_sync.*
+```
+
+**Build + Test:**
+```
+go build ./internal/engine/ ./internal/cluster/ ./cmd/linux/  ✓
+go test -race -count=1 -timeout 120s ./internal/engine/... ./internal/cluster/...  ✓
+```
+
+---
+
 ## Sabit Kısıtlamalar (değiştirilemez)
 
 Bu kısıtlamalar sprint planlamasında daima geçerlidir:

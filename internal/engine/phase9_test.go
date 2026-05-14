@@ -249,7 +249,7 @@ func TestRunCheck_SkipsWhenSyncing(t *testing.T) {
 				return true, nil
 			}},
 		},
-		cfg: Config{AppName: "test"},
+		cfg: Config{NodeAlias: "test"},
 	}
 	e.syncing.Store(true)
 

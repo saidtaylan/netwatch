@@ -11,7 +11,7 @@ import (
 func newStandaloneEngine(targets []Target, apps []App, states map[string]PersistedState) *Engine {
 	e := &Engine{
 		cfg: Config{
-			AppName: "fleet-test",
+			NodeAlias: "fleet-test",
 			Targets: targets,
 			Apps:    apps,
 		},

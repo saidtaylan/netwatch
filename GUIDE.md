@@ -366,6 +366,8 @@ slo:
 | `GET /geo/latency/{targetID}` | Target için per-node latency + anomali flag |
 | `GET /cluster/keyring/rotate` | Aktif key bilgisi |
 | `POST /cluster/keyring/rotate` | Sıfır-kesinti AES key rotasyonu |
+| `PUT /cluster/config` | Ortak config alanlarını tüm node'lara dağıt (JSON/YAML body) |
+| `POST /cluster/config/sync` | Bu node'un shared config'ini tüm peer'lara gönder |
 | `POST /cluster/leave` | Cluster'dan graceful ayrılış + process sonlanma |
 
 ---
@@ -503,6 +505,71 @@ cluster:
 
 Sıfır-kesinti key rotasyonu: önce yeni key'i listenin başına ekle, tüm node'lara dağıt,
 sonra eski key'i kaldır.
+
+### Config Dağıtımı (Push / Sync)
+
+Cluster'daki tüm node'ların ortak konfigürasyonu paylaşması gerektiğinde tek bir node'dan dağıtım yapabilirsiniz.
+
+**Eşitlenen alanlar:** `timeout`, `max_retries`, `retry_interval_sec`, `ticker_interval_sec`, `probe_interval_sec`, `reload_interval_sec`, `watchdog_threshold_sec`, `notifications`, `default_notify`, `cluster.keyring`, `cluster.peers`, `cluster.expected_node_count`, `cluster.min_quorum_ratio`, `cluster.probe_replication_factor`, `cluster.min_probe_confirmations`
+
+**Hiçbir zaman eşitlenmeyen alanlar:** `port`, `node_alias`, `log_path`, `state_file`, `credentials_file`, `targets`, `apps`, `slo`, `cluster.node_name/bind_*/advertise_*/zone/region`
+
+**Belirli alanları dağıt (`PUT /cluster/config`):**
+
+```bash
+# Tüm node'lardaki notification kanallarını ve default_notify'ı güncelle
+curl -X PUT http://node-1:10240/cluster/config \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{
+    "notifications": {
+      "ops-pager": {"type": "script", "parameters": {"script": "/etc/netwatch/alert.sh"}}
+    },
+    "default_notify": ["ops-pager"]
+  }'
+```
+
+YAML formatı da desteklenir (`Content-Type: application/x-yaml`):
+
+```bash
+curl -X PUT http://node-1:10240/cluster/config \
+  -H "Content-Type: application/x-yaml" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  --data-binary @shared-config.yaml
+```
+
+**Bu node'un tüm ortak alanlarını dağıt (`POST /cluster/config/sync`):**
+
+Bir node'u doğru kurduysanız ve diğerlerini sıfırdan başlatmak istiyorsanız:
+
+```bash
+curl -X POST http://node-1:10240/cluster/config/sync \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+Node-1'in `notifications`, `default_notify`, timing alanları ve cluster ortak ayarları tüm peer'lara yayılır. Her peer kendi `config.yaml`'ını atomik yazar ve `Reload()` tetikler — restart gerekmez.
+
+**Yanıt:**
+
+```json
+{
+  "applied_locally": true,
+  "broadcast_to": ["node-2", "node-3"],
+  "failed_nodes": {},
+  "fields_applied": ["notifications", "default_notify", "cluster.*"],
+  "pushed_at": "2026-05-14T10:00:00Z"
+}
+```
+
+**Admin auth:**
+
+```yaml
+# config.yaml
+admin:
+  token: "${ADMIN_TOKEN}"  # boşsa tüm write endpoint'ler açık
+```
+
+Token ayarlıysa `Authorization: Bearer <token>` header zorunludur. Token olmadan çağrı yapılırsa `401 Unauthorized`. Yanlış token: `403 Forbidden`.
 
 ---
 
