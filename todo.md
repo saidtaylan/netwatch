@@ -1,686 +1,364 @@
-# netwatch — Yeni Özellik Roadmap'i
+# netwatch — Distributed Probe Ownership: Soru & Cevap
 
-Bu dosya cluster mesh'in alarm dışında sunabileceği değerleri detaylandırır. Ürünün asıl farklılaşma noktaları burada — standalone mod sıradan, cluster mod magic.
-
-**Pazarlama konumu:** "The first masterless, consensus-based network monitoring agent."
-
-**Öncelik sırası:** P0 = ürün için hayati, P1 = güçlü farklılaşma, P2 = nice-to-have.
+Bu belge, cluster modunda dağıtık probe atamasının nasıl çalıştığına dair en sık sorulan soruları ve teknik mekanizmaları açıklar. README'deki ilgili bölümlerin daha derin açıklamasıdır.
 
 ---
 
-## ✅ 1. Dependency Graph + Root Cause Detection [P0] — TAMAMLANDI
+## Temel Çalışma Prensibi
 
-**Dosyalar:** `internal/engine/topology.go`, `topology_test.go`
-**Config:** `target.depends_on: [...]` — cyclic ve unknown-ref validation
-**Yeni alert env:** `ROOT_CAUSE`, `CASCADING_IMPACT`, `DEPENDENCY_DEPTH`
-**Yeni endpoint:** `GET /topology` — tam dependency graph JSON'u
-**Tests:** 14 unit test, topology_test.go (buildGraph, FindRootCause, CascadingImpact, DependencyDepth)
+### "50 node varsa sadece 3'ü probe eder" derken tam olarak ne oluyor?
+
+Diyelim ki cluster'da 50 node var ve `probe_replication_factor: 3`. `payments-db` target'ı için sistem şu üç şeyi yapar:
+
+1. **Aday listesi (candidate set):** `payments-db`'yi kendi config'inde tanımlayan ve o an alive olan tüm node'lar aday olur. Gossip'te her node kendi target listesini yayar, bu yüzden ekstra mesaj gerektirmez.
+
+2. **Hash ring seçimi:** Aday listesi isim sırasına göre sıralanır. `FNV-32a("payments-db")` hash'i hesaplanır. Sıralı listenin neresinden başlanacağı bu hash'le belirlenir. Başlangıç noktasından itibaren zone-aware algoritma `probe_replication_factor` kadar node seçer. Bu hesaplama her node'da bağımsız yapılır — ağ konuşması gerekmez, her node aynı sonuca ulaşır.
+
+3. **Probe ya da dinle:** Seçilen 3 node kendi probe goroutine'ini başlatır ve `payments-db`'ye bağlantı açar. Seçilmeyen 47 node ise `startProbeLoop` çağrısına bile girmez — goroutine başlatmazlar.
 
 ---
 
-## 1. Dependency Graph + Root Cause Detection [P0] — Orijinal Plan
+### Seçilmeyen 47 node ne yapar?
 
-### Neden hayati
-Şu an alarm mesajı şunu söylüyor: "db-primary unreachable". Operatöre fayda yok — neden down? Bağlı servisler de etkileniyor mu? Bu bilgi yok.
+Pasif dinleyicidirler. Yapabilecekleri şunlardır:
 
-Dependency graph + cluster consensus birleşince netwatch şunu söyleyebilir:
-> "payment-service unreachable. Root cause: db-primary down (confirmed by 2/3 nodes). Cascading impact: 3 apps affected."
+- Gossip kanalından gelen `GossipPayload` mesajlarını alırlar: "node-A, payments-db'yi hard-down gördü, seq=3"
+- Bu bilgiyi kendi `peerStates` map'lerine kaydederler
+- `/status`, `/fleet/status`, `/cluster/state` endpoint'lerinde bu bilgiyi gösterirler
+- `SCOPE` ve `CLASSIFICATION` hesaplamalarına katkı sağlarlar (peer state'lerini okuyarak)
 
-Bu Zabbix'te bile saatlerce config gerektiren bir şey. netwatch'ta YAML'da `depends_on:` tanımlamak yeter.
+**Yapamazlar:**
+- `payments-db`'ye bağlantı açmazlar
+- Alarm gönderemezler (hem responsible değiller hem de local probe'ları yok)
+- Probe sonucuna bağlı olarak goroutine başlatmazlar
 
-### Config genişlemesi
+Kısacası: 47 node olayı *gözlemler*, 3 node *ölçer*.
+
+---
+
+### Target down olduğunda 47 node haberdar mı oluyor? Onlar da probe etmeye başlıyor mu?
+
+Haberdar oluyorlar ama probe etmeye başlamıyorlar.
+
+Şu olur:
+
+1. 3 probe node'undan biri (diyelim node-A) `payments-db`'yi hard-down ilan eder.
+2. Node-A `Broadcast()` çağırır — gossip kanalına bir `GossipPayload` kuyruklar.
+3. Sonraki gossip round'unda (~200ms) bu payload 3 random peer'a UDP olarak gönderilir. Onlar da 3'er peer'a. Birkaç round içinde tüm 50 node haberdar olur.
+4. Her node `NotifyMsg()` callback'inde bu payload'ı alır, `peerStates["payments-db"]["node-A"] = hard_down, seq=3` şeklinde kaydeder.
+5. **Hiçbir node bu noktada probe goroutine başlatmaz.** Probe atama `recomputeProberAssignments()` tarafından yönetilir ve bu fonksiyon yalnızca cluster membership değiştiğinde çalışır (node join/leave). Target'ın durumu ne olursa olsun probe ataması değişmez.
+
+**İstisna: Prober node'u cluster'dan ayrılırsa ne olur?**
+
+Eğer 3 prober'dan biri cluster'dan ayrılırsa (`NotifyLeave` tetiklenir), `updateRing()` çağrılır ve tüm node'lar probe atamalarını yeniden hesaplar. Bu durumda daha önce pasif olan bir node artık prober listesine girebilir ve probe goroutine'ini başlatır. Bu otomatik failover mekanizmasıdır.
+
+---
+
+### 3 probe node'u birbirine "sen de probe et" diye haber veriyor mu?
+
+Hayır. Üç node birbirinden tamamen bağımsız hareket eder.
+
+Her birinin kendi probe goroutine'i vardır. Her biri kendi `probe_interval_sec`'i beklip kendi bağlantısını açar. Birinin probe sonucu diğerini tetiklemez. Birbirlerine "şu an probe et" veya "sen de bak" diye mesaj gönderilmez.
+
+Koordinasyon sadece şu konuda gerçekleşir:
+- **Gossip:** "Ben payments-db'yi down gördüm" (bilgi paylaşımı)
+- **Alert kararı:** Consistent hash primary'si toplanan bilgilere bakarak tek alarm gönderir
+
+Probing faaliyetinin kendisi koordinasyonsuz, bağımsız, paralel çalışır.
+
+---
+
+## Atama Matrisi ve Ölçek
+
+### 1000 target varsa cluster bunu nasıl yönetir?
+
+Her node için hesaplama şudur:
+
+```
+bu node, target X için prober mı?
+= IsLocalProber("target-X")
+= "target-X"'in hash ring seçiminde bu node var mı?
+```
+
+Bu hesaplama saf bir CPU işlemidir. 1000 target için 1000 kez hash + ring lookup yapılır — milisaniyeler içinde tamamlanır, ağ konuşması gerekmez.
+
+**Bellek kullanımı:**
+
+Her node, tüm target'lar için peer state'lerini tutar. 1000 target × 3 prober = en fazla 3000 gossip kaydı. Her kayıt ~100 byte. Toplam: **~300 KB per node** — önemsiz.
+
+**Goroutine kullanımı:**
+
+10 node'lu cluster'da: ortalama `1000 × 3 / 10 = 300` probe goroutine per node.
+50 node'lu cluster'da: ortalama `1000 × 3 / 50 = 60` probe goroutine per node.
+
+Go goroutine'leri uyurken neredeyse sıfır CPU harcar. 300 uyuyan goroutine ~2 MB stack, %0 CPU.
+
+**Gossip trafiği:**
+
+1000 target'ın her biri en fazla 3 node tarafından broadcast edilir. `probe_interval_sec: 60` ile dakikada 3000 gossip mesajı üretilir. Gossip fanout faktörü (3 peer per round) ile bu 50 node'a ~2 saniyede yayılır.
+
+---
+
+### Her target için ayrı bir matris tutulmuyor mu?
+
+Tutulmuyor. "Matris" kavramı yanıltıcı olabilir.
+
+Gerçekte şu var:
+
+```
+peerStates map[targetID]map[nodeName]GossipPayload
+```
+
+Bu tüm cluster'ın bildiği şeyler. 1000 target × 3 prober = 3000 entry. Her node bu map'in kendi kopyasını tutar. `peerStates["payments-db"]["node-A"]` erişimi O(1).
+
+Prober ataması ise map'te saklanmaz — `IsLocalProber("payments-db")` her çağrıldığında anında hesaplanır. Saklanan bir atama tablosu yoktur.
+
+---
+
+## Konfigürasyon ve Senkronizasyon
+
+### `probe_replication_factor`'ı değiştirebilir miyim? Tüm node'larda tek tek mi değiştireceğim?
+
+Değiştirebilirsin. Ama **tüm node'lar aynı değeri kullanmalıdır**.
+
+**Neden?**
+
+Factor, hash ring'in kaç node seçeceğini belirler. Farklı node'lar farklı factor kullanırsa, seçilen prober set'leri farklılaşır:
+
+```
+node-1 (factor=3): payments-db için prober = [A, B, C]
+node-2 (factor=5): payments-db için prober = [A, B, C, D, E]
+```
+
+Bu durumda:
+- Node-A primary. Factor=3 dünyasında: primary, sorumlu, alarm gönderir. Factor=5 dünyasında da primary, sorumlu, alarm gönderir. İlk alarm tek gider — sorun yok gibi görünür.
+- Sonra node-A crash olur. Factor=3 dünyasında ring yeniden hesaplanır: yeni primary B. Factor=5 dünyasında: yeni primary hâlâ B ama şimdi D ve E de prober — iki farklı dünyada "primary" farklı node olabilir.
+- Sonuç: çift alarm riski.
+
+**Değişiklik nasıl yapılır?**
+
+*Kubernetes / ConfigMap:* ConfigMap'i güncelle, pod'lar hot-reload ile alır. Tüm pod'lar `reload_interval_sec` içinde yeni değere geçer.
+
+*Ansible / Puppet:* Config'i tüm node'larda aynı anda yayın. `reload_interval_sec` bekleme süresi içinde tüm node'lar geçiş yapar.
+
+*Manuel:* Config dosyasını tüm node'larda hızlıca güncelle. Node'lar `reload_interval_sec` periyodunda pickup yapar. Birkaç saniyelik tutarsızlık penceresi kabul edilebilirdir — dakikalar boyunca tutarsızlık bırakma.
+
+Restart gerekmez. Hot-reload yeterlidir.
+
+**Doğrulama:** `GET /cluster/probers` endpoint'i her node'un hangi factor'ı kullandığını gösterir. Güncelleme sonrası kontrol et.
+
+---
+
+### `probe_from` ve `probe_from_regions` arasındaki fark ne?
+
+**`probe_from`** — node ismine göre tam pin:
 
 ```yaml
-targets:
-  - id: "payment-service"
-    type: "http"
-    target: "https://payments.local/health"
-    depends_on:
-      - "db-primary"        # target id
-      - "redis-cache"
-      - "auth-service"
-
-  - id: "db-primary"
-    type: "tcp"
-    target: "10.0.0.5:5432"
-    depends_on: []          # kök bağımlılık
-
-apps:
-  - name: "checkout"
-    uses: ["payment-service", "inventory-api"]
-    critical_path: ["payment-service"]    # bu down olursa app down
+probe_from: ["frankfurt-1", "frankfurt-2"]
 ```
 
-### Implementation outline
+Sadece bu iki node probe eder. VPN erişimi, özel credentials, firewall kuralları gibi durumlar için kullanılır. Node isimleri node_name config değeriyle eşleşmelidir.
 
-**Yeni dosya: `internal/engine/topology.go`**
-
-```go
-type DependencyGraph struct {
-    nodes map[string]*Target            // targetID → Target
-    edges map[string][]string           // targetID → bağımlı olduğu targetID'ler
-    reverse map[string][]string         // targetID → ona bağımlı olanlar
-}
-
-func buildDependencyGraph(cfg Config) *DependencyGraph
-func (g *DependencyGraph) FindRootCause(failedID string, allStates map[string]PersistedState) []string
-func (g *DependencyGraph) CascadingImpact(failedID string, allStates map[string]PersistedState) []string
-```
-
-**Algoritma:**
-- Bir target down olduğunda → `depends_on` listesini yürü
-- Her bağımlılık için cluster-wide state'e bak (peer states + local)
-- En derinde olan down target'ı = root cause
-- Reverse edge'lerle "etkilenen target'lar" listesi çıkar
-
-### Alarm mesajı zenginleşmesi
-
-`Alert` struct'ına ekle:
-```go
-RootCause       string   // örn: "db-primary"
-CascadingImpact []string // örn: ["payment-service", "inventory-api", "checkout-app"]
-DependencyDepth int      // bu target zincirin neresinde
-```
-
-Env değişkenleri (script + mail + webhook hepsi alır):
-- `ROOT_CAUSE=db-primary`
-- `CASCADING_IMPACT=payment-service,inventory-api`
-- `DEPENDENCY_DEPTH=2`
-
-Webhook payload'a (Alertmanager format):
-```json
-"annotations": {
-  "root_cause": "db-primary",
-  "cascading_impact": "payment-service,inventory-api,checkout-app",
-  "summary": "payment-service unreachable. Root cause: db-primary down."
-}
-```
-
-### Cluster vs Standalone
-- **Standalone:** Sadece local state'e bakar, root cause hesaplar. Çalışır ama "confirmed by N nodes" diyemez.
-- **Cluster:** Peer state'leri ile birleşir. "Root cause confirmed by 2/3 nodes" demek mümkün → `ROOT_CAUSE_CONFIRMATIONS=2/3` env'i eklenir.
-
-### Yeni endpoint
-- `GET /topology` — Dependency graph'ı JSON döner
-- `GET /topology/impact/{targetID}` — Bu target down olursa neler etkilenir
-
-### Validation
-- Cyclic dependency yasak (build sırasında detect)
-- Var olmayan target ID'sine `depends_on` referansı hata
-- `depends_on` reload'da güncellenmeli
-
-### Kabul Kriteri
-1. `db-primary` down → `payment-service` alarmında `ROOT_CAUSE=db-primary`
-2. `db-primary` UP, `payment-service` down → `ROOT_CAUSE=payment-service` (kendisi)
-3. `GET /topology` graph'ı doğru gösterir
-4. Cyclic config validation hatası verir
-
----
-
-## ✅ 2. /fleet/status — Decentralized Fleet Aggregation [P0] — TAMAMLANDI
-
-**Dosyalar:** `internal/engine/fleet.go`, `fleet_test.go`
-**Endpoint:** `GET /fleet/status` — engine-level, standalone + cluster her ikisinde çalışır
-**Payload:** `cluster` (nil in standalone), `summary` (total/up/soft_down/hard_down/unknown), `targets[]` (per-target: by_node, consensus_state, scope, affected_apps, owner_teams, root_cause, cascading_impact), `incidents[]`
-**cluster.Manager:** `QuorumHealthy()`, `ReplicationFactor()`, `AllPeerStates()` eklendi
-**Tests:** 6 unit test (fleet_test.go)
-
----
-
-## 2. /fleet/status — Decentralized Fleet Aggregation [P0] — Orijinal Plan
-
-### Neden hayati
-Bu özellik netwatch'ı "Prometheus exporter"dan "kendi başına monitoring agent"a çeviriyor. Küçük/orta ekipler Grafana kurmak istemiyor — `curl /fleet/status` ile her şeyi görsünler.
-
-Master-less. Hiçbir node "merkez" değil. Hangi node'a sorarsan sor aynı cevap.
-
-Bu **gerçekten** Zabbix'in yapamadığı bir şey — Zabbix proxy bile merkezi server'a bağımlı.
-
-### Endpoint Tasarımı
-
-`GET /fleet/status`
-```json
-{
-  "cluster": {
-    "size": 3,
-    "healthy": true,
-    "isolated": false,
-    "quorum_ratio": 1.0,
-    "members": ["node-1", "node-2", "node-3"]
-  },
-  "summary": {
-    "total_targets": 47,
-    "up": 42,
-    "soft_down": 2,
-    "hard_down": 3,
-    "unknown": 0
-  },
-  "targets": {
-    "db-primary": {
-      "consensus_state": "hard_down",
-      "scope": "GLOBAL",
-      "last_seen_up": "2026-05-09T12:34:56Z",
-      "down_duration_sec": 1247,
-      "by_node": {
-        "node-1": {"state": "hard_down", "seq": 5, "error": "connection refused"},
-        "node-2": {"state": "hard_down", "seq": 5, "error": "connection refused"},
-        "node-3": {"state": "hard_down", "seq": 5, "error": "connection refused"}
-      },
-      "responsible_node": "node-2",
-      "alert_sent": true,
-      "root_cause": "db-primary",
-      "affected_apps": ["payment-service", "checkout"]
-    },
-    ...
-  },
-  "incidents": [
-    {
-      "target": "db-primary",
-      "started_at": "2026-05-09T12:34:56Z",
-      "scope": "GLOBAL",
-      "duration_sec": 1247,
-      "alert_dispatched_by": "node-2"
-    }
-  ]
-}
-```
-
-`GET /fleet/status?format=text` — terminal-friendly tablo:
-```
-CLUSTER: 3 nodes, healthy, quorum 1.00
-TARGETS: 47 total | 42 UP | 2 SOFT | 3 DOWN
-
-DOWN:
-  db-primary       GLOBAL    20m47s   confirmed by 3/3   → payment-service, checkout
-  redis-cache      PARTIAL   5m12s    confirmed by 2/3   → session-store
-  api-gateway      LOCAL     1m08s    1/3 (node-2)       → (lokal sorun)
-```
-
-### Implementation
-
-**Yeni dosya: `internal/engine/fleet.go`**
-
-```go
-type FleetSnapshot struct {
-    Cluster   ClusterInfo
-    Summary   FleetSummary
-    Targets   map[string]TargetFleetState
-    Incidents []Incident
-}
-
-type TargetFleetState struct {
-    ConsensusState   string                       // up | soft_down | hard_down
-    Scope            string                       // GLOBAL | PARTIAL | NODE_LOCAL
-    LastSeenUp       *time.Time
-    DownDurationSec  int64
-    ByNode           map[string]NodeTargetView
-    ResponsibleNode  string
-    AlertSent        bool
-    RootCause        string                       // (1) ile entegre
-    CascadingImpact  []string
-    AffectedApps     []string
-}
-
-func (e *Engine) FleetSnapshot() FleetSnapshot {
-    // Her target için:
-    //   - local state (e.lastKnown)
-    //   - tüm peer state (cluster.PeerStatesForTarget)
-    //   - consensus hesapla (>50% aynı state → consensus)
-    //   - scope (zaten var, computeScope)
-    //   - dependency root cause
-}
-```
-
-### Yeni metric
-- `network_probe_fleet_consensus_state` — label'lı: up=1, hard_down=0, mismatch=-1
-- `network_probe_fleet_consensus_disagreement` — label'lı: kaç node karşı çıkıyor
-
-### Cluster vs Standalone
-- **Standalone:** Sadece kendi state'i döner, `cluster.size=1`, scope hep `NODE_LOCAL`. Yine de yararlı — ama esas değer cluster'da.
-
-### Kabul kriteri
-1. 3 node cluster'da `curl localhost:10240/fleet/status` ve `curl localhost:10241/fleet/status` aynı sonucu döner
-2. Bir node down olduğunda `cluster.healthy=false` ama diğer node'lar fleet view'i sunmaya devam eder
-3. Target by-node breakdown'ı doğru gösterir
-4. `?format=text` çalışır
-
----
-
-## ✅ 3. Scope Intelligence Enhancement (Network Partition Detection) [P1] — TAMAMLANDI
-
-**Dosya:** `internal/engine/scope.go`, `scope_test.go`
-**Yeni tip:** `DetailedScope` (Scope, Classification, DownNodes, UpNodes, OfflineNodes, PartitionGroups, Confidence)
-**Yeni metod:** `classifyScope(targetID)` — REAL_OUTAGE / NETWORK_PARTITION / LOCAL_FAILURE / AMBIGUOUS
-**Alert env:** CLASSIFICATION, CONFIDENCE, DOWN_NODES, UP_NODES, OFFLINE_NODES
-**fleet.go:** `FleetTarget.Classification` + `FleetTarget.Confidence` alanları eklendi
-**Tests:** 9 unit test, `-race` yeşil
-
----
-
-## 3. Scope Intelligence Enhancement (Network Partition Detection) [P1] — Orijinal Plan
-
-### Neden değerli
-Phase 8'de `SCOPE=GLOBAL/PARTIAL/NODE_LOCAL` zaten var. Ama alarm geldiğinde operatör hâlâ "ağ partition'ı mı, gerçek outage mı?" diye düşünüyor. Bu adımda sınıflandırmayı zenginleştir:
-
-- `SCOPE=GLOBAL` + tüm node'lar bağlı + target tek başına down → **REAL_OUTAGE**
-- `SCOPE=PARTIAL` + bir grup node target'ı UP, diğer grup DOWN → **NETWORK_PARTITION**
-- `SCOPE=NODE_LOCAL` + sadece tek node DOWN, diğerleri UP → **LOCAL_FAILURE**
-- `SCOPE=GLOBAL` + bazı node'lar offline → **AMBIGUOUS** (yetersiz veri)
-
-### Implementation outline
-
-**`internal/engine/scope.go`** (yeni veya `engine.go`'ya ekle)
-
-```go
-type DetailedScope struct {
-    Scope            string  // GLOBAL | PARTIAL | NODE_LOCAL
-    Classification   string  // REAL_OUTAGE | NETWORK_PARTITION | LOCAL_FAILURE | AMBIGUOUS
-    DownNodes        []string
-    UpNodes          []string
-    OfflineNodes     []string
-    PartitionGroups  [][]string  // sadece PARTIAL durumunda dolu
-    Confidence       float64     // 0.0–1.0
-}
-
-func (e *Engine) classifyScope(targetID string) DetailedScope {
-    peerStates := e.clusterMgr.PeerStatesForTarget(targetID)
-    members := e.clusterMgr.Members()
-    // ...
-}
-```
-
-**Network partition detection mantığı:**
-- Peer state'lere bak: hangi node'lar UP görüyor, hangileri DOWN
-- Eğer DOWN gören node'lar coğrafi/ağ olarak bir kümede → muhtemelen partition
-- (İleride: node'larda `region` label'ı eklenebilir, partition detection daha akıllı olur)
-
-### Alarm mesajına yansıma
-
-```
-ROOT_CAUSE=db-primary
-SCOPE=PARTIAL
-CLASSIFICATION=NETWORK_PARTITION
-DOWN_NODES=node-1,node-2
-UP_NODES=node-3
-CONFIDENCE=0.85
-```
-
-Mail HTML body'de uyarı kutusu:
-> ⚠️ This appears to be a network partition. node-3 still sees the target as UP. The target itself may not be down.
-
-### Kabul kriteri
-1. Tüm node'lar down görüyor → `CLASSIFICATION=REAL_OUTAGE`
-2. 2 node down, 1 UP görüyor → `NETWORK_PARTITION`
-3. 1 node down, 2 UP → `LOCAL_FAILURE`
-4. Confidence değeri tutarlı
-
----
-
-## ✅ 4. SLO Tracker [P1] — TAMAMLANDI
-
-**Dosya:** `internal/engine/slo.go`, `slo_test.go`
-**Config:** `slo.enabled`, `slo.targets[].target_uptime`, `slo.targets[].window` (30d/7d/24h), `slo.slo_notify`, `slo.retention_days`
-**Persistence:** `incidents.json` (yanında `state_file`) — restart sonrası açık incident'lar restore edilir
-**Endpoint:** `GET /slo` — uptime ratio, error budget, incident_count, slo_breached
-**Metrics:** `network_probe_slo_uptime_ratio`, `network_probe_slo_error_budget_seconds`, `network_probe_slo_breached`
-**Alerts:** Edge-triggered breach alert — `STATUS=slo_breached`, ek env: SLO_TARGET_UPTIME, SLO_ACTUAL_UPTIME, SLO_WINDOW, SLO_DOWNTIME_MINUTES, SLO_INCIDENT_COUNT, SLO_ERROR_BUDGET_SEC
-**Tests:** 12 unit test, `-race` yeşil
-
----
-
-## 4. SLO Tracker [P1] — Orijinal Plan
-
-### Neden değerli
-"Bu hizmet bu ay kaç dakika down kaldı?" sorusunun cevabı için ekipler şu an Prometheus + manuel hesaplama yapıyor. netwatch zaten her state geçişini biliyor — sadece persist etsin, hesaplasın.
-
-Bu özellik DBA/SRE'ler için satış noktası: aylık SLO raporu için ek tool gerekmez.
-
-### Veri Modeli
-
-**Yeni dosya: `internal/engine/slo.go`**
-
-`incidents.json` (state.json yanında):
-```json
-{
-  "version": 1,
-  "incidents": [
-    {
-      "target_id": "db-primary",
-      "started_at": "2026-05-01T10:23:00Z",
-      "ended_at": "2026-05-01T10:45:00Z",
-      "duration_sec": 1320,
-      "scope": "GLOBAL",
-      "alert_dispatched": true,
-      "alert_node": "node-2",
-      "error_code": "connection refused"
-    }
-  ]
-}
-```
-
-State machine `markHardDown` ve `markRecovered` çağrılarına incident logger hook'u eklenir:
-
-```go
-func (e *Engine) recordIncidentStart(t Target, errCode string)
-func (e *Engine) recordIncidentEnd(t Target)
-```
-
-`incidents.json` rotation: aylık otomatik archive (`incidents-2026-04.json` gibi).
-
-### SLO Config
+**`probe_from_regions`** — coğrafi bölgeye göre esnek pin:
 
 ```yaml
-slo:
-  enabled: true
-  retention_days: 90
-  targets:
-    - id: "db-primary"
-      target_uptime: 0.999      # %99.9
-      window: "30d"
-    - id: "payment-service"
-      target_uptime: 0.9995
-      window: "7d"
+probe_from_regions: ["eu-central", "us-east"]
 ```
 
-### Endpoint
+Bu bölgelerdeki herhangi bir node probe edebilir. Belirli node'ları değil bölgeyi hedeflediğin için node ekleme/çıkarma durumunda config güncellemeye gerek yok.
 
-`GET /slo`
+**İkisi birlikte kullanılabilir:** `probe_from` önce filtreleme yapar, `probe_from_regions` ikinci katman filtredir.
+
+**Önemli sözleşme:** Aynı target'ı taşıyan her node aynı `probe_from` listesini beyan etmek zorundadır. Node-1'de `probe_from: ["A", "B"]`, node-2'de `probe_from: ["A", "B", "C"]` ise candidate set'ler farklılaşır → exactly-once garantisi bozulur.
+
+---
+
+### Hiçbir node target'ı probe etmezse ne olur?
+
+Bu duruma "orphan" denir. Tetikleyiciler:
+
+- `probe_from` listesindeki tüm node'lar offline
+- `probe_from_regions` listesindeki bölgelerde hiç alive node yok
+- Target sadece birkaç node'da tanımlı ve hepsi crash oldu
+
+Ne olur:
+- `network_probe_target_orphaned{name="...", target="...", type="..."}` metriği 1'e çıkar
+- Log'a uyarı düşer: `[ORPHAN] no prober assigned for target ...`
+- Target hakkında hiçbir probe sonucu toplanmaz — ne up ne de down
+- `/fleet/status`'ta target "unknown" olarak görünür
+
+**Düzeltme:** Ya `probe_from` listesini düzelt ya da o bölgeye yeni node ekle.
+
+---
+
+## Alarm Akışı ve Exactly-Once Garantisi
+
+### 3 node da aynı target'ı down görürse kaç alarm gider?
+
+Tam olarak 1 alarm gider. Bu exactly-once garantisinin çekirdeğidir.
+
+Akış:
+
+1. 3 probe node'u bağımsız olarak `payments-db` → hard-down ilan eder, gossip'te yayar.
+2. Her node `GossipPayload` alır ve kendi `peerStates`'ini günceller.
+3. Her node `shouldAlert("payments-db")` çağırır:
+   - `quorum sağlıklı mı?` → evet
+   - `ben responsible node muyum?` → hash ring'e göre sadece primary node için evet
+   - `syncing mi?` → hayır
+4. Sadece primary node alarm gönderir. Diğer ikisi `not responsible` olduğu için suppress eder.
+
+---
+
+### Primary node crash olursa ne olur?
+
+Primary node crash olunca `NotifyLeave` callback'i tetiklenir. Her node `updateRing()` çağırır — alive node listesi güncellenir, hash ring yeniden hesaplanır. Bir sonraki node artık primary olur.
+
+Eğer target hâlâ hard-down ise yeni primary `shouldAlert()` kontrolünden geçer ve alarm gönderir mi?
+
+Hayır, çünkü `peerStates`'te zaten `alarm_sent=true` bilgisi var. Yeni primary bu bilgiyi görür ve "bu incident için alarm zaten gönderildi" der. Yeni alarm gitmez.
+
+Eğer primary crash olmadan önce alarm gönderemediyse (örneğin ağ kesintisi sırasında crash), yeni primary alarm gönderir — bu doğru davranıştır, ilk alarm hiç gitmemişti.
+
+---
+
+### Primary node'un config'inde o target yoksa ne olur?
+
+Bu senaryo için "primary-forwards-peer-alert" mekanizması devreye girer.
+
+Örnek: node-A consistent hash primary'si ama `payments-db` sadece node-B ve node-C'nin config'inde. Node-B hard-down gossip'i yayar. Node-A alır:
+
+1. `HasLocalProbe("payments-db")` → false (local probe yok)
+2. `IsResponsible("payments-db")` → true (primary)
+3. `DispatchPeerAlert(payload)` çağrılır — gossip payload'undaki `TargetName`, `TargetType` bilgileriyle alert env oluşturulur, node-A'nın kendi kanal listesinden gönderilir
+4. `NODE_NAME` env'de node-B görünür (gerçekte detect eden node)
+
+Sonuç: tek alarm, doğru bilgiyle, doğru kanaldan.
+
+---
+
+## Gözlemlenebilirlik
+
+### Hangi node neyi probe ediyor, nasıl görürüm?
+
+`GET /cluster/probers` endpoint'i her target için şunu gösterir:
+- Seçilen prober node'ları
+- Primary node
+- Candidate set (seçilebilir tüm adaylar)
+- Aktif `probe_from` kısıtlaması (varsa)
+- Her üyenin zone bilgisi
+
 ```json
 {
-  "window": "30d",
-  "computed_at": "2026-05-10T08:00:00Z",
   "targets": {
-    "db-primary": {
-      "target_uptime": 0.999,
-      "actual_uptime": 0.9987,
-      "downtime_sec": 3420,
-      "downtime_minutes": 57,
-      "incident_count": 3,
-      "longest_incident_sec": 1320,
-      "slo_breached": true,
-      "remaining_error_budget_sec": -120,
-      "incidents": [
-        {"started_at": "...", "duration_sec": 1320, "scope": "GLOBAL"}
-      ]
+    "payments-db": {
+      "probers": ["node-1", "node-2", "node-3"],
+      "primary": "node-1",
+      "candidates": ["node-1", "node-2", "node-3", "node-4", "node-5"],
+      "probe_from_pin": null,
+      "replication_factor": 3
     }
   }
 }
 ```
 
-`GET /slo?format=text`:
-```
-TARGET            UPTIME   TARGET   STATUS    BUDGET REMAINING
-db-primary        99.87%   99.90%   BREACHED  -2m 0s
-payment-service   99.95%   99.95%   OK         0s
-api-gateway       99.99%   99.90%   OK         12m 30s
+Prometheus'tan tek node bazında kontrol için:
+
+```promql
+network_probe_local_assigned{name="payments-db"} == 1
 ```
 
-### Yeni metric
-- `network_probe_slo_uptime_ratio` — label: target, window
-- `network_probe_slo_error_budget_seconds` — label: target, window
-- `network_probe_slo_breached` — label: target (1 = breached, 0 = healthy)
-
-### Alarm tetikleyici
-SLO breach olduğunda alarm gönder:
-- Channel: `default_notify` veya `slo_notify`
-- Status: `slo_breached`
-- Env: `SLO_TARGET_UPTIME=0.999`, `SLO_ACTUAL_UPTIME=0.9987`
-
-### Cluster vs Standalone
-- **Standalone:** Sadece kendi gözlemleri (yarısını kaçırabilir).
-- **Cluster:** Consensus state'inden hesapla (gerçek downtime, lokal sorun değil). Tek bir node SLO hesaplar (consistent hash → SLO için sorumlu node).
-
-### Kabul kriteri
-1. Manuel target down/up tetikle, `incidents.json`'a düzgün yazılsın
-2. `/slo` endpoint doğru uptime hesaplar
-3. SLO breach olursa alarm tetiklenir
-4. 30 günlük rolling window doğru çalışır
+Bu sorgu, `payments-db`'yi aktif olarak probe eden node'ları gösterir.
 
 ---
 
-## ✅ 5. Gossip Config Sync [P1] — TAMAMLANDI
+### Cluster genelinde kaç node toplamda probe yapıyor?
 
-**Dosyalar:** `internal/cluster/configsync.go`, `configsync_test.go`
-**Config:** `cluster.config_sync.enabled`, `mode: drift_detection`, `sync_interval_sec`
-**Yeni endpoint:** `GET /cluster/config` — self hash + peer hashes + drift count; 503 cluster kapalıysa
-**Yeni metrik:** `network_probe_config_drift` — 1=drift var, 0=tümü senkron
-**Engine:** `LoadConfig` sonrası `SetLocalConfigInfo(ConfigHashOf(raw), ...)` çağrısı
-**Tests:** 7 unit test, tümü `-race` ile yeşil
+```promql
+sum(network_probe_local_assigned{name="payments-db"})
+```
+
+Bu sonuç normalde `probe_replication_factor` (tipik olarak 3) olmalıdır. Eğer 3'ten az çıkıyorsa bazı prober'lar offline demektir. Eğer 3'ten fazla çıkıyorsa `probe_from` kısıtlaması olmayan ve factor güncellenmemiş node'lar olabilir.
+
+`network_probe_prober_count{name="payments-db"}` — her node'un kendi görüşüne göre cluster'da bu target için kaç prober var.
 
 ---
 
-## 5. Gossip Config Sync [P1] — Orijinal Plan
+### Bir target'ın orphan olduğunu nasıl anlarım?
 
-### Neden değerli
-Şu an her node bağımsız config tutuyor. Birinde target eklenir, diğerlerinde unutulursa **drift** olur. Gossip zaten her şeyi paylaşıyor — config hash'i de paylaşsın.
-
-Bu **opt-in** bir özellik olmalı (güvenlik için). İki mod:
-
-**Mod 1: Drift Detection (varsayılan)**
-- Her node config hash'ini broadcast eder
-- Diğer node'lar mismatch görürse uyarı log'lar + metric set eder
-- Config DEĞİŞMEZ — sadece uyarı
-
-**Mod 2: Auto Sync (opt-in, dikkatli)**
-- Bir node "primary config source" olarak işaretlenir
-- Diğer node'lar config farklıysa primary'den çekip uygular
-- Reload tetiklenir
-
-### Config genişlemesi
-
-```yaml
-cluster:
-  config_sync:
-    enabled: true
-    mode: "drift_detection"   # drift_detection | auto_sync
-    primary_node: ""          # auto_sync için zorunlu
-    sync_interval_sec: 30
+```promql
+network_probe_target_orphaned == 1
 ```
 
-### Implementation outline
+`GET /cluster/probers` endpoint'inde `probers: []` olan target'lar orphan'dır.
 
-**`internal/cluster/configsync.go`** (yeni)
-
-```go
-type ConfigBroadcast struct {
-    NodeName   string
-    ConfigHash string         // sha256(config.yaml)
-    ConfigSize int
-    LoadedAt   time.Time
-}
-
-func (m *Manager) BroadcastConfig(hash string, loadedAt time.Time)
-func (m *Manager) ConfigDriftDetected() []ConfigDrift
-```
-
-`gossipDelegate.NotifyMsg` config broadcast'ı tanır → `peerConfigs` map'ini günceller.
-
-**Engine entegrasyonu:**
-- `LoadConfig` sonrası → hash hesapla → broadcast
-- Periyodik: `m.ConfigDriftDetected()` çalıştır → mismatch varsa log + metric
-
-### Yeni endpoint
-- `GET /cluster/config` — kendi hash + tüm peer hash'leri
-```json
-{
-  "self": {"node": "node-1", "hash": "abc123...", "loaded_at": "..."},
-  "peers": [
-    {"node": "node-2", "hash": "abc123...", "in_sync": true},
-    {"node": "node-3", "hash": "xyz789...", "in_sync": false}
-  ],
-  "drift_count": 1
-}
-```
-
-- `POST /cluster/config/sync` (auto_sync mode) — manuel trigger
-
-### Yeni metric
-- `network_probe_config_drift` — drift tespit edildiğinde 1, sync'teyken 0
-- `network_probe_config_hash` — info metric (label: hash)
-
-### Auto-sync güvenlik
-- Sadece keyring'le authenticated mesajlar kabul edilir (memberlist zaten yapıyor)
-- Primary config en az 3 node'dan onay almadan dağıtılmaz (yeni özellik)
-- Backup yapılır (`config.yaml.bak`)
-
-### Kabul kriteri
-1. 3 node aynı config → `drift_count=0`
-2. Bir node'da target ekle → diğer 2 node loglarında "config drift detected"
-3. `/cluster/config` mismatch'leri gösterir
-4. (auto_sync) Drift sonrası 30sn içinde otomatik düzelir
+Log'da `[ORPHAN]` prefix'iyle uyarı düşer.
 
 ---
 
-## ✅ 6. Active Probe Delegation + Geo Latency [P2] — TAMAMLANDI
+## Operasyonel Senaryolar
 
-**Dosyalar:** `internal/cluster/geolat.go`, `geolat_test.go`
-**Config:** `cluster.region` (node-level coğrafi etiket), `target.probe_from_regions: [...]` (bölge filtresi)
-**Yeni endpoint:** `GET /geo/latency/{targetID}` — per-node latency + region label + anomaly flag
-**Yeni metrikler:** `network_probe_geo_latency_seconds` (labels: name,target,type,region), `network_probe_geo_latency_anomaly`
-**Engine:** `lastLatency sync.Map`, `ProbeFromRegionsConstraint()` interface, `GossipPayload.Latency` alanı
-**Anomaly:** ≥2 non-zero değer gerekiyor; max > 3×min → anomaly=true
-**Tests:** 15 unit test, tümü `-race` ile yeşil
+### Yeni bir node cluster'a katılırsa probe atamaları değişir mi?
 
----
+Evet, değişir. `NotifyJoin` callback'i tetiklenir → `updateRing()` → `recomputeProberAssignments()` → her node yeni atamayı hesaplar.
 
-## 6. Active Probe Delegation [P2] — Orijinal Plan
+Etki: bazı target'lar için yeni node prober listesine girebilir (zone diversification iyileşebilir), bazı node'lar prober listesinden çıkabilir.
 
-### Neden değerli
-Catchpoint, Datadog Synthetic, Site24x7'nin sattığı şey: "Frankfurt'tan, Tokyo'dan, São Paulo'dan ölç". Çok pahalı SaaS.
+Yeni atama sonrası:
+- Yeni prober olan node'lar o target'ların probe goroutine'lerini başlatır
+- Prober listesinden çıkan node'lar goroutine'i durdurur
 
-netwatch cluster'ında: her node bir lokasyon. Aynı target'a 3 lokasyondan probe yap, latency'leri karşılaştır, anomali tespit et. Self-hosted, gossip-native, multi-region synthetic monitoring.
-
-### Config
-
-```yaml
-cluster:
-  node_name: "frankfurt-1"
-  region: "eu-central"        # YENİ — node label'ı
-
-targets:
-  - id: "checkout-public"
-    type: "http"
-    target: "https://checkout.example.com/health"
-    probe_from:               # YENİ
-      - "frankfurt-1"
-      - "tokyo-1"
-      - "sao-paulo-1"
-    # veya region bazlı:
-    # probe_from_regions: ["eu-central", "asia-pacific", "south-america"]
-```
-
-### Davranış
-- `probe_from` boşsa → her node kendi probe'unu yapar (eski davranış)
-- `probe_from` doluysa → sadece listedeki node'lar probe yapar
-- Sonuçlar gossip ile paylaşılır
-- `/fleet/status`'ta her bölgenin latency'si ayrı görünür
-
-### Implementation outline
-
-**`internal/engine/loop.go` değişikliği:**
-```go
-func (e *Engine) shouldProbe(t Target) bool {
-    if len(t.ProbeFrom) == 0 {
-        return true
-    }
-    for _, n := range t.ProbeFrom {
-        if n == e.hostname {
-            return true
-        }
-    }
-    return false
-}
-```
-
-`startProbeLoop` her target için bunu kontrol eder, `false` ise sadece state listener olur (gossip'ten state alır).
-
-### Yeni metric
-- `network_probe_local_latency_seconds` zaten var → cluster'da artık her node'un latency'si ayrı görünür
-- `network_probe_geo_latency_p50` — label: target, region (consensus latency hesapla)
-- `network_probe_geo_latency_anomaly` — bölgeler arası varyans yüksekse 1
-
-### Yeni endpoint
-- `GET /geo/latency/{targetID}` — bölgesel latency breakdown
-```json
-{
-  "target": "checkout-public",
-  "by_region": {
-    "eu-central": {"latency_p50_ms": 45, "node": "frankfurt-1"},
-    "asia-pacific": {"latency_p50_ms": 220, "node": "tokyo-1"},
-    "south-america": {"latency_p50_ms": 180, "node": "sao-paulo-1"}
-  },
-  "anomaly": false
-}
-```
-
-### Anomaly detection
-- Bölgeler arası latency varyansı %200'ü aşarsa alarm
-- Status: `geo_anomaly`
-- Env: `ANOMALY_REGION=tokyo-1`, `ANOMALY_RATIO=2.5`
-
-### Kabul kriteri
-1. `probe_from: [node-1]` → sadece node-1 probe eder, diğerleri gossip'ten state alır
-2. 3 bölgeden farklı latency'ler `/geo/latency`'de görünür
-3. Bir bölgede latency 5x artarsa anomaly alarm
+Bu geçiş sessizce olur. Probe gap oluşmaz çünkü eski prober'lar henüz goroutine'lerini durdurmadan yeni prober'lar başlatmış olur (birkaç saniyelik çakışma zararsızdır).
 
 ---
 
-# Implementasyon Sırası Önerisi
+### Rolling restart sırasında probe sahipliği bozulur mu?
 
-```
-P0 (Hayati — bu olmadan ürün konumlandırılamaz):
-  1. Dependency Graph + Root Cause      [3-4 gün]
-  2. /fleet/status                       [2-3 gün]
+Node'ları birer birer restart edersen şu olur:
 
-P1 (Güçlü farklılaşma — pazarlamayı yapan özellikler):
-  3. Scope Intelligence Enhancement     [1-2 gün]
-  4. SLO Tracker                         [3-4 gün]
-  5. Gossip Config Sync                  [2-3 gün]
+1. Node-A kapanır → `NotifyLeave` → ring yeniden hesaplanır → node-A'nın probe ettiği target'lar başka node'lara devredilir.
+2. Node-A yerine kalkan node başlar, cluster'a katılır → `NotifyJoin` → ring tekrar hesaplanır → node-A muhtemelen eski sorumluluklarını geri alır.
+3. Restart süresi boyunca (tipik olarak saniyeler) o target'lar başka node'lar tarafından probe edilir.
 
-P2 (Nice-to-have — premium hissi veren):
-  6. Active Probe Delegation             [3-5 gün]
-```
+Anti-entropy:
+- Node-A restart sonrası rejoin yapar
+- `MergeRemoteState(join=true)` çalışır, cluster state alınır
+- `syncing=true` iken probe goroutine başlamaz, alarm gitmez
+- Sync tamamlanır, probe'lar başlar — hiçbir alarm fırtınası olmaz
 
-# Aşama Bağımlılıkları
+---
 
-```
-Phase 12 (Integration Tests) → P0.1 (Dependency Graph)
-                            ↓
-                            P0.2 (/fleet/status) ← P0.1 dependency tree'yi kullanır
-                            ↓
-                            P1.3 (Scope Intelligence) ← P0.2 fleet view'i kullanır
-                            ↓
-                            P1.4 (SLO) ← P0.2 incident verisini kullanır
-                            ↓
-                            P1.5 (Config Sync) ← bağımsız
-                            ↓
-                            P2.6 (Probe Delegation) ← P0.2 bölgesel view kullanır
-```
+### Cluster'a zone etiketi ekledim ama düzgün çalışmıyor gibi, nasıl debug ederim?
 
-# Ortak Pre-requisite'ler
+Adım adım kontrol:
 
-Bu özelliklere başlamadan önce:
+1. `GET /cluster/state` — her node'un `zone` alanını gör. Boşsa config'te `cluster.zone` tanımlı değil.
 
-1. **Phase 12 (Integration Tests)** tamamlanmalı — yeni özellikler eski davranışı bozmamalı
-2. `Manager.PeerStatesForTarget()` zaten var — kullanılabilir
-3. `Manager.Members()` zaten var — fleet listesi için
-4. `internal/engine/topology.go` ve `internal/engine/fleet.go` yeni dosyalar olarak eklenecek (CLAUDE.md'deki "iki dizin" kuralına uygun)
+2. `GET /cluster/probers` — bir target için prober seçimine bak. `zone_coverage` alanı hangi zone'lardan seçim yapıldığını gösterir.
 
-# Pazarlama Stratejisi (özet)
+3. `network_probe_target_orphaned == 1` — `probe_from_regions` kısıtlaması olan target'lar için hiçbir alive node o region'da değilse orphan olur. Region isimlerini typo için kontrol et.
 
-Her özellik landing page'de bir bullet:
+4. Hot-reload zone değişikliklerini alıyor mu? Engine `cluster.UpdateNodeMeta(zone, region)` çağırır — `NotifyUpdate` peerlara yayılır, 1-2 saniye içinde diğer node'lar yeni zone'u görür.
 
-- ✅ **Consensus-based monitoring** — Single-node false alarms eliminated
-- ✅ **Network partition detection** — Know if it's the network or the service
-- ✅ **Dependency root cause** — Get the cause, not just the symptom
-- ✅ **Master-less fleet view** — No Prometheus, no Grafana required
-- ✅ **Built-in SLO tracking** — Monthly reports without separate tooling
-- ✅ **Multi-region synthetic** — Self-hosted Catchpoint alternative
-- ✅ **Config drift detection** — GitOps-friendly cluster sanity
+---
 
-Bu liste hiçbir lightweight monitoring agent'ında yok. Zabbix'te kısmen var ama saatlerce config gerekir. Datadog'da var ama $$$.
+## Hızlı Referans
 
-netwatch'ın pazarlama tek cümlesi:
-> **"The masterless monitoring agent that knows what it doesn't know."**
+| Konfigürasyon | Nerede | Tüm Node'larda Aynı Mı? |
+|---|---|---|
+| `probe_replication_factor` | `cluster.probe_replication_factor` | **EVET — zorunlu** |
+| `zone` | `cluster.zone` | Hayır — per-node label |
+| `region` | `cluster.region` | Hayır — per-node label |
+| `probe_from` | `target.probe_from` | **EVET — aynı target için zorunlu** |
+| `probe_from_regions` | `target.probe_from_regions` | **EVET — aynı target için zorunlu** |
+| `expected_node_count` | `cluster.expected_node_count` | Tavsiye edilir aynı olması |
+| `min_quorum_ratio` | `cluster.min_quorum_ratio` | Tavsiye edilir aynı olması |
 
-(Yani: "ağ partition'ı mı, gerçek outage mı, lokal sorun mu" sorusunu otomatik cevaplayan ilk agent.)
+| Durum | Metrik / Endpoint |
+|---|---|
+| Bu node target X'i probe ediyor mu? | `network_probe_local_assigned{name="X"} == 1` |
+| Kaç node target X'i probe ediyor? | `network_probe_prober_count{name="X"}` |
+| Hangi node'lar probe ediyor? | `GET /cluster/probers` |
+| Orphan var mı? | `network_probe_target_orphaned == 1` veya `GET /cluster/probers` |
+| Config drift var mı? | `network_probe_config_drift == 1` veya `GET /cluster/config` |
+| Cluster quorum sağlıklı mı? | `network_prober_quorum_healthy == 1` |
+| Bu node izole mi? | `network_prober_isolated == 1` |
