@@ -27,6 +27,8 @@ func (s stubProvider) ProbeFromConstraint(targetID string) []string {
 	return s.pinPerTarget[targetID]
 }
 
+func (s stubProvider) ProbeFromRegionsConstraint(_ string) []string { return nil }
+
 // makeMgr builds a Manager with peerStates and (optionally) a local-target
 // inventory, then forces the ring to "alive". m.list stays nil — aliveSet
 // falls back to {cfg.NodeName} which we override below for multi-node tests.

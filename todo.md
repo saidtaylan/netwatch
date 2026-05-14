@@ -438,7 +438,18 @@ SLO breach olduğunda alarm gönder:
 
 ---
 
-## 5. Gossip Config Sync [P1]
+## ✅ 5. Gossip Config Sync [P1] — TAMAMLANDI
+
+**Dosyalar:** `internal/cluster/configsync.go`, `configsync_test.go`
+**Config:** `cluster.config_sync.enabled`, `mode: drift_detection`, `sync_interval_sec`
+**Yeni endpoint:** `GET /cluster/config` — self hash + peer hashes + drift count; 503 cluster kapalıysa
+**Yeni metrik:** `network_probe_config_drift` — 1=drift var, 0=tümü senkron
+**Engine:** `LoadConfig` sonrası `SetLocalConfigInfo(ConfigHashOf(raw), ...)` çağrısı
+**Tests:** 7 unit test, tümü `-race` ile yeşil
+
+---
+
+## 5. Gossip Config Sync [P1] — Orijinal Plan
 
 ### Neden değerli
 Şu an her node bağımsız config tutuyor. Birinde target eklenir, diğerlerinde unutulursa **drift** olur. Gossip zaten her şeyi paylaşıyor — config hash'i de paylaşsın.
@@ -520,7 +531,19 @@ func (m *Manager) ConfigDriftDetected() []ConfigDrift
 
 ---
 
-## 6. Active Probe Delegation [P2]
+## ✅ 6. Active Probe Delegation + Geo Latency [P2] — TAMAMLANDI
+
+**Dosyalar:** `internal/cluster/geolat.go`, `geolat_test.go`
+**Config:** `cluster.region` (node-level coğrafi etiket), `target.probe_from_regions: [...]` (bölge filtresi)
+**Yeni endpoint:** `GET /geo/latency/{targetID}` — per-node latency + region label + anomaly flag
+**Yeni metrikler:** `network_probe_geo_latency_seconds` (labels: name,target,type,region), `network_probe_geo_latency_anomaly`
+**Engine:** `lastLatency sync.Map`, `ProbeFromRegionsConstraint()` interface, `GossipPayload.Latency` alanı
+**Anomaly:** ≥2 non-zero değer gerekiyor; max > 3×min → anomaly=true
+**Tests:** 15 unit test, tümü `-race` ile yeşil
+
+---
+
+## 6. Active Probe Delegation [P2] — Orijinal Plan
 
 ### Neden değerli
 Catchpoint, Datadog Synthetic, Site24x7'nin sattığı şey: "Frankfurt'tan, Tokyo'dan, São Paulo'dan ölç". Çok pahalı SaaS.

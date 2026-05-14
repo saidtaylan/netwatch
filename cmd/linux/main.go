@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -13,9 +14,11 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"text/template"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -33,12 +36,15 @@ func main() {
 			cmdLeave(os.Args[2:])
 		case "uninstall":
 			cmdUninstall(os.Args[2:])
+		case "validate":
+			cmdValidate(os.Args[2:])
 		default:
 			fmt.Fprintf(os.Stderr, "unknown subcommand %q\n\nUsage:\n", os.Args[1])
-			fmt.Fprintf(os.Stderr, "  %s [--config FILE]          start the monitoring agent\n", engine.BinaryName)
-			fmt.Fprintf(os.Stderr, "  %s init [--config-dir DIR]  generate config skeleton + systemd unit\n", engine.BinaryName)
-			fmt.Fprintf(os.Stderr, "  %s leave [--port PORT]      tell a running agent to leave the cluster\n", engine.BinaryName)
-			fmt.Fprintf(os.Stderr, "  %s uninstall                stop service, remove unit, optionally delete config\n", engine.BinaryName)
+			fmt.Fprintf(os.Stderr, "  %s [--config FILE]            start the monitoring agent\n", engine.BinaryName)
+			fmt.Fprintf(os.Stderr, "  %s init [--config-dir DIR]    generate config skeleton + systemd unit\n", engine.BinaryName)
+			fmt.Fprintf(os.Stderr, "  %s validate [--config FILE]   validate config without starting\n", engine.BinaryName)
+			fmt.Fprintf(os.Stderr, "  %s leave [--port PORT]        tell a running agent to leave the cluster\n", engine.BinaryName)
+			fmt.Fprintf(os.Stderr, "  %s uninstall                  stop service, remove unit, optionally delete config\n", engine.BinaryName)
 			os.Exit(1)
 		}
 		return
@@ -160,17 +166,19 @@ func main() {
 		}
 	})
 
-	// /fleet/status returns a cluster-wide summary: member list with zones,
-	// quorum / isolated flags, and aggregated target counts. Intentionally
-	// summary-only — per-target detail lives in /cluster/state and
-	// /cluster/probers. DownTargets is capped at FleetDownTargetsCap to
-	// keep the payload bounded.
 	// /fleet/status returns the rich engine-level fleet view: per-target
 	// consensus state, scope, by-node breakdown, affected apps, root cause,
 	// and active incidents. Works in both standalone and cluster mode.
-	mux.HandleFunc("/fleet/status", func(w http.ResponseWriter, _ *http.Request) {
+	// ?format=text for a terminal-friendly ASCII table; default is JSON.
+	mux.HandleFunc("/fleet/status", func(w http.ResponseWriter, r *http.Request) {
+		snap := e.FleetSnapshot()
+		if r.URL.Query().Get("format") == "text" {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			fmt.Fprint(w, fleetStatusText(snap))
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(e.FleetSnapshot()); err != nil {
+		if err := json.NewEncoder(w).Encode(snap); err != nil {
 			slog.Error("fleet status encode error", "err", err)
 		}
 	})
@@ -178,19 +186,122 @@ func main() {
 	// /slo returns SLO metrics for all configured SLO targets: uptime ratio,
 	// error budget, incident history, and breach status.
 	// Returns 503 when slo.enabled is false.
-	mux.HandleFunc("/slo", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
+	// ?format=text for a terminal-friendly ASCII table; default is JSON.
+	mux.HandleFunc("/slo", func(w http.ResponseWriter, r *http.Request) {
 		snap := e.SLOSnapshot()
 		if snap == nil {
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_ = json.NewEncoder(w).Encode(map[string]string{
 				"error": "SLO tracking not enabled (set slo.enabled: true in config)",
 			})
 			return
 		}
+		if r.URL.Query().Get("format") == "text" {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			fmt.Fprint(w, sloText(snap))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(snap); err != nil {
 			slog.Error("slo encode error", "err", err)
 		}
+	})
+
+	// /cluster/config returns the P1.5 config-sync snapshot: this node's hash
+	// and each peer's hash with an in-sync flag. 503 when cluster is disabled.
+	mux.HandleFunc("/cluster/config", func(w http.ResponseWriter, _ *http.Request) {
+		mgr := e.ClusterManager()
+		if mgr == nil {
+			http.Error(w, `{"error":"cluster disabled"}`, http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(mgr.ConfigSyncSnapshot()); err != nil {
+			slog.Error("cluster/config encode error", "err", err)
+		}
+	})
+
+	// /geo/latency/{targetID} returns the P1.6 per-node latency view for a
+	// specific target, including region labels and the anomaly flag.
+	mux.HandleFunc("/geo/latency/", func(w http.ResponseWriter, r *http.Request) {
+		targetID := strings.TrimPrefix(r.URL.Path, "/geo/latency/")
+		if targetID == "" {
+			http.Error(w, `{"error":"targetID required"}`, http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		snap := e.GeoLatencySnapshot(targetID)
+		if err := json.NewEncoder(w).Encode(snap); err != nil {
+			slog.Error("geo/latency encode error", "err", err)
+		}
+	})
+
+	// /cluster/keyring/rotate supports zero-downtime AES key rotation.
+	// Rotation procedure (call on every node):
+	//   1. POST {"action":"add","key":"base64key"}  — add new key so all nodes can decrypt
+	//   2. POST {"action":"use","key":"base64key"}  — promote key to primary (encrypt with it)
+	//   3. POST {"action":"remove","key":"base64key"} — drop the old key
+	// GET returns current keyring info (key count + non-sensitive prefixes).
+	mux.HandleFunc("/cluster/keyring/rotate", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		mgr := e.ClusterManager()
+		if mgr == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "cluster not enabled"})
+			return
+		}
+		if r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode(mgr.KeyringInfo())
+			return
+		}
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "use GET or POST"})
+			return
+		}
+		var body struct {
+			Action string `json:"action"` // add | use | remove
+			Key    string `json:"key"`    // base64-encoded AES key
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON: " + err.Error()})
+			return
+		}
+		raw, err := base64.StdEncoding.DecodeString(body.Key)
+		if err != nil {
+			// Try URL-safe base64 as well.
+			raw, err = base64.RawStdEncoding.DecodeString(body.Key)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "key: base64 decode failed: " + err.Error()})
+				return
+			}
+		}
+		switch body.Action {
+		case "add":
+			err = mgr.KeyringAddKey(raw)
+		case "use":
+			err = mgr.KeyringUseKey(raw)
+		case "remove":
+			err = mgr.KeyringRemoveKey(raw)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "action must be add, use, or remove"})
+			return
+		}
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		slog.Info("keyring rotation step completed", "action", body.Action)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":  "ok",
+			"action":  body.Action,
+			"keyring": mgr.KeyringInfo(),
+		})
 	})
 
 	// /cluster/leave triggers a graceful cluster leave + process exit.
@@ -344,6 +455,45 @@ func cmdUninstall(args []string) {
 	fmt.Printf("\n%s uninstalled.\n", engine.BinaryName)
 }
 
+// cmdValidate loads and validates the config file without starting any
+// goroutines or network connections. Exits 0 on success, 1 on failure.
+func cmdValidate(args []string) {
+	fs := flag.NewFlagSet("validate", flag.ExitOnError)
+	configPath := fs.String("config", "", "path to config.yaml (default: auto-detect)")
+	_ = fs.Parse(args)
+
+	cfg, err := engine.ValidateConfigFile(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "INVALID  %v\n", err)
+		os.Exit(1)
+	}
+
+	activeCount := 0
+	for _, t := range cfg.Targets {
+		if t.Enabled == nil || *t.Enabled {
+			activeCount++
+		}
+	}
+
+	fmt.Printf("OK  config is valid\n\n")
+	fmt.Printf("  app_name   : %s\n", cfg.AppName)
+	fmt.Printf("  targets    : %d total, %d active\n", len(cfg.Targets), activeCount)
+	fmt.Printf("  apps       : %d\n", len(cfg.Apps))
+	fmt.Printf("  channels   : %d notification channels\n", len(cfg.Notifications))
+
+	clusterStatus := "disabled"
+	if cfg.Cluster.Enabled {
+		clusterStatus = fmt.Sprintf("enabled (node=%s, peers=%d)", cfg.Cluster.NodeName, len(cfg.Cluster.Peers))
+	}
+	fmt.Printf("  cluster    : %s\n", clusterStatus)
+
+	sloStatus := "disabled"
+	if cfg.SLO != nil && cfg.SLO.Enabled {
+		sloStatus = fmt.Sprintf("enabled (%d targets)", len(cfg.SLO.Targets))
+	}
+	fmt.Printf("  slo        : %s\n", sloStatus)
+}
+
 // systemctlRun executes a systemctl command and prints result.
 func systemctlRun(subcmdArgs ...string) {
 	cmd := exec.Command("systemctl", subcmdArgs...)
@@ -453,4 +603,160 @@ WantedBy=multi-user.target
 	var sb strings.Builder
 	_ = tmpl.Execute(&sb, tdata{BinaryName: engine.BinaryName, CfgDir: cfgDir})
 	return sb.String()
+}
+
+// ── Text format helpers ────────────────────────────────────────────────────────
+
+// fleetStatusText renders a FleetSnapshot as a human-readable ASCII table.
+// Accessible via GET /fleet/status?format=text.
+func fleetStatusText(snap engine.FleetSnapshot) string {
+	var b strings.Builder
+
+	// ── Cluster header ──
+	if snap.Cluster != nil {
+		c := snap.Cluster
+		quorum := "OK"
+		if !c.QuorumHealthy {
+			quorum = "LOST"
+		}
+		isolated := "no"
+		if c.Isolated {
+			isolated = "YES"
+		}
+		fmt.Fprintf(&b, "CLUSTER  %d nodes  quorum=%s  isolated=%s  replication=%d\n",
+			c.AliveCount, quorum, isolated, c.ReplicationFactor)
+		fmt.Fprintf(&b, "MEMBERS  %s\n", strings.Join(c.Members, ", "))
+	} else {
+		fmt.Fprintln(&b, "CLUSTER  standalone (no cluster configured)")
+	}
+
+	// ── Summary ──
+	s := snap.Summary
+	fmt.Fprintf(&b, "TARGETS  %d total  |  %d UP  |  %d SOFT  |  %d DOWN  |  %d UNKNOWN\n\n",
+		s.Total, s.Up, s.SoftDown, s.HardDown, s.Unknown)
+
+	// ── Active incidents ──
+	if len(snap.Incidents) > 0 {
+		fmt.Fprintln(&b, "INCIDENTS")
+		for _, inc := range snap.Incidents {
+			rc := ""
+			if inc.RootCause != "" && inc.RootCause != inc.TargetID {
+				rc = "  root:" + inc.RootCause
+			}
+			fmt.Fprintf(&b, "  %-24s  %-10s  seq=%-4d%s\n",
+				inc.TargetName, inc.Scope, inc.Seq, rc)
+		}
+		fmt.Fprintln(&b)
+	}
+
+	// ── Per-target table ──
+	if len(snap.Targets) == 0 {
+		fmt.Fprintln(&b, "(no targets)")
+		return b.String()
+	}
+
+	const colFmt = "%-28s  %-9s  %-10s  %-20s  %-5s\n"
+	fmt.Fprintf(&b, colFmt, "NAME", "STATE", "SCOPE", "CLASSIFICATION", "CONF")
+	fmt.Fprintln(&b, strings.Repeat("-", 80))
+
+	// Sort by state (DOWN first) then name.
+	targets := make([]engine.FleetTarget, len(snap.Targets))
+	copy(targets, snap.Targets)
+	sort.Slice(targets, func(i, j int) bool {
+		order := map[string]int{"hard_down": 0, "soft_down": 1, "unknown": 2, "up": 3}
+		oi := order[targets[i].ConsensusState]
+		oj := order[targets[j].ConsensusState]
+		if oi != oj {
+			return oi < oj
+		}
+		return targets[i].Name < targets[j].Name
+	})
+
+	for _, t := range targets {
+		state := strings.ToUpper(t.ConsensusState)
+		scope := t.Scope
+		if scope == "" {
+			scope = "-"
+		}
+		cls := t.Classification
+		if cls == "" {
+			cls = "-"
+		}
+		conf := "-"
+		if t.Confidence > 0 {
+			conf = fmt.Sprintf("%.2f", t.Confidence)
+		}
+		extra := ""
+		if t.RootCause != "" && t.RootCause != t.Name {
+			extra = "  root:" + t.RootCause
+		}
+		if len(t.AffectedApps) > 0 {
+			extra += "  apps:" + strings.Join(t.AffectedApps, ",")
+		}
+		fmt.Fprintf(&b, colFmt, t.Name, state, scope, cls, conf)
+		if extra != "" {
+			fmt.Fprintf(&b, "  └─%s\n", strings.TrimSpace(extra))
+		}
+	}
+	return b.String()
+}
+
+// sloText renders an SLOSnapshot as a human-readable ASCII table.
+// Accessible via GET /slo?format=text.
+func sloText(snap *engine.SLOSnapshot) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Computed at: %s\n\n", snap.ComputedAt.Format(time.RFC3339))
+
+	if len(snap.Targets) == 0 {
+		fmt.Fprintln(&b, "(no SLO targets configured)")
+		return b.String()
+	}
+
+	const colFmt = "%-24s  %-6s  %-8s  %-8s  %-10s  %s\n"
+	fmt.Fprintf(&b, colFmt, "TARGET", "WINDOW", "TARGET", "ACTUAL", "STATUS", "BUDGET REMAINING")
+	fmt.Fprintln(&b, strings.Repeat("-", 80))
+
+	// Sort alphabetically.
+	ids := make([]string, 0, len(snap.Targets))
+	for id := range snap.Targets {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	for _, id := range ids {
+		r := snap.Targets[id]
+		status := "OK"
+		if r.SLOBreached {
+			status = "BREACHED"
+		}
+		budget := formatBudget(r.RemainingBudgetSec)
+		fmt.Fprintf(&b, colFmt,
+			r.TargetID,
+			r.Window,
+			fmt.Sprintf("%.3f%%", r.TargetUptime*100),
+			fmt.Sprintf("%.3f%%", r.ActualUptime*100),
+			status,
+			budget,
+		)
+	}
+	return b.String()
+}
+
+// formatBudget converts a signed second count to a readable string like "+1h05m30s".
+func formatBudget(sec int64) string {
+	sign := "+"
+	if sec < 0 {
+		sign = "-"
+		sec = -sec
+	}
+	h := sec / 3600
+	m := (sec % 3600) / 60
+	s := sec % 60
+	if h > 0 {
+		return fmt.Sprintf("%s%dh%02dm%02ds", sign, h, m, s)
+	}
+	if m > 0 {
+		return fmt.Sprintf("%s%dm%02ds", sign, m, s)
+	}
+	return fmt.Sprintf("%s%ds", sign, s)
 }

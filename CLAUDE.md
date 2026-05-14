@@ -91,6 +91,12 @@ config.yaml               # Canlı config (sample — içinde açıklamalar var)
 | `GET /fleet/status` | Rich engine-level fleet view: per-target consensus state, scope, **classification** (REAL_OUTAGE/NETWORK_PARTITION/LOCAL_FAILURE/AMBIGUOUS), **confidence**, by-node breakdown, affected apps, root cause, cascading impact, active incidents. Standalone modda da çalışır (cluster=nil). |
 | `GET /topology` | Target dependency graph (depends_on ilişkileri): her target için direct deps, reverse deps, transitive cascading impact. |
 | `GET /slo` | SLO metrics: per-target uptime ratio, error budget, incident history, breach status. `slo.enabled: false` ise 503. |
+| `GET /cluster/config` | **P1.5:** Config-sync snapshot — this node's hash + peer hashes + drift count; cluster kapalıysa 503. |
+| `GET /geo/latency/{targetID}` | **P1.6:** Per-node latency view: region labels, last probe latency, anomaly flag (max > 3× min). |
+| `GET /fleet/status?format=text` | Terminal-friendly ASCII tablo: cluster başlığı, summary, incidents, per-target state/scope/classification. |
+| `GET /slo?format=text` | Terminal-friendly ASCII tablo: per-target TARGET%, ACTUAL%, STATUS, BUDGET REMAINING. |
+| `GET /cluster/keyring/rotate` | Keyring durumu: key sayısı + primary prefix. |
+| `POST /cluster/keyring/rotate` | Sıfır-kesinti AES key rotasyonu: `{"action":"add|use|remove","key":"base64..."}`. |
 | `POST /cluster/leave` | Graceful cluster leave + process exit |
 
 ---
@@ -111,9 +117,13 @@ Eski isimler (`netwatch_probe_*`) kaldırıldı, direkt yeni isimlere geçildi:
 | `network_probe_local_assigned` *(Phase 13)* | 1=bu node target'ı probe ediyor, 0=etmiyor (cluster atadı başkasına) |
 | `network_probe_prober_count` *(Phase 13)* | Bu target için cluster'da seçilen toplam prober sayısı |
 | `network_probe_inventory_peers` *(Phase 13)* | Gossip ile keşfedilen peer sayısı |
+| `network_probe_target_orphaned` *(zone-safety)* | 1=cluster'da hiçbir node target'ı probe etmiyor; 0=en az bir prober var. `probe_from`/`probe_from_regions`/`cluster.zone` yanlışsa tetiklenir. Edge-triggered log eşlik eder. Labels: `name`, `target`, `type` |
 | `network_probe_slo_uptime_ratio` *(SLO)* | Gerçek uptime oranı window içinde (0.0–1.0). Labels: `target_id`, `window` |
 | `network_probe_slo_error_budget_seconds` *(SLO)* | Kalan error budget saniye cinsinden (negatif = ihlal). Labels: `target_id`, `window` |
 | `network_probe_slo_breached` *(SLO)* | 1=SLO ihlali aktif, 0=budget dahilinde. Label: `target_id` |
+| `network_probe_config_drift` *(P1.5)* | 1=en az bir peer farklı config hash'e sahip, 0=tümü senkron. Label'sız. |
+| `network_probe_geo_latency_seconds` *(P1.6)* | Per-region son probe latency. Labels: `name`, `target`, `type`, `region`. |
+| `network_probe_geo_latency_anomaly` *(P1.6)* | 1=herhangi bir node latency'si min'in 3×'inden fazla. Labels: `name`, `target`, `type`. |
 
 Label'lar (`local_status`, `local_latency_seconds`, `cluster_status`): `name`, `target`, `type`, `source_host`, `app_name`
 Label'lar (`local_assigned`, `prober_count`): `name`, `target`, `type` (ownership = host/app'tan bağımsız)
@@ -476,7 +486,7 @@ Engine `e.appIndex` field'ında tutar, `e.mu` ile korunur.
 
 ### ✅ Phase 10 — Lifecycle Komutları (TAMAMLANDI)
 
-CLI subcommand routing eklendi: `netwatch init`, `netwatch leave`, `netwatch uninstall`, Windows için `service install/remove`. `/cluster/leave` HTTP endpoint'i eklendi. Detay için `developments.md` 2026-05-07.
+CLI subcommand routing eklendi: `netwatch init`, `netwatch validate`, `netwatch leave`, `netwatch uninstall`, Windows için `service install/remove`. `/cluster/leave` HTTP endpoint'i eklendi. Detay için `developments.md` 2026-05-07.
 
 ---
 
@@ -550,6 +560,38 @@ P0.2: Engine-level `FleetSnapshot` — `by_node`, `consensus_state`, `scope`, `a
 - `GET /slo` endpoint; `slo.enabled: false` ise 503
 
 **Tests:** `scope_test.go` 9 test, `slo_test.go` 12 test — tümü `-race` ile yeşil.
+
+---
+
+### ✅ todo.md P1.5 — Gossip Config Sync (TAMAMLANDI)
+
+**Dosyalar:** `internal/cluster/configsync.go`, `configsync_test.go`
+
+- `ConfigBroadcast` gossip mesajı: `msg_type: "config"` ile eski payload'dan ayrıştırılıyor (backward-compat)
+- `ConfigHashOf(raw)`: SHA-256[:16] hex — ham config baytları üzerinden
+- `cfgBroadcast` → `memberlist.Broadcast` impl; `Invalidates=true` → kuyrukta sadece son hash
+- `SetLocalConfigInfo(hash, size, loadedAt)`: `LoadConfig` sonrası çağrılıyor; broadcast + kayıt
+- `ConfigSyncSnapshot` → `GET /cluster/config` endpoint
+- `GaugeConfigDrift` (`network_probe_config_drift`): 1=drift var, 0=senkron
+- Engine entegrasyonu: `RegisterClusterMetrics`'e eklendi; `updateClusterMetrics`'te `UpdateConfigDriftMetric()` çağrısı
+
+---
+
+### ✅ todo.md P1.6 — Geo Latency View (TAMAMLANDI)
+
+**Dosyalar:** `internal/cluster/geolat.go`, `geolat_test.go`
+
+- `Config.Region string` — node-level coğrafi etiket; `nodeMeta`'ya eklendi (graceful overflow: önce Region düşer)
+- `GossipPayload.Latency float64` — başarılı probda `elapsed` değeri; `runCheck` → `lastLatency.Store`
+- `Target.ProbeFromRegions []string` — bölge bazlı candidate filtresi; `CandidatesFor`'da `ProbeFromConstraint` sonrası uygulanıyor
+- `Engine.ProbeFromRegionsConstraint()` — `LocalTargetProvider` arayüzüne eklendi
+- `GeoLatencyForTarget(targetID)`: peerStates'ten per-node latency snapshot; `ByNode` sıralı
+- `detectLatencyAnomaly`: ≥2 non-zero + max > 3×min → true
+- `UpdateGeoMetrics(targetInfos)`: engine'in 5s updater'ından çağrılıyor
+- `GET /geo/latency/{targetID}` endpoint
+- `GaugeGeoLatency` + `GaugeGeoLatencyAnomaly` → `RegisterClusterMetrics`'e eklendi
+
+**Tests:** `configsync_test.go` 7 test, `geolat_test.go` 15 test — tümü `-race` ile yeşil.
 
 ---
 

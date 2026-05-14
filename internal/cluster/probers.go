@@ -49,6 +49,16 @@ type LocalTargetProvider interface {
 	// that have the target in their config should return the same list to
 	// avoid disagreement on prober assignments.
 	ProbeFromConstraint(targetID string) []string
+
+	// ProbeFromRegionsConstraint returns the geographic regions allowed to probe
+	// targetID, as declared in the target's `probe_from_regions` config field.
+	// An empty / nil return means "no regional constraint".
+	//
+	// Applied after ProbeFromConstraint: CandidatesFor filters the (possibly
+	// already pin-constrained) set to nodes whose region label matches one of
+	// the declared regions. Only nodes with a non-empty region that is listed
+	// are kept; unlabelled nodes are excluded when this constraint is active.
+	ProbeFromRegionsConstraint(targetID string) []string
 }
 
 // SetLocalTargetProvider registers the engine's local-target inventory source.
@@ -274,6 +284,25 @@ func (m *Manager) CandidatesFor(targetID string) []string {
 			filtered := out[:0]
 			for _, n := range out {
 				if allowed[n] {
+					filtered = append(filtered, n)
+				}
+			}
+			out = filtered
+		}
+	}
+
+	// Apply ProbeFromRegions constraint when the operator restricted probing to
+	// specific geographic regions. Nodes without a region label are excluded
+	// when this constraint is active.
+	if provider != nil {
+		if regions := provider.ProbeFromRegionsConstraint(targetID); len(regions) > 0 {
+			allowed := make(map[string]bool, len(regions))
+			for _, r := range regions {
+				allowed[r] = true
+			}
+			filtered := out[:0]
+			for _, n := range out {
+				if allowed[m.regionOf(n)] {
 					filtered = append(filtered, n)
 				}
 			}

@@ -82,6 +82,14 @@ type Config struct {
 	// Propagated to peers via memberlist NodeMeta (no extra gossip traffic).
 	Zone string `json:"zone,omitempty"`
 
+	// Region is an optional geographic label for this node (e.g. "eu-central",
+	// "us-east", "asia-pacific"). Distinct from Zone:
+	//   - Zone is used for failure-domain spread in prober selection (Phase 13).
+	//   - Region is used for latency grouping and probe_from_regions filtering (P1.6).
+	//
+	// Propagated to peers via memberlist NodeMeta alongside Zone.
+	Region string `json:"region,omitempty"`
+
 	// ProbeReplicationFactor caps the number of nodes that probe any single
 	// target. Even if N nodes have the target in their config, only this many
 	// (selected deterministically via the hash ring with zone-aware spread)
@@ -93,6 +101,10 @@ type Config struct {
 	// When candidate count ≤ factor all candidates probe — small clusters
 	// keep the current behaviour with zero configuration.
 	ProbeReplicationFactor int `json:"probe_replication_factor,omitempty"`
+
+	// ConfigSync holds gossip-based config drift detection settings (P1.5).
+	// When nil or Enabled=false, no config hash is broadcast.
+	ConfigSync *ConfigSyncConfig `json:"config_sync,omitempty"`
 }
 
 // effectiveReplicationFactor returns ProbeReplicationFactor when set, else the
@@ -172,7 +184,10 @@ type GossipPayload struct {
 	Seq        uint64    `json:"seq"`                   // Lamport sequence from engine
 	ErrorCode  string    `json:"error_code,omitempty"`
 	NodeName   string    `json:"node_name"`             // originating node
-	Timestamp  time.Time `json:"timestamp"`
+	// Latency is the last measured round-trip in seconds (P1.6).
+	// 0 means not measured / not applicable (failure probes, bootstrap).
+	Latency   float64   `json:"latency,omitempty"`
+	Timestamp time.Time `json:"timestamp"`
 }
 
 // ── MemberInfo ────────────────────────────────────────────────────────────────
@@ -180,9 +195,8 @@ type GossipPayload struct {
 // MemberInfo is the JSON-serializable view of a cluster member.
 //
 // Zone is sourced from memberlist NodeMeta (Phase 13) and is empty when the
-// member has not declared one. Operators rely on Zone in /fleet/status and
-// /cluster/probers to verify that prober assignments fall across distinct
-// failure domains.
+// member has not declared one. Region (P1.6) is the geographic label used for
+// latency grouping; also from NodeMeta.
 type MemberInfo struct {
 	Name   string `json:"name"`
 	Addr   string `json:"addr"`
@@ -190,6 +204,7 @@ type MemberInfo struct {
 	Status string `json:"status"` // alive | suspect | dead | left
 	Self   bool   `json:"self"`
 	Zone   string `json:"zone,omitempty"`
+	Region string `json:"region,omitempty"` // P1.6 geo latency grouping
 }
 
 // ── ClusterStateSnapshot ──────────────────────────────────────────────────────
@@ -243,35 +258,55 @@ type gossipDelegate struct {
 // default and replicates it on every node update.
 //
 // Fields:
-//   - Node — the node's own NodeName; redundant with memberlist.Node.Name but
-//     useful for debugging when receivers dump the raw payload.
-//   - Zone — optional zone label used by Phase 13 prober selection. Empty
-//     means "no zone declared", which puts the node in the last-resort bucket
-//     of zoneAwarePick.
+//   - Node   — the node's own NodeName; redundant with memberlist.Node.Name but
+//               useful for debugging when receivers dump the raw payload.
+//   - Zone   — optional zone label for Phase 13 prober selection (failure domain).
+//   - Region — optional geographic label for P1.6 geo latency grouping.
 type nodeMeta struct {
-	Node string `json:"node"`
-	Zone string `json:"zone,omitempty"`
+	Node   string `json:"node"`
+	Zone   string `json:"zone,omitempty"`
+	Region string `json:"region,omitempty"` // P1.6: geographic region label
 }
 
 func (d *gossipDelegate) NodeMeta(limit int) []byte {
 	data, _ := json.Marshal(nodeMeta{
-		Node: d.mgr.cfg.NodeName,
-		Zone: d.mgr.cfg.Zone,
+		Node:   d.mgr.cfg.NodeName,
+		Zone:   d.mgr.cfg.Zone,
+		Region: d.mgr.cfg.Region,
 	})
 	if len(data) > limit {
-		// Drop the optional Zone field if we somehow overflow; the node name
-		// alone is small enough to always fit.
-		data, _ = json.Marshal(nodeMeta{Node: d.mgr.cfg.NodeName})
+		// Try without Region first, then without both Zone and Region.
+		data, _ = json.Marshal(nodeMeta{Node: d.mgr.cfg.NodeName, Zone: d.mgr.cfg.Zone})
 		if len(data) > limit {
-			return nil
+			data, _ = json.Marshal(nodeMeta{Node: d.mgr.cfg.NodeName})
+			if len(data) > limit {
+				return nil
+			}
 		}
 	}
 	return data
 }
 
 // NotifyMsg is called whenever a UDP gossip message arrives.
+// It distinguishes between state payloads (legacy / normal) and config
+// broadcasts (P1.5, identified by msg_type == "config").
 func (d *gossipDelegate) NotifyMsg(b []byte) {
 	if len(b) == 0 {
+		return
+	}
+	// Peek at msg_type to support multiple message types on the same queue.
+	// GossipPayload messages do not carry msg_type, so a missing/empty field
+	// routes to the legacy state path — fully backward-compatible.
+	var peek struct {
+		MsgType string `json:"msg_type"`
+	}
+	if err := json.Unmarshal(b, &peek); err == nil && peek.MsgType == msgTypeConfig {
+		var cb ConfigBroadcast
+		if err := json.Unmarshal(b, &cb); err != nil {
+			slog.Warn("cluster: malformed config broadcast", "err", err)
+			return
+		}
+		d.mgr.handleConfigBroadcast(cb)
 		return
 	}
 	var p GossipPayload
@@ -485,12 +520,31 @@ type Manager struct {
 	// membership / inventory event. nil until the first call.
 	recomputeTimer *time.Timer
 
+	// ── Config-sync state (P1.5) ──────────────────────────────────────────
+	// cfgMu protects the local config info fields below. Kept separate from
+	// the hot peerStates mutex (mu) to avoid contention.
+	cfgMu          sync.RWMutex
+	localCfgHash   string
+	localCfgSize   int64
+	localCfgLoadedAt time.Time
+	// peerConfigs stores the most-recent ConfigBroadcast from each peer node.
+	// Protected by mu (reuses the peerStates lock for simplicity).
+	peerConfigs map[string]ConfigBroadcast
+	// stopConfigSync cancels the runConfigSyncLoop goroutine on Leave().
+	stopConfigSync func()
+
+	// keyring is the live AES keyring used by memberlist for gossip encryption.
+	// Non-nil only when the cluster was started with at least one key in Config.Keyring.
+	// Used by KeyringAddKey / KeyringUseKey / KeyringRemoveKey for zero-downtime rotation.
+	keyring *memberlist.Keyring
+
 	// ── Test-only overrides ────────────────────────────────────────────────
 	// These are populated exclusively by testhelpers.go's SetTestAliveSet /
-	// SetTestZones. They let unit tests simulate membership and zone metadata
-	// without standing up a real memberlist. nil in production builds.
-	testAliveOverride map[string]bool
-	testZoneOverride  map[string]string
+	// SetTestZones / SetTestRegions. They let unit tests simulate membership
+	// and metadata without standing up a real memberlist. nil in production.
+	testAliveOverride  map[string]bool
+	testZoneOverride   map[string]string
+	testRegionOverride map[string]string // P1.6: region override for tests
 }
 
 // New creates and starts the cluster manager.
@@ -545,6 +599,7 @@ func New(cfg Config) (*Manager, error) {
 			return nil, fmt.Errorf("cluster keyring: %w", err)
 		}
 		mlCfg.Keyring = kr
+		m.keyring = kr // stored for live key rotation via KeyringAddKey/UseKey/RemoveKey
 	}
 
 	delegate := &gossipDelegate{
@@ -593,6 +648,9 @@ func New(cfg Config) (*Manager, error) {
 	if cfg.ExpectedNodeCount > 0 {
 		m.startQuorumLoop()
 	}
+
+	// P1.5: start config-sync loop if enabled.
+	m.startConfigSyncLoop()
 
 	// Background rejoin loop — retries joining peers every 5s while this node
 	// has fewer than 2 members (i.e. it is isolated). Needed when all nodes start
@@ -729,15 +787,24 @@ func (m *Manager) Members() []MemberInfo {
 		alive := m.aliveSet()
 		out := make([]MemberInfo, 0, len(alive))
 		for name := range alive {
-			zone := ""
+			zone, region := "", ""
 			if name == m.cfg.NodeName {
 				zone = m.cfg.Zone
+				region = m.cfg.Region
+			} else if m.testZoneOverride != nil {
+				zone = m.testZoneOverride[name]
+			}
+			if m.testRegionOverride != nil {
+				if r, ok := m.testRegionOverride[name]; ok {
+					region = r
+				}
 			}
 			out = append(out, MemberInfo{
 				Name:   name,
 				Status: "alive",
 				Self:   name == m.cfg.NodeName,
 				Zone:   zone,
+				Region: region,
 			})
 		}
 		sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -747,17 +814,21 @@ func (m *Manager) Members() []MemberInfo {
 	members := m.list.Members()
 	out := make([]MemberInfo, 0, len(members))
 	for _, mem := range members {
-		var zone string
+		var zone, region string
 		if len(mem.Meta) > 0 {
 			var meta nodeMeta
 			if json.Unmarshal(mem.Meta, &meta) == nil {
 				zone = meta.Zone
+				region = meta.Region
 			}
 		}
-		if mem.Name == local.Name && zone == "" {
-			// Self-zone is authoritative from local config — useful before
-			// the first NodeMeta cycle completes.
-			zone = m.cfg.Zone
+		if mem.Name == local.Name {
+			if zone == "" {
+				zone = m.cfg.Zone
+			}
+			if region == "" {
+				region = m.cfg.Region
+			}
 		}
 		out = append(out, MemberInfo{
 			Name:   mem.Name,
@@ -766,6 +837,7 @@ func (m *Manager) Members() []MemberInfo {
 			Status: nodeStateStr(mem.State),
 			Self:   mem.Name == local.Name,
 			Zone:   zone,
+			Region: region,
 		})
 	}
 	return out
@@ -946,6 +1018,10 @@ func (m *Manager) Leave(timeout time.Duration) error {
 	if m.stopQuorum != nil {
 		m.stopQuorum()
 	}
+	// Stop the config-sync goroutine (P1.5).
+	if m.stopConfigSync != nil {
+		m.stopConfigSync()
+	}
 	// Cancel any pending recompute so listener callbacks are not invoked
 	// against an engine that is also shutting down.
 	m.recomputeMu.Lock()
@@ -1038,6 +1114,17 @@ func (m *Manager) startQuorumLoop() {
 	go m.runQuorumLoop(ctx)
 }
 
+// startConfigSyncLoop starts the P1.5 config-sync goroutine.
+// No-op when config_sync is disabled.
+func (m *Manager) startConfigSyncLoop() {
+	if m.cfg.ConfigSync == nil || !m.cfg.ConfigSync.Enabled {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.stopConfigSync = cancel
+	go m.runConfigSyncLoop(ctx)
+}
+
 // runQuorumLoop is the quorum-monitoring goroutine.
 // It logs transitions and flips the isolated flag accordingly.
 func (m *Manager) runQuorumLoop(ctx context.Context) {
@@ -1110,6 +1197,132 @@ func (m *Manager) startAntiEntropy() {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+// ── Hot-reload helpers ───────────────────────────────────────────────────────
+
+// UpdateNodeMeta refreshes this node's zone/region labels at runtime and pushes
+// the new NodeMeta to all peers via memberlist. Call after Engine.Reload when
+// cluster.zone or cluster.region changed in the config — otherwise peers keep
+// the stale labels they learned at startup, breaking zone-aware prober
+// selection and geo-latency grouping.
+//
+// Returns nil when the cluster is not running (m.list == nil) so callers can
+// invoke it unconditionally.
+func (m *Manager) UpdateNodeMeta(zone, region string) error {
+	if m.list == nil {
+		return nil
+	}
+	m.mu.Lock()
+	prevZone := m.cfg.Zone
+	prevRegion := m.cfg.Region
+	if prevZone == zone && prevRegion == region {
+		m.mu.Unlock()
+		return nil
+	}
+	m.cfg.Zone = zone
+	m.cfg.Region = region
+	m.mu.Unlock()
+
+	// memberlist.UpdateNode forces a NodeMeta refresh — the delegate's
+	// NodeMeta(limit) callback is invoked again and the new bytes are
+	// broadcast to peers as a NodeMeta update.
+	if err := m.list.UpdateNode(1 * time.Second); err != nil {
+		slog.Warn("cluster: UpdateNodeMeta propagation failed", "err", err)
+		return err
+	}
+	slog.Info("[CLUSTER] node meta refreshed",
+		"zone_old", prevZone, "zone_new", zone,
+		"region_old", prevRegion, "region_new", region)
+	// Trigger a local recompute so this node's own zone/region picks update
+	// immediately — peers will recompute on their own once they receive the
+	// NodeMeta update (handled by NotifyUpdate → scheduleRecompute).
+	m.scheduleRecompute()
+	return nil
+}
+
+// OrphanedLocalTargets returns the local target IDs that have no eligible
+// prober — typically because `probe_from` or `probe_from_regions` filtered
+// the candidate set to empty, or every candidate is currently dead.
+//
+// Returns nil in standalone mode or when the engine has not registered a
+// LocalTargetProvider. Operators consult this via the network_probe_target_orphaned
+// metric and the periodic edge-triggered log message.
+func (m *Manager) OrphanedLocalTargets() []string {
+	m.mu.RLock()
+	provider := m.localTargetProvider
+	m.mu.RUnlock()
+	if provider == nil {
+		return nil
+	}
+	var orphans []string
+	for _, id := range provider.LocalTargets() {
+		if len(m.SelectProbers(id)) == 0 {
+			orphans = append(orphans, id)
+		}
+	}
+	sort.Strings(orphans)
+	return orphans
+}
+
+// ── Keyring rotation ─────────────────────────────────────────────────────────
+
+// KeyringInfo describes the current state of the live AES keyring.
+type KeyringInfo struct {
+	// KeyCount is the total number of keys on the ring (including old ones not yet removed).
+	KeyCount int `json:"key_count"`
+	// PrimaryHex is the first 8 hex chars of the current encryption key (for display only).
+	PrimaryHex string `json:"primary_key_prefix,omitempty"`
+	// KeyPrefixes lists the first 8 hex chars of every key on the ring.
+	KeyPrefixes []string `json:"key_prefixes,omitempty"`
+}
+
+// KeyringAddKey installs a new AES key on the gossip ring so that all nodes
+// can decrypt messages encrypted with it. The key must be 16, 24, or 32 bytes.
+// Call this on every node before promoting the key to primary with KeyringUseKey.
+func (m *Manager) KeyringAddKey(key []byte) error {
+	if m.keyring == nil {
+		return fmt.Errorf("cluster: no keyring configured (cluster.keyring is empty)")
+	}
+	return m.keyring.AddKey(key)
+}
+
+// KeyringUseKey promotes key to primary — subsequent gossip messages are
+// encrypted with it. All cluster nodes must already have the key installed
+// (via KeyringAddKey) before this is called, otherwise they cannot decrypt.
+func (m *Manager) KeyringUseKey(key []byte) error {
+	if m.keyring == nil {
+		return fmt.Errorf("cluster: no keyring configured")
+	}
+	return m.keyring.UseKey(key)
+}
+
+// KeyringRemoveKey drops key from the ring. Returns an error if the key is
+// currently the primary — demote it first with KeyringUseKey(newPrimary).
+func (m *Manager) KeyringRemoveKey(key []byte) error {
+	if m.keyring == nil {
+		return fmt.Errorf("cluster: no keyring configured")
+	}
+	return m.keyring.RemoveKey(key)
+}
+
+// KeyringInfo returns a display-safe summary of the live keyring state.
+func (m *Manager) KeyringInfo() KeyringInfo {
+	if m.keyring == nil {
+		return KeyringInfo{}
+	}
+	keys := m.keyring.GetKeys()
+	primary := m.keyring.GetPrimaryKey()
+	info := KeyringInfo{KeyCount: len(keys)}
+	if len(primary) > 0 {
+		info.PrimaryHex = fmt.Sprintf("%x", primary)[:8]
+	}
+	for _, k := range keys {
+		if len(k) > 0 {
+			info.KeyPrefixes = append(info.KeyPrefixes, fmt.Sprintf("%x", k)[:8]+"...")
+		}
+	}
+	return info
+}
 
 func nodeStateStr(s memberlist.NodeStateType) string {
 	switch s {

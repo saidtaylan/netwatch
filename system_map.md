@@ -54,6 +54,9 @@ netwatch --config /path/to/config.yaml
 | `/cluster/leave` | POST | Graceful cluster leave + process exit; `?reason=TEXT` opsiyonel |
 | `/cluster/probers` *(Phase 13)* | GET | Target başına seçilen prober subset, primary, candidate seti, probe_from constraint'i; cluster kapalıysa 503 |
 | `/fleet/status` *(Phase 13)* | GET | Cluster-wide özet: members (zone'larla), quorum/isolated flag'leri, target counts (up/hard_down/unknown), down target ID listesi (cap=100); cluster kapalıysa 503 |
+| `/slo` *(P1.4)* | GET | SLO snapshot: per-target uptime ratio, error budget, breach status, incident history; `slo.enabled: false` → 503 |
+| `/cluster/config` *(P1.5)* | GET | Config-sync snapshot: this node's SHA-256 hash + each peer's hash + in-sync flag + drift count; cluster kapalıysa 503 |
+| `/geo/latency/{targetID}` *(P1.6)* | GET | Per-node latency view for a target: region labels, last probe latency, anomaly flag (any node >3× min) |
 
 **Default port:** `10240` (config'den override edilebilir)
 
@@ -199,6 +202,10 @@ UP ──→ SOFT_DOWN   enqueue() — probe fail
 │   │   ├── loop.go          # startProbeLoop, runRetryLoop, runCheck, state transitions
 │   │   ├── notify.go        # Alerter interface, sendAlert, mergeNotifyChannels
 │   │   ├── app.go           # App struct, buildAppTargetIndex, validateApps
+│   │   ├── topology.go      # DependencyGraph, FindRootCause, CascadingImpact, TopologySnapshot
+│   │   ├── fleet.go         # FleetSnapshot — per-target detail, scope, classification, confidence, apps, root cause, incidents
+│   │   ├── scope.go         # DetailedScope, classifyScope — REAL_OUTAGE/NETWORK_PARTITION/LOCAL_FAILURE/AMBIGUOUS + confidence
+│   │   ├── slo.go           # SLOConfig, sloManager, incidents.json, ComputeSLO, breach alerts, SLO Prometheus metrics
 │   │   ├── webhook.go       # WebhookAlerter — generic + alertmanager format
 │   │   ├── watchdog.go      # runWatchdog, NotifyScrape, network_probe_prometheus_connected
 │   │   ├── mail.go          # SMTP alerter — starttls/tls/plain, multipart/alternative HTML
@@ -209,12 +216,16 @@ UP ──→ SOFT_DOWN   enqueue() — probe fail
 │   │   └── sql.go           # SQL Checker — oracle/mysql/postgres/mssql
 │   ├── appinfo.go           # var BinaryName = "netwatch" (ldflags ile override edilebilir)
 │   └── cluster/             # Gossip cluster katmanı (Phase 6–9)
-│       ├── cluster.go       # Config (Zone, ProbeReplicationFactor dahil), GossipPayload, AntiEntropyProvider, Manager, hash ring, quorum, NodeMeta (zone), MemberInfo (zone)
-│       ├── probers.go       # LocalTargetProvider, ProberAssignmentListener, CandidatesFor, SelectProbers, IsLocalProber, zoneAwarePick (3-tier), recomputeProberAssignments, scheduleRecompute (debounce), SeedProberAssignments
+│       ├── cluster.go       # Config (Zone, Region, ProbeReplicationFactor dahil), GossipPayload (Latency eklendi), AntiEntropyProvider, Manager, hash ring, quorum, NodeMeta (zone+region), MemberInfo (zone+region)
+│       ├── probers.go       # LocalTargetProvider (ProbeFromRegionsConstraint dahil), ProberAssignmentListener, CandidatesFor (region filter), SelectProbers, IsLocalProber, zoneAwarePick (3-tier)
+│       ├── configsync.go    # P1.5: ConfigBroadcast, ConfigHashOf, SetLocalConfigInfo, handleConfigBroadcast, ConfigSyncSnapshot, runConfigSyncLoop, GaugeConfigDrift
+│       ├── geolat.go        # P1.6: GeoLatencyEntry, GeoLatencySnapshot, GeoLatencyForTarget, detectLatencyAnomaly, UpdateGeoMetrics, regionOf, GaugeGeoLatency, GaugeGeoLatencyAnomaly
 │       ├── views.go         # ProberAssignmentsSnapshot (/cluster/probers), FleetSummarySnapshot (/fleet/status), FleetDownTargetsCap
-│       ├── testhelpers.go   # NewTestManager, SetIsolated, SetPeerState, SetTestAliveSet, SetTestZones
+│       ├── testhelpers.go   # NewTestManager, SetIsolated, SetPeerState, SetTestAliveSet, SetTestZones, SetTestRegions
 │       ├── cluster_test.go  # Hash ring, quorum, IsolatedMode, PeerStatesForTarget testleri
 │       ├── antientropy_test.go    # LocalState/MergeRemoteState dispatch, mockProvider testleri
+│       ├── configsync_test.go     # P1.5: ConfigHashOf, SetLocalConfigInfo, drift detection, ConfigSyncSnapshot
+│       ├── geolat_test.go         # P1.6: anomaly detection, regionOf, GeoLatencyForTarget, probe_from_regions filter
 │       ├── phase13_config_test.go  # Config validation, NodeMeta, zoneOf
 │       ├── phase13_probers_test.go # CandidatesFor, hashCandidateOrder, zoneAwarePick, SelectProbers, IsLocalProber, ProbeFrom
 │       ├── phase13_recompute_test.go # recomputeProberAssignments, Seed, scheduleRecompute debounce
@@ -257,6 +268,15 @@ UP ──→ SOFT_DOWN   enqueue() — probe fail
 | `mailAlerter` | `mail.go` | SMTP — multipart/alternative |
 | `shouldAlert` | `engine.go` | Cluster alarm kapısı: nil→true, isolated→false, not-responsible→false |
 | `computeScope` | `engine.go` | Peer states'e bakarak GLOBAL/NODE_LOCAL/PARTIAL/STANDALONE döner |
+| `classifyScope` | `scope.go` | Zenginleştirilmiş scope: Classification + Confidence + per-node breakdowns; classifyScope().ScopeEnv() alert env'e eklenir |
+| `DetailedScope` | `scope.go` | REAL_OUTAGE/NETWORK_PARTITION/LOCAL_FAILURE/AMBIGUOUS + DownNodes/UpNodes/OfflineNodes/PartitionGroups/Confidence |
+| `FleetSnapshot` | `fleet.go` | /fleet/status için per-target detay: scope, classification, confidence, apps, root cause, cascading impact, incidents |
+| `TopologySnapshot` | `topology.go` | /topology için dependency graph: depends_on, reverse deps, cascading impact |
+| `sloManager` | `slo.go` | incidents.json lifecycle: RecordStart/End, PruneOldIncidents, ComputeSLO, breach flag |
+| `ComputeSLO` | `slo.go` | Rolling-window uptime: downtime klamp + aktif incident sayma + SLOResult |
+| `SLOSnapshot` | `slo.go` | /slo endpoint verisi; slo.enabled=false → nil |
+| `runSLOChecker` | `slo.go` | 60sn goroutine: checkSLOBreaches + edge-triggered sendSLOBreachAlert |
+| `RegisterSLOMetrics` | `slo.go` | slo.enabled=true iken SLO gauge'larını registry'e kaydeder |
 | `FullState` | `engine.go` | AntiEntropyProvider: lastKnown haritasını JSON serialize eder |
 | `ApplyRemoteState` | `engine.go` | AntiEntropyProvider: Lamport kuralıyla remote state merge eder |
 | `SetSyncing` | `engine.go` | AntiEntropyProvider: syncing flag'i set/clear eder; runCheck/processPending guard'ı |
@@ -305,35 +325,90 @@ UP ──→ SOFT_DOWN   enqueue() — probe fail
 | `network_probe_local_assigned` *(Phase 13)* | GaugeVec | name, target, type — 1: bu node probe ediyor |
 | `network_probe_prober_count` *(Phase 13)* | GaugeVec | name, target, type — seçilen prober sayısı |
 | `network_probe_inventory_peers` *(Phase 13)* | Gauge | (label'sız) — candidate set'te görünen peer sayısı |
+| `network_probe_slo_uptime_ratio` *(P1.4)* | GaugeVec | target_id, window — gerçek uptime oranı (0.0–1.0) |
+| `network_probe_slo_error_budget_seconds` *(P1.4)* | GaugeVec | target_id, window — kalan hata bütçesi saniye (negatif = ihlal) |
+| `network_probe_slo_breached` *(P1.4)* | GaugeVec | target_id — 1=SLO ihlali aktif, 0=normal |
+| `network_probe_config_drift` *(P1.5)* | Gauge | (label'sız) — 1=en az bir peer farklı config hash'e sahip, 0=tümü senkron |
+| `network_probe_geo_latency_seconds` *(P1.6)* | GaugeVec | name, target, type, region — bölge bazlı son probe latency'si |
+| `network_probe_geo_latency_anomaly` *(P1.6)* | GaugeVec | name, target, type — 1=herhangi bir node'un latency'si min'in 3×'inden fazla |
 
 ---
 
-## Phase 13 Bekleyen Değişiklikler (Distributed Probe Ownership)
+## Config Extensions (Tamamlanan Aşamalar Özeti)
 
-Aşağıdaki değişiklikler **planlandı**, henüz uygulanmadı. Detay için `sprint.md` Phase 13.
-
-### Config Şeması Eklemeleri
+### Phase 13 — Distributed Probe Ownership ✅
 
 ```yaml
 cluster:
-  zone: "istanbul"                  # opsiyonel; node'a yazılır, target'a değil
-  probe_replication_factor: 3       # opsiyonel, default 3
+  zone: "istanbul"                  # opsiyonel; memberlist NodeMeta üzerinden dağıtılır
+  probe_replication_factor: 3       # opsiyonel, default 3; ≤ candidate → hepsi probe eder
 
 targets:
   - id: "db-restricted"
     type: "tcp"
     target: "10.0.0.5:5432"
-    probe_from: ["node-fr", "node-tr"]  # opsiyonel; pin → sadece bu node'lar probe eder
+    probe_from: ["node-fr", "node-tr"]  # opsiyonel; dolu ise sadece bu node'lar candidate olur
 ```
 
-- `Zone` → memberlist `NodeMeta` üzerinden taşınır (built-in distribution)
-- `ProbeReplicationFactor` → bir target için seçilecek max prober sayısı
-- Candidate count ≤ factor → tüm candidate'lar probe (geriye uyum: 3 node cluster aynı davranır)
+- 5sn debounce `recomputeProberAssignments` → `StartProbing`/`StopProbing` callback'leri
+- 3-tier zone-aware picker: Tier-1 zone diversity, Tier-2 zone repeat, Tier-3 zone-less fallback
+- Bootstrap broadcast: Init + Reload sonrası her local target için 1 `GossipPayload`
 
-### Davranış Değişiklikleri
+### P1.3 — Scope Intelligence ✅
 
-- **Probe loop:** `clusterMgr.IsLocalProber(targetID)` true ise `startProbeLoop`, değilse `stopProbeLoop`. Standalone modda her zaman true.
-- **Membership değişimi:** `NotifyJoin/Leave/Update` → 5sn debounce → `recomputeProberAssignments` → engine'e `StartProbing`/`StopProbing` callback'i
-- **Bootstrap broadcast:** `Init()` ve `Reload()` sonrası her local target için 1 state broadcast — ek mesaj tipi yok, mevcut `GossipPayload` kullanılır
-- **Zone öncelik (3-tier):** Tier-1 zone diversity, Tier-2 zone repeat, Tier-3 zone-less son tercih
-- **Peer-alert (Phase 9):** korunur ama nadir tetiklenir (sigorta — zone constraint nedeniyle primary'nin prober olmadığı edge case'ler)
+Alert env değişkenleri enriched:
+- `CLASSIFICATION`: REAL_OUTAGE / NETWORK_PARTITION / LOCAL_FAILURE / AMBIGUOUS
+- `CONFIDENCE`: "0.00"–"1.00"
+- `DOWN_NODES`, `UP_NODES`, `OFFLINE_NODES`: virgülle ayrılmış node adları
+
+`/fleet/status` endpoint'i `classification` + `confidence` alanlarını per-target içerir.
+
+### P1.4 — SLO Tracker ✅
+
+```yaml
+slo:
+  enabled: true
+  retention_days: 90
+  slo_notify: ["ops"]
+  targets:
+    - id: "db-primary"
+      target_uptime: 0.999   # 99.9%
+      window: "30d"          # 30d | 7d | 24h
+```
+
+- `incidents.json`: state.json ile aynı dizinde; restart sonrası açık incident'lar yeniden açılır
+- `/slo` endpoint: per-target uptime ratio, error budget, breach status, incident history
+- 3 Prometheus metriği: `network_probe_slo_uptime_ratio`, `network_probe_slo_error_budget_seconds`, `network_probe_slo_breached`
+
+### P1.5 — Gossip Config Sync ✅
+
+```yaml
+cluster:
+  config_sync:
+    enabled: true
+    mode: "drift_detection"   # "drift_detection" (default, safe) | "auto_sync" (reserved)
+    sync_interval_sec: 30     # default; min 5
+    primary_node: ""          # sadece auto_sync modunda kullanılır
+```
+
+- Her node `config.yaml` ham baytlarının SHA-256[:16] parmak izini yayıyor
+- `GET /cluster/config`: self hash + peer hash listesi + drift count
+- `network_probe_config_drift` Prometheus metriği: 1=drift var, 0=tümü senkron
+- `cluster.config_sync.enabled: false` (default) → tüm gossip ve metrik no-op
+
+### P1.6 — Geo Latency View ✅
+
+```yaml
+cluster:
+  region: "eu-west"   # node-level coğrafi etiket (zone'dan ayrı)
+
+targets:
+  - id: "api-gw"
+    probe_from_regions: ["eu-west", "us-east"]   # sadece bu bölgeler probe eder
+```
+
+- Başarılı her probe'da `GossipPayload.Latency` doluyor (elapsed saniye)
+- `GET /geo/latency/{targetID}`: per-node latency + region label + anomaly flag
+- Anomaly: en az 2 non-zero değer + max > 3×min
+- `network_probe_geo_latency_seconds` (labels: name, target, type, region)
+- `network_probe_geo_latency_anomaly` (labels: name, target, type)

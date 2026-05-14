@@ -16,7 +16,240 @@ Bu belge, netwatch projesinin günlük güncellemelerini ve teknik detaylarını
 
 ---
 
+## 2026-05-14
+
+- [backend] [test] **Windows/Linux parity + comprehensive E2E test suite (31 tests, all pass with -race).**
+
+  İki büyük iş tamamlandı:
+
+  **1. cmd/windows/main.go — tam Linux parity:**
+  - Önceki durum: Windows binary'si yalnızca `/metrics`, `/health`, `/status` endpointlerini sunuyordu (~246 satır).
+  - Yeni durum: Tüm 12 endpoint eklendi — `/metrics`, `/health`, `/status`, `/topology`, `/cluster/state`, `/cluster/probers`, `/fleet/status`, `/slo`, `/cluster/config`, `/geo/latency/`, `/cluster/keyring/rotate`, `/cluster/leave`
+  - `netwatch init`, `netwatch validate`, `netwatch leave`, `netwatch uninstall` CLI subcommand'ları eklendi
+  - `fleetStatusText`, `sloText`, `formatBudget` formatlama fonksiyonları Linux'tan kopyalandı
+  - Windows Service lifecycle düzeltildi: `agentService.Execute()` artık `leaveCh chan string` üzerinden graceful stop yapıyor — SCM stop komutu `leaveCh`'e yönlendiriliyor, `runAgent()` return ediyor, servis clean shutdown yapıyor
+  - Koşullu cluster/SLO metrik kaydı eklendi (enabled olmadığında register edilmiyor)
+
+  **2. internal/engine/engine.go — idempotent Shutdown:**
+  - `Engine.shutdownOnce sync.Once` eklendi; `Shutdown()` fonksiyonu `shutdownOnce.Do()` ile sarıldı
+  - `memberlist.Leave()` çift çağrıda panik atıyordu — `sync.Once` ile tam çözüm
+  - Bu production bug'ı: herhangi iki goroutine aynı anda Shutdown çağırırsa (SIGTERM + HTTP `/cluster/leave`) artık güvenli
+
+  **3. test/integration/comprehensive_test.go — 31 kapsamlı E2E test:**
+  - Apps (multi-app enrichment, kanal birleştirme, fallback, partial down): 4 test
+  - Dependency graph (root cause zinciri, cascading impact, topology edges): 3 test
+  - SLO (incident kaydı, disabled mode): 2 test
+  - FleetSnapshot (standalone mode, apps enrichment): 2 test
+  - Config validation (valid, dup ID, unknown app target, cyclic dep): 4 test
+  - HTTP probe up/down: 1 test
+  - 5-node quorum kaybı → isolated mode: 1 test
+  - 3-node primary failover + exactly-once alert: 1 test
+  - Zone-aware prober spread (4 node, 2 zone): 1 test
+  - Scope classification (GLOBAL, non-STANDALONE): 1 test
+  - Watchdog smoke: 1 test
+  - State machine seq + error code: 1 test
+  - 3-node cluster exactly-once: 1 test
+  - Key rotation (shared key + hot add): 2 test
+  - Standalone (probe cycle, app enrichment, v1 migration): 3 test
+  - **Tümü -race ile yeşil, 321s toplam**
+
+  **Düzeltilen test bug'ları:**
+  - `TestFleetSnapshot_StandaloneMode`: `scope.go:119` standalone+down → "NODE_LOCAL" (STANDALONE değil); test beklentisi düzeltildi
+  - `TestHTTP_Probe_UpDown`: `expected_status.eq` operatörü yok → `in: [200]` ile düzeltildi
+  - `TestDependency_RootCause_InAlert`: 3 target eş zamanlı kapatılınca root cause yanlış çözülüyordu → sequental takedown + FleetSnapshot poll ile düzeltildi
+  - `TestCluster_5Node_QuorumLost_Isolated`: quorum loop 5s lag'ı — `waitState` hem AliveCount≥5 hem `!IsolatedMode()` koşulunu bekleyecek şekilde genişletildi
+  - `TestCluster_Scope_GLOBAL`: çift listener (port çakışması) → FleetSnapshot tabanlı UP detection ile değiştirildi
+
+---
+
+## 2026-05-13
+
+- [backend] [altyapi] **Zone/region safety — hot-reload NodeMeta propagation + orphan target detection.**
+
+  Mevcut implementasyonda iki zone/region gap'i vardı; ikisi de düzeltildi.
+
+  **Bug fix — Hot-reload sonrası NodeMeta propagation:**
+  - Önceki durum: `cluster.zone` veya `cluster.region` config'te değiştirilip hot-reload yapıldığında, `cluster.Manager.cfg` ESKİ değerde kalıyor → `NodeMeta()` peerlara eski label'ı dönüyor → diğer node'lar yanlış zone-aware seçim yapıyor → restart gerekiyor
+  - Düzeltme: `cluster.Manager.UpdateNodeMeta(zone, region string) error` eklendi — `m.cfg.Zone/Region` günceller ve `m.list.UpdateNode(1s)` ile peerlara forces refresh atar (memberlist NodeMeta update mesajı yayar)
+  - `Engine.Reload`'a entegre: eski/yeni zone/region farkı varsa `UpdateNodeMeta` çağrılıyor
+  - `NotifyUpdate` zaten peer tarafında `scheduleRecompute` tetikliyor → tüm node'lar otomatik adapt eder
+
+  **Yeni özellik — Orphan target detection:**
+  - Bir target'a hiçbir node atanmamış olabilir: `probe_from: ["typo"]` veya `probe_from_regions: ["yanlış-region"]` veya tek eligible node leave olunca
+  - Önceki durum: silent failure — sadece `prober_count=0` olarak metric'te görünür, alarm/log yok
+  - `cluster.Manager.OrphanedLocalTargets() []string` — `SelectProbers(id)` boş dönen local target'lar
+  - `network_probe_target_orphaned` GaugeVec — 1=orphan, 0=at least one prober. Labels: `name`, `target`, `type`
+  - `Engine.refreshOrphanState(targets)` — 5s'lik cluster metrics updater'dan çağrılıyor; per-target gauge set + edge-triggered log:
+    - Yeni orphan: `[CLUSTER] target orphaned — no eligible probers  target=X hint=check probe_from / probe_from_regions / cluster.zone`
+    - Recovery: `[CLUSTER] target re-assigned — prober available again  target=X probers=[...]`
+  - `Engine.orphanedSet` field + `orphanedMu` ile transition state takip ediliyor
+
+  **Test sayısı:** 6 yeni test (`orphan_test.go`): NoProvider, AllAssigned, PinToDeadNode, RegionFilterEmpty, Recovers_WhenPinNodeJoins, UpdateNodeMeta_NoListIsSafe — tümü `-race` ile yeşil.
+
+  **Build + Test:**
+  ```
+  go build ./internal/engine/ ./internal/cluster/ ./cmd/linux/  ✓
+  go test -race ./internal/engine/... ./internal/cluster/...    ✓
+  go test -race -timeout 300s ./test/integration/...            ✓  (110s, 0 race)
+  go vet ./...  ✓
+  ```
+
+- [backend] [devops] **format=text|json, validate subcommand, keyring rotation — 4 yeni özellik.**
+
+  **`/fleet/status?format=text` ve `/slo?format=text`:**
+  - `format=text`: terminal-dostu ASCII tablo; `format=json` veya format belirtilmemesi → JSON (mevcut davranış)
+  - `/fleet/status?format=text`: CLUSTER başlığı, TARGETS özeti, INCIDENTS listesi, per-target STATE/SCOPE/CLASSIFICATION/CONF tablosu (DOWN-first sıralama)
+  - `/slo?format=text`: ComputedAt başlığı, TARGET/ACTUAL/STATUS/BUDGET REMAINING sütunları
+  - `formatBudget(sec int64)` helper: `+1h05m30s` / `-2m00s` formatı
+  - `cmd/linux/main.go`'da `fleetStatusText()` ve `sloText()` fonksiyonları eklendi
+
+  **`netwatch validate [--config FILE]`:**
+  - Config yükler ve doğrular, hiçbir goroutine veya network bağlantısı başlatmaz
+  - Başarıda: app_name, targets (total/active), apps, channels, cluster, slo özeti
+  - Başarısızda: açıklayıcı hata + exit 1
+  - `engine.ValidateConfigFile(path) (Config, error)` exported fonksiyonu eklendi
+  - Subcommand router'a `case "validate"` eklendi
+
+  **`GET|POST /cluster/keyring/rotate` — sıfır-kesinti AES key rotasyonu:**
+  - `GET`: `KeyringInfo` döner (key_count, primary_key_prefix, key_prefixes)
+  - `POST {"action":"add","key":"base64..."}`: yeni key ring'e eklenir (tüm node'lar eski+yeni ile decrypt eder)
+  - `POST {"action":"use","key":"base64..."}`: key primary olarak set edilir (artık bu ile encrypt edilir)
+  - `POST {"action":"remove","key":"base64..."}`: eski key ring'den kaldırılır
+  - `cluster.Manager.keyring *memberlist.Keyring` field eklendi; `New()`'da assign ediliyor
+  - `KeyringAddKey`, `KeyringUseKey`, `KeyringRemoveKey`, `KeyringInfo` metodları eklendi
+  - Cluster disabled ise 503; keyring yoksa (şifreleme kapalı) descriptive hata
+
+  **Build + Test:**
+  ```
+  go build ./internal/engine/ ./internal/cluster/ ./cmd/linux/  ✓
+  go test -race ./internal/engine/... ./internal/cluster/...    ✓
+  go vet ./...  ✓
+  netwatch validate --config config.yaml  ✓  (OK + özet çıktısı)
+  netwatch validate --config /bad.yaml    ✓  (INVALID + exit 1)
+  ```
+
+- [backend] [altyapi] **P1.5 + P1.6 tamamlandı — Gossip Config Sync (drift detection) + Geo Latency View (per-region latency + anomaly detection).**
+
+  **P1.5 — Gossip Config Sync (`internal/cluster/configsync.go` yeni dosya):**
+
+  Her node `config.yaml` dosyasının SHA-256 parmak izini (ilk 16 hex) gossip üzerinden yayıyor. Peer'lar karşılaştırıyor; uyumsuzlukta warning log + `network_probe_config_drift=1`.
+
+  | Bileşen | Detay |
+  |---------|-------|
+  | `ConfigBroadcast` | `msg_type: "config"` ile eski `GossipPayload`'dan ayrıştırılıyor (backward-compat) |
+  | `cfgBroadcast` | `memberlist.Broadcast` impl; `Invalidates=true` → kuyrukta sadece son hash |
+  | `ConfigHashOf(raw)` | `sha256[:16]` — ham `config.yaml` baytları üzerinden (var substitution öncesi) |
+  | `SetLocalConfigInfo` | `LoadConfig` sonrası çağrılıyor; broadcast + dahili kayıt |
+  | `ConfigSyncSnapshot` | `GET /cluster/config` yanıtı: self hash + peer hash listesi + drift count |
+  | `runConfigSyncLoop` | `config_sync.sync_interval_sec` (default 30s) aralıklı re-broadcast |
+  | `GaugeConfigDrift` | `network_probe_config_drift` — 1=drift var, 0=tüm peerlar senkron |
+  | Test | `configsync_test.go` — 7 test: hash, inject, drift detection, snapshot, self-ignore |
+
+  **P1.6 — Geo Latency View (`internal/cluster/geolat.go` yeni dosya):**
+
+  `cluster.region` (Zone'dan ayrı coğrafi etiket). Her başarılı probe'da `GossipPayload.Latency` doluyor. `/geo/latency/{targetID}` per-node latency + anomaly flag.
+
+  | Bileşen | Detay |
+  |---------|-------|
+  | `GossipPayload.Latency float64` | Son probe round-trip saniye; başarısız probda 0 (omitempty) |
+  | `Config.Region string` | Node-level coğrafi etiket; `nodeMeta`'ya eklendi, graceful overflow |
+  | `regionOf(nodeName)` | `testRegionOverride` > local cfg > memberlist NodeMeta |
+  | `GeoLatencyForTarget(targetID)` | peerStates'ten per-node latency snapshot; ByNode sıralı |
+  | `detectLatencyAnomaly` | ≥2 non-zero değer gerekiyor; max > 3×min → anomaly=true |
+  | `UpdateGeoMetrics(targetInfos)` | Engine'in 5s updater'ından çağrılıyor; GaugeGeoLatency + GaugeGeoLatencyAnomaly |
+  | `probe_from_regions []string` | Target-level bölge filtresi; `CandidatesFor`'da `ProbeFromConstraint` sonrası uygulanıyor |
+  | `GaugeGeoLatency` | `network_probe_geo_latency_seconds` — labels: name, target, type, region |
+  | `GaugeGeoLatencyAnomaly` | `network_probe_geo_latency_anomaly` — 1=anomaly, 0=normal |
+  | Test | `geolat_test.go` — 15 test: anomaly detection, regionOf, GeoLatencyForTarget, probe_from_regions filter |
+
+  **Engine entegrasyonu (`internal/engine/engine.go`, `loop.go`, `cmd/linux/main.go`):**
+  - `Target.ProbeFromRegions []string` yeni config alanı
+  - `Engine.lastLatency sync.Map` — başarılı probe sonrası `elapsed` kaydediliyor
+  - `Engine.ProbeFromRegionsConstraint()` — `cluster.LocalTargetProvider` arayüzüne eklendi
+  - `LoadConfig` sonrası `clusterMgr.SetLocalConfigInfo(ConfigHashOf(raw), ...)` çağrısı
+  - `RegisterClusterMetrics`: `GaugeConfigDrift`, `GaugeGeoLatency`, `GaugeGeoLatencyAnomaly` eklendi
+  - `updateClusterMetrics`: `UpdateConfigDriftMetric()` + `UpdateGeoMetrics(targetInfos)` çağrıları
+  - `Engine.GeoLatencySnapshot(targetID)` — `/geo/latency/` handler'a bağlı
+  - `GET /cluster/config` endpoint eklendi (503 cluster disabled ise)
+  - `GET /geo/latency/{targetID}` endpoint eklendi
+
+  **Build + Test:**
+  ```
+  go build ./internal/engine/ ./internal/cluster/ ./cmd/linux/  ✓
+  go test -race ./internal/cluster/...   ✓  (tümü yeşil)
+  go test -race ./internal/engine/...    ✓  (tümü yeşil)
+  go test -race -timeout 300s ./test/integration/...  ✓  (110s, 0 data race)
+  go vet ./...  ✓
+  ```
+
 ## 2026-05-11
+
+- [backend] [altyapi] **P1.3 + P1.4 tamamlandı — Scope Intelligence (REAL_OUTAGE/NETWORK_PARTITION/LOCAL_FAILURE/AMBIGUOUS) + SLO Tracker (incident persistence, error budget, breach alerts, 3 Prometheus metrics).**
+
+  **P1.3 — Scope Intelligence Enhancement (`internal/engine/scope.go` yeni dosya):**
+
+  `classifyScope(targetID) DetailedScope` Engine metodu — `computeScope`'un ham GLOBAL/PARTIAL/NODE_LOCAL etiketini insan-okunabilir sınıflandırma + güven skoru ile zenginleştiriyor:
+
+  | Durum | Scope | Classification | Confidence |
+  |-------|-------|----------------|------------|
+  | Standalone, state yok | STANDALONE | AMBIGUOUS | 0.5 |
+  | Standalone, hard_down | NODE_LOCAL | LOCAL_FAILURE | 1.0 |
+  | Standalone, up | STANDALONE | LOCAL_FAILURE | 1.0 |
+  | Cluster, tüm node down + offline yok | GLOBAL | REAL_OUTAGE | 1.0 |
+  | Cluster, tüm node down + offline var | GLOBAL | AMBIGUOUS | downCount/clusterSize (max 0.95) |
+  | Cluster, sadece local node down | NODE_LOCAL | LOCAL_FAILURE | upCount/totalKnown |
+  | Cluster, karışık | PARTIAL | NETWORK_PARTITION | split simetrisine göre (50/50 = en yüksek) |
+
+  `DetailedScope` struct: `Scope`, `Classification`, `DownNodes`, `UpNodes`, `OfflineNodes`, `PartitionGroups` (NETWORK_PARTITION'da dolu), `Confidence`.
+
+  `ScopeEnv()` → alert env map: `SCOPE`, `CLASSIFICATION`, `CONFIDENCE`, `DOWN_NODES`, `UP_NODES`, `OFFLINE_NODES`. Tüm kanallar (script/mail/webhook) bu enrichment'ı alıyor.
+
+  **Değiştirilen dosyalar (P1.3):**
+  - `notify.go` — `computeScope()` yerine `classifyScope().ScopeEnv()` kullanıyor; SCOPE artık 6 değişkenle zenginleştirilmiş
+  - `fleet.go` — `FleetTarget`'a `Classification string` + `Confidence float64` alanları eklendi; hard_down branch `classifyScope` kullanıyor
+
+  **Test:** `scope_test.go` — 9 unit test: Standalone_LocalDown, Standalone_Up, Standalone_Unknown, ScopeEnv_AllFields, ScopeEnv_NetworkPartition, absFloat, condSlice.
+
+  ---
+
+  **P1.4 — SLO Tracker (`internal/engine/slo.go` yeni dosya):**
+
+  - `sloManager`: `incidents.json` persistence (state.json ile aynı dizin, atomik `.tmp`→`os.Rename` yazma). `RecordStart`/`RecordEnd` incident lifecycle; `PruneOldIncidents(retentionDays)` — retention_days dışına düşen kapalı incident'lar silinir.
+  - `ComputeSLO(targetID, targetUptime, window) (SLOResult, error)` — rolling window (30d/7d/24h). Aktif incident (EndedAt=nil) `time.Now()` kadar sayılır. Incident start window sınırından önce ise kırpılır. `SLOResult`: DowntimeSec, ActualUptime, SLOBreached, RemainingBudgetSec, IncidentCount.
+  - `runSLOChecker` goroutine (60sn): `checkSLOBreaches` → ihlal tespit edilince edge-triggered `sendSLOBreachAlert` (STATUS=slo_breached, SLO_TARGET_UPTIME, SLO_ACTUAL_UPTIME, SLO_WINDOW, SLO_DOWNTIME_MINUTES, SLO_INCIDENT_COUNT, SLO_ERROR_BUDGET_SEC, SLO_LONGEST_INCIDENT_SEC). İhlal düzelince flag temizlenir, bir sonraki ihlalde yeniden atar.
+  - `sloRecordStart` / `sloRecordEnd` → `loop.go`'daki `markHardDown` / `markRecovered` path'lerinden tetikleniyor.
+  - 3 yeni Prometheus metriği (`RegisterSLOMetrics` ile koşullu — `slo.enabled: false` iken registry'de görünmez):
+    - `network_probe_slo_uptime_ratio{target_id, window}` — gerçek uptime oranı (0.0–1.0)
+    - `network_probe_slo_error_budget_seconds{target_id, window}` — kalan hata bütçesi (negatif = ihlal)
+    - `network_probe_slo_breached{target_id}` — 1=ihlal aktif, 0=normal
+  - `/slo` endpoint: `SLOSnapshot()` JSON döner; `slo.enabled: false` → 503.
+
+  **Değiştirilen dosyalar (P1.4):**
+  - `engine.go` — `Config.SLO *SLOConfig`; `Engine.sloMgr *sloManager`; `SLOEnabled() bool`; Init'te `runSLOChecker` goroutine başlatılıyor
+  - `loop.go` — `markHardDown` sonrası `sloRecordStart`; `markRecovered` + processPending recovery sonrası `sloRecordEnd`
+  - `cmd/linux/main.go` — `RegisterSLOMetrics(reg)` koşullu çağrı; `/slo` endpoint
+
+  **Test:** `slo_test.go` — 12 unit test: parseWindow (30d/7d/24h/bad/0d), RecordStart/End lifecycle, no-op-when-open, no-op-when-closed, persistence round-trip, ComputeSLO (zero downtime, 2h downtime breached, active incident ongoing, invalid window), PruneOldIncidents, breach flag toggle, nil-safe engine hooks, SLOSnapshot nil when disabled.
+
+  **Build + test sonuçları:**
+  ```
+  go build ./internal/engine/ ./internal/cluster/ ./cmd/linux/    ✅
+  go test -race ./internal/engine/... ./internal/cluster/... ./test/integration/...  ✅
+  0 data race
+  ```
+
+  **Oluşturulan/değiştirilen dosyalar:**
+  - **Oluşturuldu**: `internal/engine/scope.go` — DetailedScope, classifyScope, ScopeEnv, condSlice, absFloat
+  - **Oluşturuldu**: `internal/engine/scope_test.go` — 9 unit test
+  - **Oluşturuldu**: `internal/engine/slo.go` — SLOConfig, sloManager, ComputeSLO, SLO Prometheus metrics, /slo snapshot
+  - **Oluşturuldu**: `internal/engine/slo_test.go` — 12 unit test
+  - **Düzenlendi**: `internal/engine/engine.go` — SLO config/manager alanları, SLOEnabled(), Init SLO wiring
+  - **Düzenlendi**: `internal/engine/loop.go` — sloRecordStart/End çağrıları
+  - **Düzenlendi**: `internal/engine/notify.go` — classifyScope().ScopeEnv() enrichment
+  - **Düzenlendi**: `internal/engine/fleet.go` — FleetTarget.Classification + Confidence
+  - **Düzenlendi**: `cmd/linux/main.go` — RegisterSLOMetrics + /slo endpoint
+
+---
 
 - [test] [altyapi] **Phase 12 tamamlandı — 7 entegrasyon testi + 3 cluster data race düzeltmesi.**
 

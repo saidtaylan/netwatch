@@ -63,3 +63,18 @@ func (m *Manager) SetTestZones(zones map[string]string) {
 	}
 	m.testZoneOverride = clone
 }
+
+// SetTestRegions installs a per-node region override consulted by regionOf()
+// (P1.6). Use this in unit tests to drive geo-latency logic without memberlist
+// NodeMeta. Passing a nil map clears the override.
+func (m *Manager) SetTestRegions(regions map[string]string) {
+	if regions == nil {
+		m.testRegionOverride = nil
+		return
+	}
+	clone := make(map[string]string, len(regions))
+	for k, v := range regions {
+		clone[k] = v
+	}
+	m.testRegionOverride = clone
+}

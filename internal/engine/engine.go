@@ -155,6 +155,13 @@ type Target struct {
 	// In standalone mode (no cluster) ProbeFrom is ignored — the single node
 	// always probes its own targets.
 	ProbeFrom []string `json:"probe_from,omitempty"`
+
+	// ProbeFromRegions restricts probing to nodes whose cluster.region label
+	// matches one of the listed geographic region names (P1.6). Nodes without a
+	// region label are excluded when this constraint is active. Applied after
+	// ProbeFrom — the two constraints are ANDed together.
+	// Empty / nil means no regional restriction.
+	ProbeFromRegions []string `json:"probe_from_regions,omitempty"`
 }
 
 func (t Target) active() bool { return t.Enabled == nil || *t.Enabled }
@@ -335,6 +342,15 @@ var (
 		Name: "network_probe_inventory_peers",
 		Help: "Number of distinct peer nodes whose target inventory has been observed via gossip",
 	})
+
+	// GaugeTargetOrphaned is 1 when the labelled target has no eligible prober
+	// in the cluster — typically because `probe_from` or `probe_from_regions`
+	// filtered the candidate set to empty, or every candidate is dead.
+	// 0 when at least one node is selected to probe it.
+	GaugeTargetOrphaned = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "network_probe_target_orphaned",
+		Help: "1 = no cluster member is currently assigned to probe this target (check probe_from / probe_from_regions / cluster.zone)",
+	}, []string{"name", "target", "type"})
 )
 
 // RegisterMetrics registers the core (non-cluster) metrics with reg.
@@ -351,6 +367,11 @@ func RegisterMetrics(reg *prometheus.Registry) {
 func RegisterClusterMetrics(reg *prometheus.Registry) {
 	reg.MustRegister(GaugeQuorumHealthy, GaugeIsolated, GaugeClusterSize, GaugeClusterStatus)
 	reg.MustRegister(GaugeLocalAssigned, GaugeProberCount, GaugeInventoryPeers)
+	reg.MustRegister(GaugeTargetOrphaned)
+	// P1.5 config drift metric.
+	reg.MustRegister(cluster.GaugeConfigDrift)
+	// P1.6 geo-latency metrics.
+	reg.MustRegister(cluster.GaugeGeoLatency, cluster.GaugeGeoLatencyAnomaly)
 	GaugeQuorumHealthy.Set(1) // optimistic: assume quorum until first check
 	GaugeIsolated.Set(0)
 	GaugeClusterSize.Set(0)
@@ -587,8 +608,23 @@ type Engine struct {
 	// nil when slo.enabled is false (the default).
 	sloMgr *sloManager
 
+	// lastLatency stores the most recently measured probe round-trip for each
+	// target key (string → float64 seconds). Written by runCheck on success,
+	// read by broadcastState to populate GossipPayload.Latency for P1.6.
+	// sync.Map avoids the engine-wide mu/stateMu for this hot-path field.
+	lastLatency sync.Map
+
+	// orphanedSet tracks which local targets currently have no cluster prober
+	// assigned, so updateClusterMetrics can log only on transitions (edge-
+	// triggered) instead of every 5 s. Guarded by orphanedMu.
+	orphanedMu  sync.Mutex
+	orphanedSet map[string]bool
+
 	// Suppress repeated credential-load log entries.
 	credLogged bool
+
+	// shutdownOnce ensures Shutdown is idempotent.
+	shutdownOnce sync.Once
 }
 
 // StatusSnapshot represents the current state of a target.
@@ -648,6 +684,20 @@ func (e *Engine) Status() []StatusSnapshot {
 }
 
 // New creates an Engine. configPath is the path to config.yaml; pass "" to use
+// ValidateConfigFile loads and validates the config at path without starting
+// any goroutines or network connections. It returns a summary of what was
+// found or a descriptive error. Safe to call from a CLI validate subcommand.
+func ValidateConfigFile(path string) (cfg Config, err error) {
+	e := New("localhost", ShellRunner, path)
+	if loadErr := e.LoadConfig(); loadErr != nil {
+		return Config{}, loadErr
+	}
+	e.mu.RLock()
+	cfg = e.cfg
+	e.mu.RUnlock()
+	return cfg, nil
+}
+
 // the default (CONFIG_PATH env var → config.yaml next to the binary).
 // Call Init() before use.
 func New(hostname string, runner AlertRunner, configPath string) *Engine {
@@ -730,21 +780,23 @@ func (e *Engine) Port() string {
 // Shutdown stops all probe goroutines, the retry loop, and gracefully leaves
 // the cluster (if enabled) so other nodes update their membership tables.
 func (e *Engine) Shutdown() {
-	e.probesMu.Lock()
-	for _, cancel := range e.probeCancel {
-		cancel()
-	}
-	e.probesMu.Unlock()
-
-	if e.retryStop != nil {
-		e.retryStop()
-	}
-
-	if e.clusterMgr != nil {
-		if err := e.clusterMgr.Leave(5 * time.Second); err != nil {
-			slog.Warn("cluster leave error", "err", err)
+	e.shutdownOnce.Do(func() {
+		e.probesMu.Lock()
+		for _, cancel := range e.probeCancel {
+			cancel()
 		}
-	}
+		e.probesMu.Unlock()
+
+		if e.retryStop != nil {
+			e.retryStop()
+		}
+
+		if e.clusterMgr != nil {
+			if err := e.clusterMgr.Leave(5 * time.Second); err != nil {
+				slog.Warn("cluster leave error", "err", err)
+			}
+		}
+	})
 }
 
 // ClusterManager returns the cluster Manager (nil when cluster is disabled).
@@ -926,6 +978,14 @@ func (e *Engine) LoadConfig() error {
 		e.configMtime = info.ModTime()
 	}
 	e.mu.Unlock()
+
+	// P1.5: inform the cluster manager of this node's config fingerprint so it
+	// can broadcast and detect drift against peers.
+	if e.clusterMgr != nil {
+		hash := cluster.ConfigHashOf(raw)
+		e.clusterMgr.SetLocalConfigInfo(hash, int64(len(raw)), time.Now())
+	}
+
 	slog.Info("config loaded", "path", cfgPath, "targets", len(newCfg.Targets), "apps", len(newCfg.Apps))
 	return nil
 }
@@ -1201,6 +1261,86 @@ func (e *Engine) updateClusterMetrics() {
 	// Inventory-peer count: distinct peer names with at least one broadcast
 	// in peerStates. Uses Snapshot().PeerStates which is already deep-copied.
 	GaugeInventoryPeers.Set(float64(len(e.clusterMgr.Snapshot().PeerStates)))
+
+	// Orphan detection: targets whose candidate set / SelectProbers is empty.
+	// Updates per-target gauge, then logs edge-triggered transitions so
+	// operators are alerted exactly once per state change instead of every 5 s.
+	e.refreshOrphanState(targets)
+
+	// P1.5: refresh config-drift metric.
+	e.clusterMgr.UpdateConfigDriftMetric()
+
+	// P1.6: build targetInfos map (targetID → {displayName, targetAddr, probeType})
+	// for geo-latency metric labels, then delegate to the cluster manager.
+	targetInfos := make(map[string][3]string, len(targets))
+	for _, t := range targets {
+		if t.active() {
+			targetInfos[t.key()] = [3]string{t.key(), t.Target, t.Type}
+		}
+	}
+	e.clusterMgr.UpdateGeoMetrics(targetInfos)
+}
+
+// refreshOrphanState updates the per-target orphaned gauge and emits
+// edge-triggered log lines for each transition. An orphaned target is one
+// the cluster has no eligible prober for — typically a `probe_from` or
+// `probe_from_regions` constraint that filtered to an empty candidate set.
+//
+// Called only when the cluster manager is non-nil; the gauge is registered
+// by RegisterClusterMetrics.
+func (e *Engine) refreshOrphanState(targets []Target) {
+	orphans := make(map[string]bool)
+	for _, id := range e.clusterMgr.OrphanedLocalTargets() {
+		orphans[id] = true
+	}
+
+	for _, t := range targets {
+		if !t.active() {
+			continue
+		}
+		labels := prometheus.Labels{
+			"name":   t.key(),
+			"target": t.Target,
+			"type":   t.Type,
+		}
+		if orphans[t.key()] {
+			GaugeTargetOrphaned.With(labels).Set(1)
+		} else {
+			GaugeTargetOrphaned.With(labels).Set(0)
+		}
+	}
+
+	// Edge-triggered logging — compare against previous set, log only diffs.
+	e.orphanedMu.Lock()
+	prev := e.orphanedSet
+	if prev == nil {
+		prev = map[string]bool{}
+	}
+	for id := range orphans {
+		if !prev[id] {
+			slog.Warn("[CLUSTER] target orphaned — no eligible probers",
+				"target", id,
+				"hint", "check probe_from / probe_from_regions / cluster.zone")
+		}
+	}
+	for id := range prev {
+		if !orphans[id] {
+			slog.Info("[CLUSTER] target re-assigned — prober available again",
+				"target", id,
+				"probers", e.clusterMgr.SelectProbers(id))
+		}
+	}
+	e.orphanedSet = orphans
+	e.orphanedMu.Unlock()
+}
+
+// GeoLatencySnapshot returns the cluster-wide per-node latency view for
+// targetID. Returns a zero-value snapshot when cluster is not enabled.
+func (e *Engine) GeoLatencySnapshot(targetID string) cluster.GeoLatencySnapshot {
+	if e.clusterMgr == nil {
+		return cluster.GeoLatencySnapshot{TargetID: targetID}
+	}
+	return e.clusterMgr.GeoLatencyForTarget(targetID)
 }
 
 // computeScope determines the alert scope based on how many cluster nodes see
@@ -1358,6 +1498,26 @@ func (e *Engine) ProbeFromConstraint(targetID string) []string {
 		}
 		out := make([]string, len(t.ProbeFrom))
 		copy(out, t.ProbeFrom)
+		return out
+	}
+	return nil
+}
+
+// ProbeFromRegionsConstraint implements cluster.LocalTargetProvider. Returns
+// the `probe_from_regions` list configured on the target locally (P1.6).
+// An empty / nil return means "no regional constraint".
+func (e *Engine) ProbeFromRegionsConstraint(targetID string) []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	for _, t := range e.cfg.Targets {
+		if t.key() != targetID {
+			continue
+		}
+		if len(t.ProbeFromRegions) == 0 {
+			return nil
+		}
+		out := make([]string, len(t.ProbeFromRegions))
+		copy(out, t.ProbeFromRegions)
 		return out
 	}
 	return nil

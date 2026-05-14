@@ -110,6 +110,9 @@ func (e *Engine) runCheck(ctx context.Context, t Target) {
 	e.stateMu.RUnlock()
 
 	if ok {
+		// P1.6: store measured latency for inclusion in gossip broadcasts.
+		e.lastLatency.Store(t.key(), elapsed)
+
 		if !seen {
 			// First observation: register silently (no alert), but broadcast
 			// the UP state so cluster peers can include this node as a candidate.
@@ -380,6 +383,10 @@ func (e *Engine) broadcastState(t Target, ps PersistedState) {
 	if e.clusterMgr == nil {
 		return
 	}
+	var lat float64
+	if v, ok := e.lastLatency.Load(t.key()); ok {
+		lat, _ = v.(float64)
+	}
 	e.clusterMgr.Broadcast(cluster.GossipPayload{
 		TargetID:   t.key(),
 		TargetName: t.Name,
@@ -389,6 +396,7 @@ func (e *Engine) broadcastState(t Target, ps PersistedState) {
 		ErrorCode:  ps.ErrorCode,
 		NodeName:   e.clusterNodeName(),
 		Timestamp:  time.Now(),
+		Latency:    lat,
 	})
 }
 
@@ -447,6 +455,8 @@ func (e *Engine) effectiveTimeout(t Target) int {
 func (e *Engine) Reload() {
 	e.mu.RLock()
 	oldTargets := e.cfg.Targets
+	oldZone := e.cfg.Cluster.Zone
+	oldRegion := e.cfg.Cluster.Region
 	e.mu.RUnlock()
 
 	oldKeys := make(map[string]bool, len(oldTargets))
@@ -463,7 +473,18 @@ func (e *Engine) Reload() {
 
 	e.mu.RLock()
 	newTargets := e.cfg.Targets
+	newZone := e.cfg.Cluster.Zone
+	newRegion := e.cfg.Cluster.Region
 	e.mu.RUnlock()
+
+	// Propagate zone / region changes to peers via memberlist NodeMeta refresh.
+	// Without this, peers keep stale labels and zone-aware prober selection
+	// continues to use the pre-reload values.
+	if e.clusterMgr != nil && (oldZone != newZone || oldRegion != newRegion) {
+		if err := e.clusterMgr.UpdateNodeMeta(newZone, newRegion); err != nil {
+			slog.Warn("cluster: NodeMeta refresh failed after reload", "err", err)
+		}
+	}
 
 	newKeys := make(map[string]bool, len(newTargets))
 	for _, t := range newTargets {

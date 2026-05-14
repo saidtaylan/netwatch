@@ -677,6 +677,99 @@ Her adım sonrası `go build` + `go test -race` yeşil olmalı.
 
 ---
 
+## ✅ P1.3 — Scope Intelligence Enhancement (TAMAMLANDI)
+
+**Hedef:** Ham GLOBAL/PARTIAL/NODE_LOCAL scope etiketlerini insan-okunabilir sınıflandırma (REAL_OUTAGE / NETWORK_PARTITION / LOCAL_FAILURE / AMBIGUOUS) ve [0.0–1.0] güven skoru ile zenginleştir.
+
+**Yeni dosya:** `internal/engine/scope.go`
+
+**Ana değişiklikler:**
+
+- `DetailedScope` struct: `Scope`, `Classification`, `DownNodes`, `UpNodes`, `OfflineNodes`, `PartitionGroups`, `Confidence`
+- `classifyScope(targetID) DetailedScope` — Engine metodu; standalone + cluster modları ayrı path'te
+- `ScopeEnv()` → `SCOPE`, `CLASSIFICATION`, `CONFIDENCE`, `DOWN_NODES`, `UP_NODES`, `OFFLINE_NODES` env map'i; tüm alert kanalları alır
+- `notify.go` — `computeScope()` yerine `classifyScope().ScopeEnv()` kullanıyor
+- `fleet.go` — `FleetTarget`'a `Classification` + `Confidence` alanları eklendi
+
+**Sınıflandırma kuralları:**
+
+| Durum | Classification | Confidence |
+|-------|----------------|------------|
+| Tüm node'lar down, offline yok | REAL_OUTAGE | 1.0 |
+| Tüm node'lar down, bazı offline | AMBIGUOUS | downCount/clusterSize (max 0.95) |
+| Sadece local node down | LOCAL_FAILURE | upCount/totalKnown |
+| Bazı down, bazı up | NETWORK_PARTITION | split simetrisine göre |
+| Veri yetersiz | AMBIGUOUS | 0.4–0.5 |
+
+**Test sonuçları:** `scope_test.go` — 9 unit test; `go test -race` yeşil.
+
+---
+
+## ✅ P1.4 — SLO Tracker (TAMAMLANDI)
+
+**Hedef:** Rolling-window SLO hesabı, incident persistence, error budget tracking, breach alerting.
+
+**Yeni dosya:** `internal/engine/slo.go`
+
+**Özellikler:**
+
+- `incidents.json` — state.json ile aynı dizinde; atomik yazma; `retention_days` (default 90) göre prune
+- `sloManager.ComputeSLO(targetID, targetUptime, window)` — 30d/7d/24h; aktif (açık) incident'lar ongoing sayılır
+- `runSLOChecker` goroutine (60sn): breach edge-triggered alert — `STATUS=slo_breached`, SLO_* env değişkenleri
+- `sloRecordStart`/`sloRecordEnd` → `markHardDown`/`markRecovered` path'lerine bağlı
+- 3 Prometheus metriği (sadece `slo.enabled: true` iken register):
+  - `network_probe_slo_uptime_ratio{target_id, window}`
+  - `network_probe_slo_error_budget_seconds{target_id, window}`
+  - `network_probe_slo_breached{target_id}`
+- `/slo` endpoint — JSON SLOSnapshot; disabled → 503
+
+**Config örneği:**
+```yaml
+slo:
+  enabled: true
+  retention_days: 90
+  slo_notify: ["ops"]
+  targets:
+    - id: "db-primary"
+      target_uptime: 0.999
+      window: "30d"
+```
+
+**Test sonuçları:** `slo_test.go` — 12 unit test; `go test -race` yeşil.
+
+---
+
+## ✅ P1.5 — Gossip Config Sync (TAMAMLANDI)
+
+**Hedef:** Cluster içindeki node'ların config drift'ini gossip üzerinden tespit etmesi.
+
+**Tamamlanan işler:**
+- `internal/cluster/configsync.go` yeni dosya: `ConfigBroadcast`, `cfgBroadcast`, `ConfigHashOf`, `SetLocalConfigInfo`, `handleConfigBroadcast`, `ConfigDriftDetected`, `ConfigSyncSnapshot`, `runConfigSyncLoop`
+- `GaugeConfigDrift` (`network_probe_config_drift`) Prometheus metriği
+- `NotifyMsg`'de `msg_type` peek ile backward-compat mesaj ayrıştırma
+- `GET /cluster/config` endpoint (503 cluster disabled ise)
+- `Engine.LoadConfig` sonrası `SetLocalConfigInfo(ConfigHashOf(raw), ...)` çağrısı
+- `configsync_test.go` — 7 test, tümü yeşil
+
+---
+
+## ✅ P1.6 — Geo Latency + Region-Based Probe Filter (TAMAMLANDI)
+
+**Hedef:** Coğrafi bölge bazlı latency görünümü ve anomaly tespiti; probe_from_regions kısıtlaması.
+
+**Tamamlanan işler:**
+- `internal/cluster/geolat.go` yeni dosya: `GeoLatencyEntry`, `GeoLatencySnapshot`, `GeoLatencyForTarget`, `detectLatencyAnomaly`, `UpdateGeoMetrics`, `regionOf`/`RegionOf`
+- `GossipPayload.Latency float64` — başarılı probda `elapsed` değeri taşınıyor
+- `Config.Region string` ve `nodeMeta.Region` — node-level coğrafi etiket
+- `Target.ProbeFromRegions []string` — bölge bazlı candidate filtresi
+- `Engine.ProbeFromRegionsConstraint()` — `LocalTargetProvider` arayüzüne eklendi
+- `Engine.lastLatency sync.Map` — per-target son latency değeri
+- `GaugeGeoLatency` + `GaugeGeoLatencyAnomaly` Prometheus metrikleri
+- `GET /geo/latency/{targetID}` endpoint
+- `geolat_test.go` — 15 test, tümü yeşil
+
+---
+
 ## Sabit Kısıtlamalar (değiştirilemez)
 
 Bu kısıtlamalar sprint planlamasında daima geçerlidir:
