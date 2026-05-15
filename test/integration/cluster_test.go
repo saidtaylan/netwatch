@@ -54,7 +54,7 @@ func buildClusterCfg(c clusterNodeCfg) string {
 		peerList += fmt.Sprintf("    - \"127.0.0.1:%d\"\n", p)
 	}
 	return fmt.Sprintf(`
-app_name: "cluster-integration"
+node_alias: "cluster-integration"
 port:     "0"
 state_file: %q
 log_path: ""

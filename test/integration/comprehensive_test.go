@@ -129,7 +129,7 @@ func TestApps_MultiApp_AffectedApps(t *testing.T) {
 
 	rr := &richRunner{}
 	cfgPath := writeCfg(t, fmt.Sprintf(`
-app_name: "apps-multi"
+node_alias: "apps-multi"
 port:     "0"
 state_file: %q
 log_path: ""
@@ -213,7 +213,7 @@ func TestApps_TargetOwnChannel_Union(t *testing.T) {
 	})
 
 	cfgPath := writeCfg(t, fmt.Sprintf(`
-app_name: "channel-union"
+node_alias: "channel-union"
 port:     "0"
 state_file: %q
 log_path: ""
@@ -283,7 +283,7 @@ func TestApps_NoAppNoTargetNotify_FallsToDefault(t *testing.T) {
 
 	rr := &richRunner{}
 	cfgPath := writeCfg(t, fmt.Sprintf(`
-app_name: "default-notify-test"
+node_alias: "default-notify-test"
 port:     "0"
 state_file: %q
 log_path: ""
@@ -334,7 +334,7 @@ func TestApps_MultipleTargets_OneDown(t *testing.T) {
 
 	rr := &richRunner{}
 	cfgPath := writeCfg(t, fmt.Sprintf(`
-app_name: "multi-target-app"
+node_alias: "multi-target-app"
 port:     "0"
 state_file: %q
 log_path: ""
@@ -417,7 +417,7 @@ func TestDependency_RootCause_InAlert(t *testing.T) {
 
 	rr := &richRunner{}
 	cfgPath := writeCfg(t, fmt.Sprintf(`
-app_name: "dep-rootcause"
+node_alias: "dep-rootcause"
 port:     "0"
 state_file: %q
 log_path: ""
@@ -546,7 +546,7 @@ func TestDependency_CascadingImpact(t *testing.T) {
 
 	rr := &richRunner{}
 	cfgPath := writeCfg(t, fmt.Sprintf(`
-app_name: "dep-cascade"
+node_alias: "dep-cascade"
 port:     "0"
 state_file: %q
 log_path: ""
@@ -633,7 +633,7 @@ func TestTopologySnapshot_Edges(t *testing.T) {
 	defer close2()
 
 	e := noopEngine(t, fmt.Sprintf(`
-app_name: "topo-test"
+node_alias: "topo-test"
 port:     "0"
 state_file: %q
 log_path: ""
@@ -706,7 +706,7 @@ func TestSLO_IncidentRecording(t *testing.T) {
 
 	stateDir := t.TempDir()
 	cfgPath := writeCfg(t, fmt.Sprintf(`
-app_name: "slo-test"
+node_alias: "slo-test"
 port:     "0"
 state_file: %q
 log_path: ""
@@ -818,7 +818,7 @@ func TestSLO_Disabled_SnapshotNil(t *testing.T) {
 	defer close1()
 
 	e := noopEngine(t, fmt.Sprintf(`
-app_name: "slo-off"
+node_alias: "slo-off"
 port:     "0"
 state_file: %q
 log_path: ""
@@ -853,7 +853,7 @@ func TestFleetSnapshot_StandaloneMode(t *testing.T) {
 
 	rr := &richRunner{}
 	cfgPath := writeCfg(t, fmt.Sprintf(`
-app_name: "fleet-standalone"
+node_alias: "fleet-standalone"
 port:     "0"
 state_file: %q
 log_path: ""
@@ -951,7 +951,7 @@ func TestFleetSnapshot_AffectedApps(t *testing.T) {
 	defer closeTarget()
 
 	e := noopEngine(t, fmt.Sprintf(`
-app_name: "fleet-apps"
+node_alias: "fleet-apps"
 port:     "0"
 state_file: %q
 log_path: ""
@@ -1021,7 +1021,7 @@ func TestValidateConfig_Valid(t *testing.T) {
 	defer close1()
 
 	p := writeCfg(t, fmt.Sprintf(`
-app_name: "valid-cfg"
+node_alias: "valid-cfg"
 port:     "0"
 state_file: %q
 log_path: ""
@@ -1069,7 +1069,7 @@ func TestValidateConfig_DuplicateTargetID(t *testing.T) {
 	defer close1()
 
 	p := writeCfg(t, fmt.Sprintf(`
-app_name: "dupe-id"
+node_alias: "dupe-id"
 port:     "0"
 state_file: %q
 log_path: ""
@@ -1101,7 +1101,7 @@ func TestValidateConfig_UnknownAppTarget(t *testing.T) {
 	defer close1()
 
 	p := writeCfg(t, fmt.Sprintf(`
-app_name: "bad-app"
+node_alias: "bad-app"
 port:     "0"
 state_file: %q
 log_path: ""
@@ -1135,7 +1135,7 @@ func TestValidateConfig_CyclicDependency(t *testing.T) {
 	defer close2()
 
 	p := writeCfg(t, fmt.Sprintf(`
-app_name: "cyclic"
+node_alias: "cyclic"
 port:     "0"
 state_file: %q
 log_path: ""
@@ -1172,7 +1172,7 @@ func TestHTTP_Probe_UpDown(t *testing.T) {
 
 	rr := &richRunner{}
 	cfgPath := writeCfg(t, fmt.Sprintf(`
-app_name: "http-probe"
+node_alias: "http-probe"
 port:     "0"
 state_file: %q
 log_path: ""
@@ -1248,7 +1248,7 @@ func buildNNodeCfg(c clusterNodeCfg, totalNodes int, zone string) string {
 		zoneLine = fmt.Sprintf("  zone: %q\n", zone)
 	}
 	return fmt.Sprintf(`
-app_name: "cluster-comprehensive"
+node_alias: "cluster-comprehensive"
 port:     "0"
 state_file: %q
 log_path: ""
@@ -1573,7 +1573,7 @@ func TestCluster_ZoneAwareSpread(t *testing.T) {
 			peerList += fmt.Sprintf("    - \"127.0.0.1:%d\"\n", p)
 		}
 		cfg := fmt.Sprintf(`
-app_name: "zone-spread"
+node_alias: "zone-spread"
 port:     "0"
 state_file: %q
 log_path: ""
@@ -1785,7 +1785,7 @@ func TestWatchdog_NotifyScrape_NocrashSmoke(t *testing.T) {
 	defer close1()
 
 	e := noopEngine(t, fmt.Sprintf(`
-app_name: "watchdog-smoke"
+node_alias: "watchdog-smoke"
 port:     "0"
 state_file: %q
 log_path: ""
@@ -1822,7 +1822,7 @@ func TestStateMachine_SeqAndErrorCode(t *testing.T) {
 	stateFile := filepath.Join(t.TempDir(), "state.json")
 	rr := &richRunner{}
 	cfgPath := writeCfg(t, fmt.Sprintf(`
-app_name: "seq-test"
+node_alias: "seq-test"
 port:     "0"
 state_file: %q
 log_path: ""

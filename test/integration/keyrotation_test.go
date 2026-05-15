@@ -47,7 +47,7 @@ func buildKeyedCfg(c clusterNodeCfg, keyring []string) string {
 		keyList += fmt.Sprintf("    - %q\n", k)
 	}
 	return fmt.Sprintf(`
-app_name: "keyrot-test"
+node_alias: "keyrot-test"
 port:     "0"
 state_file: %q
 log_path: ""

@@ -143,7 +143,7 @@ func TestStandalone_ProbeAndAlertCycle(t *testing.T) {
 	alertScript := filepath.Join(t.TempDir(), "alert") // runner ignores extension
 
 	cfg := fmt.Sprintf(`
-app_name: "integration-standalone"
+node_alias: "integration-standalone"
 port:     "0"
 state_file: %q
 log_path: ""
@@ -299,7 +299,7 @@ func TestStandalone_AppEnrichment(t *testing.T) {
 	alertScript := filepath.Join(t.TempDir(), "alert")
 
 	cfg := fmt.Sprintf(`
-app_name: "integration-apps"
+node_alias: "integration-apps"
 port:     "0"
 state_file: %q
 log_path: ""
@@ -414,7 +414,7 @@ func TestStandalone_StateV2Migration(t *testing.T) {
 	}
 
 	cfg := fmt.Sprintf(`
-app_name: "migration-test"
+node_alias: "migration-test"
 port:     "0"
 state_file: %q
 log_path: ""

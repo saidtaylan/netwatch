@@ -72,7 +72,7 @@ func TestAntiEntropy_RejoinNoDuplicateAlert(t *testing.T) {
 
 	cfgNode1 := func() string {
 		return fmt.Sprintf(`
-app_name: "ae-test"
+node_alias: "ae-test"
 port:     "0"
 state_file: %q
 log_path: ""
@@ -119,7 +119,7 @@ cluster:
 	alertScript2 := filepath.Join(stateDir2, "alert2")
 
 	cfgNode2YAML := fmt.Sprintf(`
-app_name: "ae-test"
+node_alias: "ae-test"
 port:     "0"
 state_file: %q
 log_path: ""
