@@ -1130,12 +1130,14 @@ func cmdJoin(args []string) {
 		_ = sigs_yaml.Unmarshal(raw, &m)
 	}
 	if m == nil {
-		// Fresh skeleton.
+		// Fresh skeleton. Note: credentials_file deliberately omitted —
+		// adding it would require the operator to create the file before the
+		// agent could start. Operators can add `credentials_file:` to the
+		// config later if they need ${VAR} substitution.
 		m = map[string]interface{}{
 			"port":              "10240",
 			"state_file":        filepath.Join(filepath.Dir(path), "state.json"),
 			"log_path":          filepath.Join(filepath.Dir(path), "agent.log"),
-			"credentials_file":  filepath.Join(filepath.Dir(path), "credentials.env"),
 			"timeout":           5,
 			"max_retries":       2,
 			"retry_interval_sec": 30,

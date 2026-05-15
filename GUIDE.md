@@ -419,91 +419,290 @@ tekrar alarm üretmez — alarm `AlarmSent=true` olarak kaydedilmiştir.
 ## Cluster Modu
 
 Birden fazla netwatch node'u aynı altyapıyı izliyorsa cluster modu devreye girer.
-Temel garantiler:
+Garantiler:
 - Aynı alarm **tek kez** atılır (gossip + consistent hash primary)
 - **Quorum kaybında** alarmlar baskılanır (izole node yanlış alarm atmaz)
 - Node restart edildiğinde **alarm fırtınası olmaz** (anti-entropy sync)
+- Her target yalnızca `probe_replication_factor` (varsayılan 3) node tarafından probe edilir
 
-### Hızlı Cluster Kurulumu (önerilen)
+---
 
-İki komutla cluster ayağa kalkar. Önce ilk node'da:
+### N-Node Cluster Kurulumu — Adım Adım Talimat
+
+> **Bu bölüm Gemini, ChatGPT, Claude veya operator bir insan için aynı şekilde uygulanabilir.** Hiçbir adımda "acaba?" diye düşünme — her şey net.
+
+**Senaryo:** N node (örnek N=20). Her node ayrı bir makinede veya container'da. Aşağıdaki adımları sırayla uygula.
+
+#### Ön Koşullar (her makinede)
+
+1. **Binary**: `netwatch` derlenmiş olmalı (`go build -o /usr/local/bin/netwatch ./cmd/linux/`)
+2. **Açık portlar (firewall)**: Her makinede şu portlar açık olmalı:
+   - **TCP 10240** (HTTP API — `/metrics`, `/cluster/state`, vb.) — bu port operatörün ve Prometheus'un eriştiği port
+   - **TCP 7946 + UDP 7946** (memberlist gossip) — bu portlar diğer cluster üyelerinin eriştiği port
+   - macOS test'inde: `sudo pfctl` kuralı yoksa zaten açıktır
+   - Linux production: `firewall-cmd --permanent --add-port=10240/tcp --add-port=7946/tcp --add-port=7946/udp && firewall-cmd --reload`
+3. **Saat senkronu**: NTP açık olmalı (memberlist'in suspicion timer'ları doğru çalışsın diye)
+4. **Her makinenin diğerlerine ulaşılabilir IP'si olmalı** (NAT/VPN engelleri yok)
+
+#### Adım 1 — İlk node'u kur (`node-01`)
 
 ```bash
-$ netwatch init --cluster
-# ... çıktının sonunda:
-#
-#   To add another node, run on it:
-#
-#     netwatch join \
-#       --keyring 9TtmlRYcubbE++DW9WYnf6bUwNOeR8PLAwh8cWu7jHM= \
-#       --addr 10.0.1.10:7946
+# 1.1 — Cluster için config + random keyring üret
+sudo netwatch init --cluster --config-dir /etc/netwatch
 
-$ sudo systemctl start netwatch
+# Bu komut şunları yapar:
+#  - /etc/netwatch/config.yaml dosyasını yazar (cluster.enabled=true)
+#  - Random AES-256 keyring üretir
+#  - /etc/netwatch/credentials.env iskelet dosyası oluşturur
+#  - /etc/systemd/system/netwatch.service yazar
+#  - Stdout'a tam `netwatch join ...` komutu basar — KOPYALA, sakla
 ```
 
-İkinci ve sonraki node'larda yukarıdaki komutu olduğu gibi yapıştır:
-
-```bash
-$ netwatch join \
-    --keyring 9TtmlRYcubbE++DW9WYnf6bUwNOeR8PLAwh8cWu7jHM= \
-    --addr 10.0.1.10:7946
-
-$ sudo systemctl start netwatch
+**Çıktı şu şekilde olur:**
 ```
+─────────────────────────────────────────────────────────
+  Cluster enabled — keep this keyring SECRET
 
-Her node başlatıldığında stdout'a benzer bir banner basar (operatör kopyalayabilir):
-
-```
-=========================================================
-  netwatch cluster ready
-
-  Node     : machine2
-  Address  : 10.0.1.11:7946
-  Members  : 2
+  Keyring: xR7tK9pQ2sV8mN4jL6hF3wE1cB5yU0gA7zP9oI2nQ4=
+  Node   : node-01
+  Addr   : 10.0.1.10:7946   (auto-detected; override in config if needed)
 
   To add another node, run on it:
+
     netwatch join \
-      --keyring ... \
+      --keyring xR7tK9pQ2sV8mN4jL6hF3wE1cB5yU0gA7zP9oI2nQ4= \
       --addr 10.0.1.10:7946
-=========================================================
+─────────────────────────────────────────────────────────
 ```
 
-**Faydalı yan komutlar:**
+> **DİKKAT:** `Addr` satırı non-loopback IPv4'tür. Eğer **yanlış bir IP otomatik tespit edildiyse** (örn. Docker bridge, VPN aralığı), `/etc/netwatch/config.yaml` içinde `cluster.advertise_addr` alanını **doğru IP** ile elle güncelle.
 
 ```bash
-$ netwatch keyring generate       # yeni AES-256 base64 key — keyring rotation için
-$ netwatch validate -config ...   # config doğrulama
-$ netwatch leave                  # graceful cluster ayrılışı
+# 1.2 — node-01 config'inde mutlaka kontrol et / ayarla:
+sudo vi /etc/netwatch/config.yaml
+
+# Yapılması gereken değişiklikler:
+#  (a) expected_node_count: 20      ← Cluster'da toplam KAÇ node olacaksa o sayı
+#  (b) advertise_addr: "10.0.1.10"  ← Bu node'un diğer makinelerden erişilebilir IP'si
+#  (c) targets: [...]                ← İzlenecek hedefler (örnekler aşağıda)
+#  (d) notifications: [...]          ← Alarm kanalları
 ```
 
-İlk node doğru kurulduğunda diğerlerinde `sync` ile ortak alanları (notifications, default_notify, keyring, timing) tek seferde yayabilirsin:
+Minimum config örneği (`/etc/netwatch/config.yaml` üzerine yazılacak değer):
 
-```bash
-$ curl -X POST http://10.0.1.10:10240/cluster/config/sync \
-    -H "Authorization: Bearer $ADMIN_TOKEN"
-```
-
-### Minimal 3-node cluster
-
-`node-1/config.yaml`:
 ```yaml
+node_alias: "node-01"          # OPSİYONEL — atlanırsa hostname kullanılır
+port: "10240"                  # HTTP API portu (10240 önerilen)
+state_file: "/etc/netwatch/state.json"
+log_path: ""                   # Boş = stdout (systemd journal'a düşer)
+timeout: 5                     # probe başına saniye
+max_retries: 2                 # soft → hard down öncesi tekrar sayısı
+retry_interval_sec: 30         # retry'lar arası saniye (en az 5)
+probe_interval_sec: 60         # iki probe arası saniye
+ticker_interval_sec: 5         # retry scheduler ticker (en az 1)
+reload_interval_sec: 30        # config dosyası mtime tarama aralığı (saniye, 0=kapalı)
+
+admin:
+  token: "BURAYA_RASTGELE_BIR_SECRET_YAZ"   # PUT/POST endpoint'leri için zorunlu
+
+notifications:
+  ops-alert:
+    type: script
+    parameters:
+      script: "/etc/netwatch/alert.sh"
+
+default_notify: ["ops-alert"]
+
+targets:
+  - id: "example-tcp"
+    name: "Example TCP"
+    type: tcp
+    target: "example.com:443"
+  # Daha fazla target için Probe Tipleri bölümüne bak
+
 cluster:
   enabled: true
-  node_name: "node-1"
-  bind_addr: "0.0.0.0"
-  bind_port: 7946
-  advertise_addr: "192.168.1.101"
-  peers:
-    - "192.168.1.101:7946"
-    - "192.168.1.102:7946"
-    - "192.168.1.103:7946"
+  node_name: "node-01"
+  bind_addr: "0.0.0.0"               # Bütün ağ arayüzlerinde dinle
+  bind_port: 7946                    # Gossip portu (TCP+UDP)
+  advertise_addr: "10.0.1.10"        # ZORUNLU — peer'ların eriştiği IP. ASLA "127.0.0.1" YAZMA.
+  advertise_port: 7946
+  peers: []                          # İlk node'da boş bırak — join eden node'lar bu listeyi kendileri tamamlar
   keyring:
-    - "base64_aes256_key_here=="
-  expected_node_count: 3
-  min_quorum_ratio: 0.5
+    - "INIT_KOMUTUNDAN_GELEN_KEYRING"
+  expected_node_count: 20            # ZORUNLU — Cluster'daki TOPLAM node sayısı
+  min_quorum_ratio: 0.5              # Çoğunluk eşiği — 0.5 = floor(20*0.5)+1 = 11 alive node
+  probe_replication_factor: 3        # Her target'ı en fazla 3 node probe eder
 ```
 
-`node-2` ve `node-3`: aynı yapı, sadece `node_name` ve `advertise_addr` farklı.
+```bash
+# 1.3 — Alert script (en basit hâli; kendi entegrasyonun olduğu yerlerde değiştirebilirsin)
+sudo cat > /etc/netwatch/alert.sh << 'EOF'
+#!/usr/bin/env bash
+# netwatch alarm script — env değişkenlerinde alarm bilgisi gelir
+# STATUS: unreachable | reachable
+# NAME, TARGET, TYPE, SEQ, ERROR_CODE, SCOPE, AFFECTED_APPS, ROOT_CAUSE
+echo "$(date -u +%FT%TZ) $STATUS $NAME ($TARGET) [$SCOPE]" >> /var/log/netwatch-alerts.log
+EOF
+sudo chmod +x /etc/netwatch/alert.sh
+
+# 1.4 — Config'i validate et
+sudo netwatch validate --config /etc/netwatch/config.yaml
+# Çıktı: "OK  config is valid" görmeli; yoksa hata mesajına göre düzelt
+
+# 1.5 — Servisi başlat
+sudo systemctl daemon-reload
+sudo systemctl enable --now netwatch
+sudo systemctl status netwatch     # active (running) olmalı
+
+# 1.6 — Çalıştığını doğrula
+curl http://localhost:10240/health           # → 200
+curl http://localhost:10240/cluster/state | jq '.members | length'   # → 1
+journalctl -u netwatch -f                    # → "netwatch cluster ready" banner görmeli
+```
+
+**Başarı kriterleri (Adım 1 sonunda):**
+- ✅ `systemctl status netwatch` → `active (running)`
+- ✅ `/health` → `200`
+- ✅ `/cluster/state` → `members.length == 1`
+- ✅ Journal'da `netwatch cluster ready` banner var
+
+#### Adım 2 — Diğer 19 node'u join et (`node-02..node-20`)
+
+Her node makinesinde sırayla:
+
+```bash
+# 2.1 — node-01'in init çıktısındaki tam komutu çalıştır
+sudo netwatch join \
+  --keyring xR7tK9pQ2sV8mN4jL6hF3wE1cB5yU0gA7zP9oI2nQ4= \
+  --addr 10.0.1.10:7946 \
+  --config /etc/netwatch/config.yaml \
+  --node-name "node-NN"     # Her node için UNIQUE — node-02, node-03, ... node-20
+
+# Bu komut şunları yapar:
+#  - /etc/netwatch/config.yaml dosyasını yazar (cluster.enabled=true, peer=node-01)
+#  - keyring'i embed eder
+#  - node_name'i belirler
+#  - Agent'i BAŞLATMAZ — sonra systemctl ile başlatacaksın
+
+# 2.2 — Config'te bu node için node-specific ayarları kontrol et
+sudo vi /etc/netwatch/config.yaml
+# Sadece şu alanları doğrula/güncelle:
+#  (a) cluster.advertise_addr: "10.0.1.NN"   ← BU node'un diğerlerinden erişilebilir IP'si
+#  (b) cluster.expected_node_count: 20        ← Toplam node sayısı (node-01 ile aynı)
+#  (c) node_alias: "node-NN"                  ← Opsiyonel etiket
+# DİĞER ŞEYLERİ ELLEME — config sync ile node-01'den dağıtılacak (Adım 3).
+
+# 2.3 — Servisi başlat
+sudo systemctl daemon-reload    # Eğer init önceden çalıştırılmadıysa unit dosyası eksik olabilir;
+                                 # `netwatch init --config-dir /etc/netwatch` ile sadece unit dosyası
+                                 # üretip diğer dosyaları yok edebilirsin (ama burada zaten join attı,
+                                 # daha kolay yol: unit dosyasını node-01'den scp ile kopyala).
+sudo systemctl enable --now netwatch
+
+# 2.4 — Cluster'a katıldığını doğrula
+curl http://localhost:10240/cluster/state | jq '.members | length'
+# Beklenen: her join'den sonra +1 artmalı (node-02 join ettikten sonra 2, node-03 sonrası 3, ...)
+
+# Aynı kontrolü node-01'den de yap:
+curl http://10.0.1.10:10240/cluster/state | jq '.members | length'
+# Aynı sayıyı vermeli.
+```
+
+> **Önemli — node_name UNIQUE olmalı:** İki node'un `cluster.node_name`'i aynı olursa memberlist onları aynı node sanır, biri ezilir. **Hostname'i kullanırsan otomatik unique olur.**
+
+> **Önemli — advertise_addr asla `127.0.0.1` veya `0.0.0.0` olmamalı:** Diğer node'lar bu IP üzerinden geri bağlantı kurar. Loopback yazarsan peer bağlanamaz. Her node'a kendi gerçek IP'sini yaz. `bind_addr: "0.0.0.0"` OK (dinleme), ama `advertise_addr` gerçek IP olmalı.
+
+> **Önemli — keyring her node'da AYNEN aynı olmalı:** Tek karakter farkı bile cluster'ın bölünmesine yol açar (iki ayrı küçük cluster oluşur). `join` komutu bunu otomatik halleder; elle değiştirme.
+
+#### Adım 3 — Ortak config'i tüm node'lara dağıt (önerilen)
+
+Her node'da config'i ayrı ayrı kurgulamak yerine, node-01'i tam kur, sonra **tek komutla** notifications, default_notify, targets dışındaki ortak ayarları diğerlerine yay:
+
+```bash
+# Bu komut: node-01'in config'indeki "shared" alanları (timeout, retries, intervals,
+# keyring, expected_node_count, probe_replication_factor, min_quorum_ratio, peers)
+# diğer 19 node'a gossip TCP ile dağıtır.
+# Her node config.yaml'ını atomik yazar ve hot-reload tetikler — restart gerekmez.
+
+curl -X POST http://10.0.1.10:10240/cluster/config/sync \
+  -H "Authorization: Bearer SECRET_TOKEN_NODE_01_ADMIN_TOKEN"
+
+# Çıktı:
+# {"applied_locally":false,"broadcast_to":["node-02",...,"node-20"],"failed_nodes":{}, ...}
+
+# NOT: targets, apps, slo, node_alias, port, advertise_addr DAĞITILMAZ.
+# Bunlar her node'a özel veya cluster-wide olarak start'tan önce ayarlanmalı.
+```
+
+#### Adım 4 — Cluster sağlığını doğrula
+
+```bash
+# 4.1 — Tüm 20 node'u tek tek kontrol et
+for ip in 10.0.1.{10..29}; do
+  SIZE=$(curl -sf http://$ip:10240/cluster/state 2>/dev/null | jq '.members | length')
+  echo "$ip → $SIZE members"
+done
+# Beklenen: hepsi "20 members" yazsın
+
+# 4.2 — Quorum sağlıklı mı
+curl -s http://10.0.1.10:10240/metrics | grep -E "^network_prober_(quorum_healthy|isolated|cluster_size)"
+# Beklenen:
+#   network_prober_quorum_healthy 1
+#   network_prober_isolated 0
+#   network_prober_cluster_size 20
+
+# 4.3 — Probe assignment'ları dağıldı mı (stabilize olması ~30 sn sürebilir)
+sleep 30
+curl -s http://10.0.1.10:10240/cluster/probers | jq '.targets[0] | {target_id, selected_probers}'
+# Beklenen: her target için 3 prober (factor=3) seçilmiş olmalı
+
+# 4.4 — Fleet özeti
+curl -s http://10.0.1.10:10240/fleet/status?format=text
+# Tüm target'lar ve durumları okunaklı tablo halinde
+```
+
+**Cluster hazır ✓** — Bu noktada N=20 node bağlı, gossip çalışıyor, probe'lar dağıtık koşuyor.
+
+---
+
+### Sık Karşılaşılan Sorunlar
+
+**P: Cluster boyutu 20 yerine düşük (örn. 17) gösteriyor**
+- `cluster.advertise_addr`'ı bağlanamayan node'larda kontrol et — loopback veya yanlış IP olabilir
+- Firewall'ları kontrol et: TCP 7946 + UDP 7946 her node'a açık mı
+- `journalctl -u netwatch | grep -i "memberlist\|join"` ile join hatalarına bak
+- `cluster.peers` listesinde en az 1 alive node olmalı (node-01 down ise bağlanamazlar)
+
+**P: `network_probe_target_orphaned` metriği 1**
+- `probe_from` listesinde alive node yok
+- `probe_from_regions` listesi hiçbir node'un `cluster.region` etiketiyle eşleşmiyor
+- `cluster.zone` typoları için config'leri kontrol et
+
+**P: Aynı alarm 2 kere geliyor**
+- `cluster.keyring` farklı olabilir — iki ayrı cluster'a bölündüyseniz her cluster'ın kendi primary'si var
+- `cluster.expected_node_count` tüm node'larda aynı olmalı (yoksa quorum hesabı bozulur)
+- `cluster.probe_replication_factor` tüm node'larda aynı olmalı
+
+**P: Hiç alarm gelmiyor**
+- Servis gerçekten down mu? `/status` endpoint'inde target durumlarına bak (`hard_down` görmen lazım)
+- `cluster.min_quorum_ratio` çok yüksek olabilir — `network_prober_isolated` metriği 1 ise alarmlar baskılanır
+- `admin.token` set edildiyse alarm script'in env'inde lazım değil, ama `PUT /cluster/config` çağrılarında Authorization header'ı zorunlu
+- `journalctl -u netwatch | grep -E "sending alert|alert suppressed"` ile alarm akışını izle
+
+**P: Bir node'u temiz silmek istiyorum**
+```bash
+# Hedef node'da:
+sudo netwatch leave --port 10240    # gossip leave yayar, sonra servisi durdurur
+sudo systemctl disable --now netwatch
+# Diğer node'lar 5-10 sn içinde "cluster member left" log'u basar ve ringi yeniden hesaplar.
+```
+
+**P: Bir node'un keyring'i değişirse**
+- Sıfır kesintili keyring rotation için `POST /cluster/keyring/rotate` API'sini kullan (Keyring Rotation bölümüne bak)
+- Manuel değiştirip restart edersen O NODE küme'den izole olur; sadece aynı yeni keyring'e sahip node'larla konuşur
+
+---
 
 ### Distributed Probe Ownership
 

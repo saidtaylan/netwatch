@@ -922,12 +922,22 @@ func (e *Engine) LoadConfig() error {
 	vars := make(map[string]string)
 	if peek.CredentialsFile != "" {
 		credPath := resolvePath(peek.CredentialsFile)
-		vars, err = parseEnvFile(credPath)
-		if err != nil {
-			return err
-		}
-		if !e.credLogged {
-			slog.Info("credentials loaded", "path", credPath, "vars", len(vars))
+		// A missing credentials file is non-fatal: the operator may have set
+		// credentials_file: ... in anticipation of future secrets but not yet
+		// created the file (e.g. fresh `netwatch join` writes the path but
+		// not the file). Continue with empty vars; only fail on malformed contents.
+		if _, statErr := os.Stat(credPath); statErr == nil {
+			vars, err = parseEnvFile(credPath)
+			if err != nil {
+				return err
+			}
+			if !e.credLogged {
+				slog.Info("credentials loaded", "path", credPath, "vars", len(vars))
+				e.credLogged = true
+			}
+		} else if !e.credLogged {
+			slog.Warn("credentials file not found — continuing with empty vars",
+				"path", credPath, "hint", "create the file if any ${VAR} references need resolving")
 			e.credLogged = true
 		}
 	}
