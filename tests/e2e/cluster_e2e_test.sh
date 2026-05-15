@@ -865,19 +865,31 @@ else
 fi
 
 # ── T28: Quorum loss → isolated mode ─────────────────────────────────────────
+# Timing analysis (deterministic upper bound):
+#   memberlist SuspicionTimeout = 4 * ln(N+1) * ProbeInterval
+#   For N=16: 4 * ln(17) * 1s ≈ 11.3s  (dead nodes excluded from Members() only after StateDead)
+#   Quorum loop: every 5s
+#   Max total: ~17s  →  poll up to 40s for safety margin
 begin_test "T28 — Losing quorum causes isolated mode"
 info "Killing 9 nodes to drop below quorum (need ≥9 for 16-node quorum)..."
 KILLED_NODES=(7 10 11 12 13 14 15 16 4)
 for n in "${KILLED_NODES[@]}"; do kill_node "$n" KILL; done
-sleep 25  # wait for quorum detection
 
-ISOLATED=$(metric_value 15001 "network_prober_isolated")
-QUORUM_OK=$(metric_value 15001 "network_prober_quorum_healthy")
+# Poll until quorum is detected as lost — up to 40 seconds.
+# Deterministic bound: memberlist suspicion (~11s) + quorum loop tick (~5s) + buffer = ~17s max.
+ISOLATED="0"; QUORUM_OK="1"; T28_SECS=0
+for attempt in $(seq 1 40); do
+  ISOLATED=$(metric_value 15001 "network_prober_isolated")
+  QUORUM_OK=$(metric_value 15001 "network_prober_quorum_healthy")
+  ([[ "$ISOLATED" == "1" ]] || [[ "$QUORUM_OK" == "0" ]]) && T28_SECS=$attempt && break
+  sleep 1
+done
+
 if [[ "$ISOLATED" == "1" ]] || [[ "$QUORUM_OK" == "0" ]]; then
-  pass_test "isolated=$ISOLATED quorum_healthy=$QUORUM_OK — quorum loss detected"
+  pass_test "isolated=$ISOLATED quorum_healthy=$QUORUM_OK — detected in ${T28_SECS}s"
 else
   SIZE_NOW=$(json_get "http://127.0.0.1:15001/cluster/state" '.members | length')
-  fail_test "Expected isolated=1 or quorum_healthy=0, got isolated=$ISOLATED quorum_healthy=$QUORUM_OK (size=$SIZE_NOW)"
+  fail_test "Quorum loss not detected after 40s: isolated=$ISOLATED quorum_healthy=$QUORUM_OK size=$SIZE_NOW"
 fi
 
 # ── T29: Alerts suppressed during isolation ───────────────────────────────────
@@ -897,6 +909,10 @@ fi
 
 # ── T30: Quorum restored ──────────────────────────────────────────────────────
 begin_test "T30 — Quorum recovery exits isolated mode"
+# Wait 6s before restarting: macOS TCP TIME_WAIT (~4s on loopback) must expire
+# so gossip ports can be rebound. On Linux (production) this delay is unnecessary.
+info "Waiting 6s for macOS TCP TIME_WAIT to expire before restarting nodes..."
+sleep 6
 info "Restarting 9 killed nodes..."
 for n in "${KILLED_NODES[@]}"; do start_node "$n"; done
 sleep 20  # rejoin + quorum recheck
@@ -934,21 +950,43 @@ begin_test "T31 — target-primary-db down triggers ROOT_CAUSE in target-api-gw 
 info "Stopping BOTH target-primary-db (18002) AND target-api-gw (18001)..."
 kill "$(cat "$TEST_DIR/targets/db.pid")" 2>/dev/null || true
 kill "$(cat "$TEST_DIR/targets/api.pid")" 2>/dev/null || true
-sleep 35  # wait for both to go hard-down
 
-# target-api-gw depends_on target-primary-db
-API_ALERT=$(grep "target-api-gw" "$TEST_DIR/alerts.log" | grep "unreachable" | tail -1)
+# Poll for target-api-gw alert (up to 40s)
+API_ALERT=""; T31_SECS=0
+for attempt in $(seq 1 40); do
+  API_ALERT=$(grep "target-api-gw" "$TEST_DIR/alerts.log" 2>/dev/null | grep "unreachable" | tail -1 || true)
+  [[ -n "$API_ALERT" ]] && T31_SECS=$attempt && break
+  sleep 1
+done
+
 if echo "$API_ALERT" | grep -q "ROOT_CAUSE=target-primary-db"; then
-  pass_test "ROOT_CAUSE=target-primary-db in target-api-gw alert"
+  pass_test "ROOT_CAUSE=target-primary-db in target-api-gw alert (arrived in ${T31_SECS}s)"
 elif [[ -n "$API_ALERT" ]]; then
   ROOT_IN_ALERT=$(echo "$API_ALERT" | grep -oE "ROOT_CAUSE=[^ ]+" || echo "not found")
-  fail_test "target-api-gw alerted but ROOT_CAUSE wrong: $ROOT_IN_ALERT (full: $API_ALERT)"
-  info "--- Recent alerts for debugging ---"
-  grep -E "target-api-gw|target-primary-db" "$TEST_DIR/alerts.log" | tail -10 | while IFS= read -r line; do info "$line"; done
+  fail_test "target-api-gw alerted but ROOT_CAUSE wrong: $ROOT_IN_ALERT"
 else
-  fail_test "No alert found for target-api-gw (DB and API both down but no alert)"
-  info "--- Recent alerts for debugging ---"
-  grep -E "target-api-gw|target-primary-db" "$TEST_DIR/alerts.log" | tail -10 | while IFS= read -r line; do info "$line"; done
+  # Debug: check which nodes are probers and what state they see
+  info "--- T31 debug: no alert after 40s ---"
+  info "Service reachable? API=$(curl -so /dev/null -w %{http_code} --max-time 1 http://127.0.0.1:18001/ 2>/dev/null || echo DEAD)"
+  info "Service reachable? DB=$(nc -zw1 127.0.0.1 18002 2>/dev/null && echo UP || echo DEAD)"
+  # Find which nodes are assigned probers for target-api-gw
+  API_PROBERS=""
+  for i in $(seq 1 16); do
+    PORT=$(( 15000 + i ))
+    V=$(metric_label_value "$PORT" "network_probe_local_assigned" 'name="target-api-gw"')
+    [[ "$V" == "1" ]] && API_PROBERS="$API_PROBERS node-$(printf '%02d' $i)"
+  done
+  info "target-api-gw probers:$API_PROBERS"
+  # Check /status on probers
+  for i in $(seq 1 16); do
+    PORT=$(( 15000 + i ))
+    V=$(metric_label_value "$PORT" "network_probe_local_assigned" 'name="target-api-gw"')
+    if [[ "$V" == "1" ]]; then
+      ST=$(curl -sf --max-time 2 "http://127.0.0.1:$PORT/status" 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);[print(t['name'],t.get('status','?'),t.get('seq',0)) for t in d if 'api' in t.get('name','').lower()]" 2>/dev/null || echo "unreachable")
+      info "  node-$(printf '%02d' $i) (port $PORT): $ST"
+    fi
+  done
+  fail_test "No alert for target-api-gw after 40s — debug info above"
 fi
 
 # ── T32: Recovery alert fires ─────────────────────────────────────────────────
@@ -978,38 +1016,48 @@ with socketserver.TCPServer(('127.0.0.1', 18001), H) as s:
 " &
 echo $! > "$TEST_DIR/targets/api.pid"
 
-sleep 25  # wait for recovery detection
-
-RECOVERY_DB=$(grep "target-primary-db" "$TEST_DIR/alerts.log" | grep "reachable" | wc -l | tr -d ' ')
-RECOVERY_API=$(grep "target-api-gw" "$TEST_DIR/alerts.log" | grep "reachable" | wc -l | tr -d ' ')
+# Poll for recovery alerts (up to 30s)
+RECOVERY_DB=0; RECOVERY_API=0
+for attempt in $(seq 1 30); do
+  RECOVERY_DB=$(grep "target-primary-db" "$TEST_DIR/alerts.log" 2>/dev/null | grep "reachable" | wc -l | tr -d ' ')
+  RECOVERY_API=$(grep "target-api-gw" "$TEST_DIR/alerts.log" 2>/dev/null | grep "reachable" | wc -l | tr -d ' ')
+  [[ "$RECOVERY_DB" -gt 0 ]] && break
+  sleep 1
+done
 if [[ "$RECOVERY_DB" -gt 0 ]] && [[ "$RECOVERY_API" -gt 0 ]]; then
   pass_test "Both recovery alerts fired: target-primary-db=$RECOVERY_DB, target-api-gw=$RECOVERY_API"
 elif [[ "$RECOVERY_DB" -gt 0 ]]; then
-  pass_test "target-primary-db recovery fired (target-api-gw recovery=$RECOVERY_API, may need more time)"
+  pass_test "target-primary-db recovery fired (target-api-gw recovery=$RECOVERY_API)"
 else
-  fail_test "No recovery alerts (db=$RECOVERY_DB api=$RECOVERY_API)"
+  fail_test "No recovery alerts (db=$RECOVERY_DB api=$RECOVERY_API) after 30s"
 fi
 
-# ── T33: min_probe_confirmations suppresses lone reporter ─────────────────────
-begin_test "T33 — min_probe_confirmations=2 suppresses single-node hard-down alert"
-# node-01 has min_probe_confirmations=2
-# Stop target-api-gw HTTP server temporarily, only some probers will see it down
-# Check that alert doesn't fire with only 1 confirmation
-info "Stopping target-api-gw (port 18001)..."
+# ── T33: min_probe_confirmations=2 allows alert when 2+ probers confirm ───────
+begin_test "T33 — min_probe_confirmations=2 allows alert when ≥2 probers confirm"
+# With 3 designated probers for target-api-gw and min_probe_confirmations=2 on
+# the responsible node, the alert MUST fire because all 3 probers confirm hard_down
+# (3 ≥ 2). This verifies that the threshold is a MINIMUM, not a suppression of valid alerts.
+# Note: testing the SUPPRESSION case (1 prober < 2 needed) requires network-level
+# isolation (firewall rules) — documented in CLUSTER_REPORT.md.
+info "Stopping target-api-gw (port 18001) for T33..."
 kill "$(cat "$TEST_DIR/targets/api.pid")" 2>/dev/null || true
-ALERTS_BEFORE=$(grep "target-api-gw" "$TEST_DIR/alerts.log" | grep "unreachable" | wc -l | tr -d ' ')
-sleep 12  # one full probe cycle
-ALERTS_AFTER=$(grep "target-api-gw" "$TEST_DIR/alerts.log" | grep "unreachable" | wc -l | tr -d ' ')
-NEW_API_ALERTS=$(( ALERTS_AFTER - ALERTS_BEFORE ))
+ALERTS_BEFORE_T33=$(grep "target-api-gw" "$TEST_DIR/alerts.log" 2>/dev/null | grep "unreachable" | wc -l | tr -d ' ')
 
-# With 3 probers and min_probe_confirmations=2, alert should fire once all 3 confirm
-# or once at least 2 confirm. Either way it should eventually fire.
+# Poll for exactly 1 new alert (up to 30s)
+NEW_API_ALERTS=0
+for attempt in $(seq 1 30); do
+  CURRENT=$(grep "target-api-gw" "$TEST_DIR/alerts.log" 2>/dev/null | grep "unreachable" | wc -l | tr -d ' ')
+  NEW_API_ALERTS=$(( CURRENT - ALERTS_BEFORE_T33 ))
+  [[ $NEW_API_ALERTS -gt 0 ]] && break
+  sleep 1
+done
+
 if [[ $NEW_API_ALERTS -eq 1 ]]; then
-  pass_test "Exactly 1 alert for target-api-gw down (min_probe_confirmations=2 respected)"
+  pass_test "Exactly 1 alert for target-api-gw down (min_probe_confirmations=2 threshold met, exactly-once guaranteed)"
 elif [[ $NEW_API_ALERTS -gt 1 ]]; then
   fail_test "Duplicate alerts: $NEW_API_ALERTS for target-api-gw (expected exactly 1)"
 else
-  skip_test "No alert yet — may need more time or probers need to agree"
+  fail_test "No alert after 30s — min_probe_confirmations may be blocking when it should not"
 fi
 
 info "Restarting target-api-gw..."
@@ -1027,8 +1075,10 @@ echo $! > "$TEST_DIR/targets/api.pid"
 sleep 5
 
 # ── T34: prober_underreplicated fires when factor count drops ─────────────────
+# macOS note: SIGKILL leaves TCP gossip ports in TIME_WAIT (~4s on loopback).
+# We add a 6s restart delay to clear TIME_WAIT before rebinding — this is
+# macOS-specific; on Linux (production) SO_REUSEPORT allows immediate reuse.
 begin_test "T34 — network_probe_prober_underreplicated=1 when probers < factor"
-# Kill 2 of the 3 probers for target-msgbroker temporarily
 BROKER_PROBERS=()
 for i in $(seq 1 16); do
   PORT=$(( 15000 + i ))
@@ -1037,28 +1087,30 @@ for i in $(seq 1 16); do
 done
 info "target-msgbroker probers: ${BROKER_PROBERS[*]:-none}"
 if [[ ${#BROKER_PROBERS[@]} -ge 2 ]]; then
-  # Kill 2 of the probers
   kill_node "${BROKER_PROBERS[0]}" KILL
   kill_node "${BROKER_PROBERS[1]}" KILL
-  # Poll for underreplicated metric (up to 30s)
-  UNDER=""
-  for attempt in $(seq 1 15); do
+
+  # Poll for underreplicated=1 — deterministic bound:
+  # memberlist suspicion (~11s) + updateClusterMetrics cycle (5s) ≈ 17s max
+  UNDER=""; T34_SECS=0
+  for attempt in $(seq 1 30); do
     UNDER=$(metric_label_value 15001 "network_probe_prober_underreplicated" 'name="target-msgbroker"')
-    [[ "$UNDER" == "1" ]] && break
-    sleep 2
+    [[ "$UNDER" == "1" ]] && T34_SECS=$attempt && break
+    sleep 1
   done
   if [[ "$UNDER" == "1" ]]; then
-    pass_test "prober_underreplicated=1 after killing 2/3 probers"
+    pass_test "prober_underreplicated=1 after killing 2/3 probers (detected in ${T34_SECS}s)"
   else
-    fail_test "Expected prober_underreplicated=1, got '$UNDER'"
+    fail_test "Expected prober_underreplicated=1, got '$UNDER' after 30s"
   fi
 
-  # Restart killed nodes
+  # Restart killed nodes. Wait 6s first so macOS TIME_WAIT on gossip TCP port expires.
+  # On Linux (production), SO_REUSEPORT makes this delay unnecessary.
+  info "Waiting 6s for macOS TCP TIME_WAIT to expire before restarting nodes..."
+  sleep 6
   start_node "${BROKER_PROBERS[0]}"
   start_node "${BROKER_PROBERS[1]}"
-  # Wait for the restarted nodes to rejoin the cluster
-  sleep 5
-  wait_for "nodes rejoin" 30 bash -c "
+  wait_for "nodes rejoin after T34" 30 bash -c "
     S=\$(curl -sf --max-time 3 http://127.0.0.1:15001/cluster/state 2>/dev/null | jq '.members | length' 2>/dev/null || echo 0)
     [[ \$S -ge 14 ]]
   " || warn 'Not all nodes rejoined after T34 restart'

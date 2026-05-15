@@ -680,6 +680,12 @@ func New(cfg Config) (*Manager, error) {
 		}
 	}
 
+	// Rebuild the ring now that Join() has exchanged full membership with peers.
+	// The initial updateRing() call (above) only had the local node in the ring
+	// because Join() had not yet completed. After Join(), list.Members() reflects
+	// the full cluster view, so the ring is now populated correctly.
+	m.updateRing()
+
 	local := list.LocalNode()
 	slog.Info("cluster started",
 		"node", cfg.NodeName,

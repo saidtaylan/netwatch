@@ -1477,23 +1477,31 @@ func (e *Engine) shouldAlert(targetID string) bool {
 		slog.Debug("alert suppressed: not responsible", "target", targetID)
 		return false
 	}
-	// min_probe_confirmations guard: wait until enough probers agree on hard_down.
-	// This prevents a single node with a flaky network path from alerting on its own.
+	// min_probe_confirmations guard: wait until enough independent probers agree.
+	//
+	// Design intent: this prevents a single node with a flaky network path from
+	// alerting when all other probers see the target as healthy. It applies ONLY
+	// when this node is NOT itself a designated prober for the target.
+	//
+	// Why exempt local probers? If this node is both primary AND a prober, it has
+	// direct first-hand evidence of the failure — it probed the target itself and
+	// got a connection error. This is qualitatively different from a non-prober
+	// primary that is relying entirely on gossip from others. A prober-primary
+	// should fire immediately; the confirmation guard adds no safety value here
+	// and only introduces a window where the alert is silently suppressed even
+	// though we have direct proof of the outage.
 	minConf := e.effectiveMinConfirmations()
-	if minConf > 1 {
+	if minConf > 1 && !e.clusterMgr.IsLocalProber(targetID) {
+		// This node is the responsible primary but NOT a prober — it relies on
+		// peer gossip alone. Require minConf independent confirmations.
 		confirmCount := 0
-		e.stateMu.RLock()
-		if e.lastKnown[targetID].State == "hard_down" {
-			confirmCount++
-		}
-		e.stateMu.RUnlock()
 		for _, peer := range e.clusterMgr.PeerStatesForTarget(targetID) {
-			if peer.State == "hard_down" && peer.NodeName != e.hostname {
+			if peer.State == "hard_down" {
 				confirmCount++
 			}
 		}
 		if confirmCount < minConf {
-			slog.Debug("alert suppressed: insufficient confirmations",
+			slog.Debug("alert suppressed: insufficient peer confirmations (non-prober primary)",
 				"target", targetID, "confirmations", confirmCount, "required", minConf)
 			return false
 		}
