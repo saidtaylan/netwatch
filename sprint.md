@@ -4,6 +4,722 @@ Bu dosya aktif geliştirme planını içerir. Tamamlananlar → **developments.m
 
 ---
 
+## 🎯 Aktif Sprint — Production Quality Features (2026-05-16 onaylı)
+
+Kullanıcı onayı bekliyor. Sıra: F1 → F2 → F3 → F4 → F5.
+
+### F1 — Probe Interval Staggering (KÜÇÜK, ÖNCE)
+
+**Hedef:** Aynı target'ı probe eden N node, hepsi aynı anda probe atmasın. Probe yükü interval içinde eşit dağıtılsın.
+
+**Mevcut sorun:**
+```
+3 prober, probe_interval=60s:
+T+0s:  prober-A → probe
+T+0s:  prober-B → probe   ← AYNI saniyede
+T+0s:  prober-C → probe   ← AYNI saniyede
+T+60s: hepsi yine aynı anda
+```
+
+**Hedeflenen davranış:**
+```
+3 prober, probe_interval=60s:
+T+0s:  prober-A → probe   (offset = 0)
+T+20s: prober-B → probe   (offset = 60/3 * 1)
+T+40s: prober-C → probe   (offset = 60/3 * 2)
+T+60s: prober-A → probe   ← döngü başa
+```
+
+**Faydalar:**
+- Target servise düz yük (burst yok)
+- Mean detection latency: probe_interval/N (örn. 60s yerine 20s)
+- Network bandwidth düz dağılır
+
+**İmplementasyon:**
+
+Dosya: `internal/engine/loop.go` — `startProbeLoop()` içinde:
+
+```go
+func (e *Engine) startProbeLoop(t Target) {
+    if e.clusterMgr != nil && !e.clusterMgr.IsLocalProber(t.key()) {
+        return
+    }
+
+    // ... mevcut probeFastCheck ve probeCancel kurulumu ...
+
+    // ── YENİ: stagger offset hesabı ──
+    var offset time.Duration
+    if e.clusterMgr != nil {
+        probers := e.clusterMgr.SelectProbers(t.key())  // sorted
+        myName := e.clusterNodeName()
+        for i, p := range probers {
+            if p == myName {
+                // offset = (probe_interval / N) * i
+                e.mu.RLock()
+                interval := e.cfg.globalProbeInterval()
+                e.mu.RUnlock()
+                if t.IntervalSec != nil {
+                    interval = *t.IntervalSec
+                }
+                offset = time.Duration(i) * (time.Duration(interval)*time.Second / time.Duration(len(probers)))
+                break
+            }
+        }
+    }
+
+    go func() {
+        // İlk probe öncesi stagger sleep
+        if offset > 0 {
+            slog.Debug("probe loop staggered", "target", t.key(), "offset", offset)
+            select {
+            case <-ctx.Done():
+                return
+            case <-time.After(offset):
+            }
+        }
+
+        // Mevcut: immediate probe + ticker loop (değişmedi)
+        e.runCheck(ctx, t)
+        // ... ticker döngüsü ...
+    }()
+}
+```
+
+**Edge case'ler:**
+
+1. Standalone mod (cluster=nil): offset = 0, mevcut davranış korunur
+2. Tek prober (N=1): offset = 0
+3. Prober assignment değişimi: mevcut `StopProbing` + `StartProbing` recompute mekanizması yeni offset'i otomatik hesaplar
+4. Çok kısa interval (1s) + çok prober (10): 1s/10 = 100ms offset — kabul edilebilir
+
+**Test (white-box, `internal/engine/loop_test.go` veya yeni `stagger_test.go`):**
+
+```go
+func TestStartProbeLoop_Stagger_ComputesCorrectOffset(t *testing.T) {
+    // Mock cluster manager that returns SelectProbers = [n1, n2, n3]
+    // Set local node = n2 (index 1)
+    // probe_interval = 60s
+    // Expected offset = 20s
+    // Verify: probe loop sleeps 20s before first probe
+}
+
+func TestStartProbeLoop_Stagger_StandaloneZeroOffset(t *testing.T) {
+    // clusterMgr = nil
+    // Expected: probe runs immediately (offset=0)
+}
+
+func TestStartProbeLoop_Stagger_SingleProberZeroOffset(t *testing.T) {
+    // SelectProbers returns single node (self)
+    // Expected: offset = 0
+}
+```
+
+**E2E test (tests/domain/stagger_test.go):**
+
+3 node cluster, probe_replication_factor=3, probe_interval=6s. Bir target'ı probe ederler. Tüm probe'ların timestamp'ini topla (mock TCP server probe count'u). 30 saniye sonra prober başına ~5 probe görünmeli ve probe'lar arası boşluk ~2s olmalı (6/3=2).
+
+**Tahmini efor:** 1.5 saat (kod + test)
+
+**Kabul kriterleri:**
+- [x] Standalone mod (cluster yok): mevcut davranış (offset yok)
+- [x] 3 prober cluster: ilk probe'lar 0, 20, 40 saniyede (probe_interval=60s için)
+- [x] Prober set değişince yeni offset uygulanır
+- [x] race detector temiz
+- [x] Mevcut tüm testler hâlâ geçer
+
+---
+
+### F2 — Multi-Node depends_on / ROOT_CAUSE Cross-Node Lookup Fix
+
+**Hedef:** Bir target'ın bağımlılığı başka bir node'da probe ediliyor olabilir. ROOT_CAUSE hesabı sadece local state'e değil, peer gossip state'ine de bakmalı.
+
+**Mevcut bug:**
+
+20 node, factor=3. Aynı target listesi (config sync). Ama her target'ı sadece 3 node probe eder.
+
+```
+target `db-primary` probers: nodes[1, 5, 9]
+target `api-gateway` probers: nodes[2, 6, 10]    ← farklı set
+api-gateway depends_on: ["db-primary"]
+```
+
+api-gateway hard_down olduğunda node-2 alarm gönderir. node-2 `e.lastKnown["db-primary"]`'a bakar → **YOK** (node-2 db-primary probe etmiyor). ROOT_CAUSE boş çıkar.
+
+**Düzeltme:**
+
+Dosya: `internal/engine/notify.go` veya `topology.go` — `rootCauseEnv()` veya FindRootCause çağırma yeri.
+
+```go
+// rootCauseEnv: dependency state'i hesaplarken cluster gossip'i de kullan
+func (e *Engine) rootCauseEnv(t Target, status string, localStates map[string]PersistedState) map[string]string {
+    if e.topoGraph == nil || !e.topoGraph.HasDependencies() {
+        return nil
+    }
+    if status != "unreachable" {
+        return nil
+    }
+
+    // ── YENİ: gossip-aware merged state ──
+    mergedStates := make(map[string]PersistedState, len(localStates))
+    for id, ps := range localStates {
+        mergedStates[id] = ps
+    }
+    if e.clusterMgr != nil {
+        // Bu target'ın tüm transitif bağımlılıkları için peer state lookup
+        for _, depID := range e.topoGraph.AllDependencyIDs(t.key()) {
+            if _, ok := mergedStates[depID]; ok {
+                continue // local'de var, peer'a bakmaya gerek yok
+            }
+            peers := e.clusterMgr.PeerStatesForTarget(depID)
+            if len(peers) == 0 {
+                continue
+            }
+            // En yüksek seq'li (en taze) peer state'i seç
+            best := peers[0]
+            for _, p := range peers[1:] {
+                if p.Seq > best.Seq || (p.Seq == best.Seq && p.NodeName > best.NodeName) {
+                    best = p
+                }
+            }
+            mergedStates[depID] = PersistedState{
+                State:     best.State,
+                Seq:       best.Seq,
+                ErrorCode: best.ErrorCode,
+            }
+        }
+    }
+
+    rootCause := e.topoGraph.FindRootCause(t.key(), mergedStates)
+    // ... env üret ...
+}
+```
+
+**Yeni eklenecek helper (`topology.go`):**
+
+```go
+// AllDependencyIDs returns all transitive dependencies of targetID (BFS).
+func (g *DependencyGraph) AllDependencyIDs(targetID string) []string {
+    visited := make(map[string]bool)
+    var out []string
+    queue := []string{targetID}
+    for len(queue) > 0 {
+        cur := queue[0]
+        queue = queue[1:]
+        for _, dep := range g.dependsOn[cur] {
+            if visited[dep] {
+                continue
+            }
+            visited[dep] = true
+            out = append(out, dep)
+            queue = append(queue, dep)
+        }
+    }
+    return out
+}
+```
+
+**Test:**
+
+E2E (yeni `tests/domain/crossnode_rootcause_test.go`):
+1. 6 node cluster, factor=2
+2. target-a depends_on target-b
+3. probe_from constraint kullanarak target-a'yı node-1, node-2'ye; target-b'yi node-5, node-6'ya pinle (disjoint set)
+4. Mock server'ları kapat: hem target-a hem target-b down
+5. Alarm yakala
+6. Alarm env'inde ROOT_CAUSE=target-b olmalı
+
+**Tahmini efor:** 2 saat (kod + test + edge case'ler)
+
+**Kabul kriterleri:**
+- [x] Disjoint prober set'leri arasında ROOT_CAUSE doğru çözülür
+- [x] Local state varsa onu tercih eder (peer state'e ihtiyaç yok)
+- [x] Peer state Lamport seq'iyle çakışma çözer (en yüksek seq kazanır, eşitse NodeName lex)
+- [x] HasDependencies()=false olan target'lar için no-op (perf)
+- [x] gemini_thoughts.md'deki Case 3 (zincirleme çöküş) artık 20-node disjoint set'lerde de çalışır
+
+---
+
+### F3 — Maintenance Window (API-Driven)
+
+**Hedef:** Operatör elle config dosyası düzenlemeden, REST API ile belirli target'ları belirli süre için "alarm üretmesi durdurulmuş" duruma getirebilsin. Restart-survivable, gossip-replicated.
+
+**API tasarımı:**
+
+```
+PUT /cluster/maintenance        Authorization: Bearer <admin_token>
+Content-Type: application/json
+Body: {
+  "target_ids": ["db-primary", "api-gateway"],
+  "duration": "2h",                          # Go duration: 30m, 1h30m, 24h
+  "reason": "DB migration v2.3",
+  "started_by": "ops-team"                   # opsiyonel
+}
+
+Response 200:
+{
+  "applied_locally": true,
+  "broadcast_to": ["node-2", ..., "node-20"],
+  "expires_at": "2026-05-16T18:30:00+03:00",
+  "id": "mw-2026-05-16T16:30:00Z-abc1234"    # iptal için
+}
+```
+
+```
+DELETE /cluster/maintenance/{id}    Authorization: Bearer <admin_token>
+
+Response 200: { "cancelled": true }
+```
+
+```
+GET /cluster/maintenance
+
+Response:
+[
+  {
+    "id": "mw-...",
+    "target_ids": ["db-primary"],
+    "started_at": "...",
+    "expires_at": "...",
+    "reason": "...",
+    "started_by": "..."
+  }
+]
+```
+
+**Persistence:**
+
+Yeni dosya: `<state_file_dir>/maintenance.json`
+
+```json
+{
+  "version": 1,
+  "windows": [
+    {
+      "id": "mw-2026-05-16T16:30:00Z-abc1234",
+      "target_ids": ["db-primary", "api-gateway"],
+      "started_at": "2026-05-16T16:30:00Z",
+      "expires_at": "2026-05-16T18:30:00Z",
+      "reason": "DB migration v2.3",
+      "started_by": "ops-team"
+    }
+  ]
+}
+```
+
+**Gossip mesaj tipi:** `msgType: "maintenance"`
+
+```go
+type MaintenanceBroadcast struct {
+    MsgType    string    `json:"msg_type"`   // "maintenance"
+    Action     string    `json:"action"`     // "set" | "cancel"
+    Window     *MaintenanceWindow `json:"window,omitempty"`  // set için
+    CancelID   string    `json:"cancel_id,omitempty"`        // cancel için
+    OriginNode string    `json:"origin_node"`
+    Timestamp  time.Time `json:"timestamp"`
+}
+```
+
+**Engine entegrasyonu:**
+
+Dosya: `internal/engine/maintenance.go` (yeni)
+
+```go
+type MaintenanceWindow struct {
+    ID         string    `json:"id"`
+    TargetIDs  []string  `json:"target_ids"`
+    StartedAt  time.Time `json:"started_at"`
+    ExpiresAt  time.Time `json:"expires_at"`
+    Reason     string    `json:"reason,omitempty"`
+    StartedBy  string    `json:"started_by,omitempty"`
+}
+
+type maintenanceManager struct {
+    mu        sync.RWMutex
+    windows   map[string]MaintenanceWindow      // id → window
+    byTarget  map[string][]string               // target_id → window IDs
+    path      string                            // disk persistence path
+}
+
+func newMaintenanceManager(path string) *maintenanceManager
+func (m *maintenanceManager) IsInMaintenance(targetID string) bool
+func (m *maintenanceManager) Set(window MaintenanceWindow) error  // disk + memory
+func (m *maintenanceManager) Cancel(id string) error
+func (m *maintenanceManager) List() []MaintenanceWindow
+func (m *maintenanceManager) load()  // startup
+func (m *maintenanceManager) save()  // atomic write
+func (m *maintenanceManager) pruneExpired()  // periodic
+```
+
+**shouldAlert() değişikliği:**
+
+```go
+func (e *Engine) shouldAlert(targetID string) bool {
+    // ── YENİ: maintenance check (önce gelir) ──
+    if e.maintMgr != nil && e.maintMgr.IsInMaintenance(targetID) {
+        slog.Debug("alert suppressed: target in maintenance", "target", targetID)
+        return false
+    }
+    // ... mevcut isolation, IsResponsible, min_probe_confirmations checks ...
+}
+```
+
+**Probe loop değişikliği yok:** Probe'lar çalışmaya devam eder. Sadece alert bastırılır. Bu, maintenance bitince state'in doğru olmasını sağlar (eğer hâlâ down ise alarm gider).
+
+**Cron tabanlı (config'de tekrarlayan) maintenance — Faz 2:**
+
+Bu sprint'te değil. Şimdilik sadece **ad-hoc API-driven** maintenance. Cron eklenirse `MaintenanceWindow.Recurring: cron string` opsiyonel alan olur.
+
+**Timezone:**
+
+Yeni Config alanı (SharedConfig'e eklenir, sync olur):
+```yaml
+timezone: "Europe/Istanbul"   # opsiyonel, default = system local
+```
+
+Maintenance API'de `expires_at` her zaman UTC olarak hesaplanır ve döner. UI/CLI gösterimi local timezone'a çevrilir. Ad-hoc maintenance için zone önemsiz (sadece duration); cron eklenince önem kazanır.
+
+**Yeni metrik:**
+
+```
+network_probe_in_maintenance{name="db-primary", target="db:5432", type="tcp"} 1
+network_probe_maintenance_active_count gauge   # toplam aktif window sayısı
+```
+
+**Yeni endpoint'ler (`cmd/linux/main.go` + `cmd/windows/main.go`):**
+
+| Endpoint | Method | Auth | Açıklama |
+|---|---|---|---|
+| `/cluster/maintenance` | GET | optional | Aktif maintenance'ları listele |
+| `/cluster/maintenance` | PUT | required | Yeni maintenance ekle (gossip ile yayar) |
+| `/cluster/maintenance/{id}` | DELETE | required | İptal et (gossip ile yayar) |
+
+**Yeni CLI komutu (opsiyonel ama operatör için kolaylık):**
+
+```bash
+$ netwatch maintenance set --target db-primary --duration 2h --reason "DB migration"
+$ netwatch maintenance list
+$ netwatch maintenance cancel mw-2026-...
+```
+
+Bu CLI komutları curl wrapper'ı — admin token'ı env'den okur.
+
+**Test stratejisi:**
+
+Unit (tests/engine/maintenance_test.go):
+- IsInMaintenance(targetID) → expired window'lar atılır
+- Set() → disk'e yazar, memory'i günceller
+- Cancel() → memory + disk
+- load() restart sonrası state restore
+
+Integration (tests/domain/maintenance_test.go):
+- 3 node cluster, target down
+- PUT /cluster/maintenance ile maintenance girer
+- Hard-down geçişine rağmen alarm gelmez
+- Cancel sonrası bir sonraki probe'da (hâlâ down) alarm gelir
+- Restart node-1 → maintenance persist eder
+
+Gossip propagation test:
+- node-1'e PUT, 3 saniye sonra node-5'in maintenance map'inde de var mı?
+
+**Tahmini efor:** 6-8 saat (kod + test + dokümantasyon)
+
+**Kabul kriterleri:**
+- [x] PUT /cluster/maintenance → alarm bastırılır
+- [x] Gossip ile tüm cluster'a propagate olur (<3s)
+- [x] Restart sonrası maintenance.json'dan restore
+- [x] Süresi dolan window otomatik kaldırılır
+- [x] DELETE /cluster/maintenance/{id} → anında etkili
+- [x] Probe loop çalışmaya devam eder (metric'ler güncellenir)
+- [x] `in_maintenance: true` flag /status'ta görünür
+
+---
+
+### F4 — Soft-Up State (Symmetric Recovery)
+
+**Hedef:** Recovery alarmları flap'leri filtrelesin. Tek başarılı probe yerine N consecutive başarılı probe sonrası "reachable" alarmı atılsın.
+
+**Mevcut state machine:**
+```
+UP → SOFT_DOWN → HARD_DOWN          (asimetrik, sadece down tarafında flap koruma)
+HARD_DOWN → UP                       (tek probe yeterli)
+```
+
+**Yeni state machine:**
+```
+UP → SOFT_DOWN → HARD_DOWN
+HARD_DOWN → SOFT_UP → UP             (yeni: recovery flap koruma)
+SOFT_UP + probe fail → HARD_DOWN     (back-off)
+```
+
+**Yeni config alanı:**
+```yaml
+recovery_probes: 2            # default 1 (backward compat: mevcut davranış)
+# veya target-specific:
+targets:
+  - id: "flap-prone"
+    recovery_probes: 3
+```
+
+SharedConfig'e eklenir, sync olur.
+
+**Engine değişikliği:**
+
+`internal/engine/loop.go` — `runCheck()` içinde recovery path:
+
+```go
+if ok {
+    if !seen {
+        // ... mevcut first-observation logic
+    } else if inPending || !prevUp {
+        // ── YENİ: HARD_DOWN/SOFT_DOWN → recovery
+        // markRecovered() → markRecoveringOrUp() ile değiştir
+        recoveryThreshold := e.effectiveRecoveryProbes(t)
+        if recoveryThreshold > 1 {
+            // soft_up state'inde bir entry oluştur
+            done := e.markSoftUpOrUp(pkey, t, recoveryThreshold)
+            if done {
+                e.sloRecordEnd(t)
+                slog.Info("target fully recovered", ...)
+                if e.shouldAlert(t.key()) {
+                    e.sendAlert(t, "reachable")
+                }
+            }
+        } else {
+            // Backward compat: tek probe yeterli (mevcut davranış)
+            if e.markRecovered(pkey, t) {
+                e.sloRecordEnd(t)
+                if e.shouldAlert(t.key()) {
+                    e.sendAlert(t, "reachable")
+                }
+            }
+        }
+    }
+}
+```
+
+**Yeni state machine sub-component:**
+
+```go
+// PendingRecovery: state machine soft_up tracking
+type pendingRecovery struct {
+    Target       Target
+    SuccessCount int       // ardışık başarı sayısı
+    LastSuccess  time.Time
+}
+
+// markSoftUpOrUp:
+//   - İlk başarılı probe → soft_up (pending recovery'e ekle)
+//   - N-inci ardışık başarı → up (markRecovered → return true)
+//   - Probe fail → pending recovery'den sil (back-off to hard_down)
+```
+
+**state.json değişikliği:**
+
+Yeni state değeri: `"soft_up"` (transient, sadece bilgi amaçlı persist edilir).
+
+```json
+{
+  "version": 2,
+  "targets": {
+    "db": { "state": "soft_up", "seq": 5, ... }
+  }
+}
+```
+
+**Yeni metrik:**
+
+`network_probe_local_status` extension — Şu an 0/1. Soft_up için ara değer? Hayır, metric semantic'ini bozar. **Çözüm:** `local_status` UP=1 DOWN=0 olarak kalır. SOFT_UP için ayrı:
+
+```
+network_probe_local_state{name=...,target=...,type=...,state="up|soft_up|soft_down|hard_down"} 1
+```
+
+State Vec metric: hangi state aktifse 1, diğerleri 0.
+
+**Test stratejisi:**
+
+Unit:
+- recovery_probes=2, hard_down state'inde 1 başarı → soft_up, alarm yok
+- 2 ardışık başarı → up, recovery alarmı 1 kez
+- Soft_up state'inde 1 fail → hard_down, alarm yok (zaten gönderilmişti)
+- recovery_probes=1 (default) → mevcut davranış korunur (backward compat)
+
+Integration:
+- 3 node cluster, recovery_probes=2
+- Target down → hard_down alarmı
+- Target restart, 1 successful probe → no alarm
+- 2. successful probe → recovery alarmı
+
+**Tahmini efor:** 4-5 saat
+
+**Kabul kriterleri:**
+- [x] recovery_probes=1 default'unda mevcut davranış aynen korunur
+- [x] recovery_probes=2 ile flap koruma çalışır (1 başarı yeterli değil)
+- [x] state.json soft_up değerini doğru persist eder
+- [x] Restart sonrası soft_up state'ten resume edebilir
+- [x] Yeni `network_probe_local_state` metrik state Vec olarak çalışır
+- [x] SLO incident kaydı: soft_up gelince incident kapanmaz; up gelince kapanır
+
+---
+
+### F5 — Kubernetes Service Discovery (DETAY — şimdi atlanıyor, sonra için)
+
+**Hedef:** Kubernetes ortamında çalışan netwatch, k8s API'sini izleyerek Service/Pod/Ingress'leri otomatik target olarak ekler. Operatör manuel target listesi yönetmek zorunda kalmaz.
+
+**Önerilen Config:**
+```yaml
+discovery:
+  kubernetes:
+    enabled: true
+    incluster: true                       # pod içindeyse true (ServiceAccount kullanır)
+    kubeconfig: ""                        # cluster dışıysa kubeconfig path
+    namespaces: ["production", "staging"] # boş = tümü
+    label_selector: "netwatch.io/monitor=true"
+    refresh_interval_sec: 30
+    resources: ["service", "pod", "ingress"]  # hangi kaynak tipleri taransın
+```
+
+**Annotation şeması (operatör Service/Pod üzerine koyar):**
+
+```yaml
+# Kubernetes Service örneği
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-api
+  annotations:
+    netwatch.io/monitor: "true"           # bunu izle
+    netwatch.io/type: "http"              # probe tipi
+    netwatch.io/path: "/health"           # HTTP path
+    netwatch.io/expected-status: "200"
+    netwatch.io/expected-body: "ok"
+    netwatch.io/app: "payment-gateway"    # AFFECTED_APPS bağlamı
+    netwatch.io/owner-team: "fintech-sre"
+    netwatch.io/depends-on: "postgres-primary"
+    netwatch.io/probe-interval: "30"
+```
+
+**Mimari:**
+
+Yeni paket: `internal/discovery/kubernetes/`
+
+> **NOT:** CLAUDE.md'nin "yalnızca iki dizin" kuralını bilinçli ihlal ediyoruz. K8s entegrasyonu mantıken kendi dünyası, engine'in bir parçası değil. CLAUDE.md güncellenecek: "k8s eklenirse internal/discovery/kubernetes/ kabul edilir, başka alt-paket eklenemez."
+
+```
+internal/discovery/kubernetes/
+  watcher.go        # Service/Pod/Ingress informer'lar
+  parser.go         # Annotation → engine.Target dönüşümü
+  reconciler.go     # discovered set ↔ engine.Targets diff
+  config.go         # KubernetesConfig struct
+```
+
+**Dependency:**
+- `k8s.io/client-go` — ~80MB transitive
+- `k8s.io/api`
+- `k8s.io/apimachinery`
+
+Binary boyutu artar: ~25-35MB. Bu yüzden:
+
+**Build tag stratejisi:**
+- Default build: k8s olmadan (engine compile time'da hızlı, binary küçük)
+- `make build-k8s` veya `go build -tags k8s` ile özel build
+
+`internal/discovery/kubernetes/watcher.go` üst tarafında:
+```go
+//go:build k8s
+```
+
+Engine içinde `discovery.kubernetes.enabled: true` ama k8s tag yok ise startup hatası: "K8s discovery requires `netwatch-k8s` build. Use plain netwatch with static targets."
+
+**ServiceAccount RBAC (helm chart'a eklenecek):**
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: netwatch-discovery
+rules:
+- apiGroups: [""]
+  resources: ["services", "pods", "endpoints"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["get", "list", "watch"]
+```
+
+**Discovered target lifecycle:**
+
+1. Informer event (Service added) → parser → engine.Target
+2. Engine'in target listesi: `cfg.Targets ∪ discovered`
+3. Discovered target → mevcut hash ring atamasına dahil edilir
+4. Service silindi → discovered set'ten çıkar → probe loop stop
+5. Hot-reload mantığı: 5-10 saniyede bir reconcile
+
+**Risk noktaları:**
+
+| Risk | Çözüm |
+|---|---|
+| Service IP'leri ya da Pod IP'leri? | Service IP'leri (uzun ömürlü). Pod IP'leri opsiyonel (`netwatch.io/probe-pods: "true"`) |
+| Pod create/delete burst — sürekli recompute? | `scheduleRecompute` zaten 5s debounce. Burst güvenli. |
+| Manuel target + discovered çakışması (aynı ID)? | Discovered target ID prefix: `k8s-` (örn. `k8s-payment-api.production`) |
+| Annotation parsing hataları? | Per-target try/catch + warning log; geçersiz target skip |
+| K8s API rate limit? | client-go zaten exponential backoff yapar |
+| ServiceAccount yoksa? | `discovery.kubernetes.incluster: true` ama SA bulunamaz → fatal startup error |
+
+**Test stratejisi:**
+
+- `k8s.io/client-go/kubernetes/fake` ile mock client
+- Service ekle → discovered target oluşmalı
+- Service annotation güncelle → target güncellensin
+- Service sil → target kaybolsun
+- Helm chart için integration test (kind cluster)
+
+**Tahmini efor:** 3-4 gün (kod + test + helm chart + CI)
+
+**Bu sprint'te yapılmıyor.** F1-F4 bitince ayrı bir sprint olarak ele alınır.
+
+---
+
+### F6 — Process-Level Auto Discovery (REDDEDİLDİ — eski APM scope'u)
+
+Kullanıcı önerisi: Subnet tarama → SSH/agent → Java bytecode injection → outbound socket izleme → 24h sonra target öner.
+
+**Karar:** Bu netwatch'ın kapsamı dışındadır. Datadog/New Relic/OpenTelemetry alanı.
+
+**Gelecekte düşünülebilecek alternatif:** Passive network discovery (nmap-style) ile açık port tespiti, common service signature'larıyla target önerisi. Bu bile **opsiyonel ayrı paket** olur, ana ürüne dahil edilmez.
+
+**Bu sprint'te yapılmıyor. Tartışma sonrası ayrıca değerlendirilir.**
+
+---
+
+### Sprint Sıralama ve Bağımlılık
+
+```
+F1 (stagger) → bağımsız, hemen yapılabilir
+F2 (cross-node depends_on) → bağımsız, F1'den sonra
+F3 (maintenance) → bağımsız, F4'le birleştirilebilir  
+F4 (soft_up) → bağımsız, F3'le birleştirilebilir
+F5 (k8s SD) → ayrı sprint, sonra
+F6 (process discovery) → tartışılacak, şimdilik out of scope
+```
+
+**Önerilen iş akışı:**
+1. F1 → smoke test → kullanıcı onayı → commit + push
+2. F2 → ROOT_CAUSE fix → 20-node E2E ile doğrula → kullanıcı onayı → commit
+3. F3 → maintenance feature full + tests → kullanıcı onayı → commit
+4. F4 → soft_up state machine → kullanıcı onayı → commit
+5. (yeni sprint) F5 → k8s SD
+
+**Her aşama sonu:**
+- `go build ./internal/engine/ ./internal/cluster/ ./cmd/linux/`
+- `go test -race -count=1 ./internal/... ./tests/...`
+- Manual smoke test
+- Docs güncelle (GUIDE.md, GUIDE_EN.md, CLAUDE.md, system_map.md, developments.md)
+
+---
+
+---
+
 ## Aşama Bağımlılık Grafiği
 
 ```

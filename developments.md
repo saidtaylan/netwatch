@@ -16,6 +16,21 @@ Bu belge, netwatch projesinin günlük güncellemelerini ve teknik detaylarını
 
 ---
 
+## Planlanan (Aktif Sprint — 2026-05-16 onaylı, implementasyon kullanıcı onayını bekliyor)
+
+> Detaylı tasarım → `sprint.md` → "Aktif Sprint" bölümü.
+
+- **F1 — Probe Interval Staggering**: Aynı target'ı izleyen N node, probe'larını `probe_interval / N` offset ile dağıtacak. Burst yerine düz yük + daha hızlı mean detection latency.
+- **F2 — Multi-Node depends_on / ROOT_CAUSE Cross-Node Lookup Fix** (GERÇEK BUG): Disjoint prober set'lerinde ROOT_CAUSE çözümü çalışmıyor (local lastKnown'a bakıyor, peer state'i atlıyor). Fix: `rootCauseEnv()` peer gossip state'ini de birleştirecek.
+- **F3 — Maintenance Window (API-driven)**: `PUT /cluster/maintenance` ile target'lar geçici alarm bastırma. RAM + `maintenance.json` persistence + gossip propagation. Cron-based recurring opsiyonu Faz 2'de.
+- **F4 — Soft-Up State (Symmetric Recovery)**: `recovery_probes: N` config. HARD_DOWN → SOFT_UP → UP transition'ı ile flap-resilient recovery. Default N=1 (mevcut davranış).
+- **F5 — Kubernetes Service Discovery**: Atlandı, ayrı sprint'e bırakıldı. Detay `sprint.md`'de.
+- **F6 — Process-Level Auto Discovery**: Reddedildi (APM scope'u, OpenTelemetry/Datadog alanı).
+
+Sıralama: F1 → F2 → F3 → F4. F3 ve F4 birlikte ele alınabilir (state machine ve maintenance birbirini tamamlar). Her aşama sonunda kullanıcı onayı.
+
+---
+
 ## 2026-05-14
 
 - [backend] [dokuman] **CLI join workflow — `netwatch init --cluster`, `netwatch join`, `netwatch keyring generate` + startup banner.**
