@@ -34,7 +34,69 @@ Bu dosya aktif geliştirme planını içerir. Tamamlananlar → **developments.m
 
 ---
 
-### 🔄 S1 — [frontend] Nuxt 3 İskelet
+### ✅ S1 — [frontend] Nuxt 3 İskelet (Tamamlandı 2026-05-20)
+
+- Nuxt 4.4.6 + Tailwind v3 + Pinia + pinia-plugin-persistedstate + vue-chartjs + heroicons kuruldu
+- Tüm klasör yapısı oluşturuldu: `app/pages/`, `components/`, `composables/`, `stores/`, `layouts/`, `middleware/`
+- `types/api.ts`: Backend response TS tipleri (B1-B11 için genişlemeye hazır)
+- Stores: auth, nodes (localStorage persist), ui, alerts (in-memory ring buffer)
+- Layouts: default (sidebar+topbar), auth (centered card)
+- Components: Sidebar (B1/Audit "soon"), StatusBadge, SeverityBadge (B2 ready), ConnectionStatus, Toast, ConfirmDialog
+- Pages: setup (multi-node form), index (cluster overview)
+- Backend: `/auth/whoami`, `/version`, CORS middleware, `AdminConfig.CORSOrigin`
+- `pnpm build` → `.output/` clean ✓
+
+---
+
+### ✅ S2 — [frontend] Auth + Node Connection (Tamamlandı 2026-05-20)
+
+- **67 unit test** — format, classifyState, auth/nodes/alerts/ui stores, useNodeConnection composable; tümü yeşil
+- Auth sadeleştirildi: single-admin-token, self-hosted model. `/login` → `/setup` yönlendirmesi. Gelecekte LDAP için genişletilebilir
+- `useApi`: Bearer inject, 401 auto-logout, network error → failover + 1 retry
+- `usePolling`: visibilitychange aware, global polling interval
+- Global middleware: `auth.global.ts`, `node-health.global.ts`
+
+---
+
+### ✅ S3 — [frontend] Tüm Sayfalar (Tamamlandı 2026-05-20)
+
+Cluster + Targets + SLO + Maintenance + Alerts + Settings + Config + Geo + Placeholder sayfalar (Silences, Audit).
+Detay: `developments.md` 2026-05-20.
+
+---
+
+### ✅ S4 — [frontend] Target Detail + Topology (Tamamlandı 2026-05-20)
+
+Target `[id]` sayfası: scope/classification, by-node breakdown, dependency chips, prober assignment, geo latency.
+Topology sayfası: root/bağımlı ayrımı, depends_on + cascading tablo. Graph visualizasyon sonraki sprint.
+Detay: `developments.md` 2026-05-20.
+
+---
+
+### S5 — [frontend] Maintenance CRUD (S3'te tamamlandı) → Polish + Production-Hardening
+
+**Durum:** S3-S4 kapsamında temel sayfalar tamamlandı. Kalan iş:
+- Loading skeleton animasyonları (tüm sayfalara)
+- Error boundary + retry butonu
+- a11y: focus ring, keyboard nav, ARIA labels
+- `pnpm build` clean output doğrulama (zaten geçiyor)
+- `deploy-systemd/` dizini: `netwatch.target`, `netwatch-backend.service`, `netwatch-frontend.service`
+
+### S6 — [frontend] Config Management (S3'te tamamlandı)
+
+Push config + keyring rotate sayfaları S3'te yapıldı. Kalan: smoke test gerçek backend ile.
+
+### S7 — [frontend] Production-Hardening + Deployment (Bekliyor)
+
+- systemd target dosyaları
+- Top-level README "Deployment" bölümü
+- `pnpm build` CI gate
+
+### S8 — [frontend] Tests (Bekliyor)
+
+67 unit test mevcut. Kalan:
+- Playwright e2e: login akışı, targets list render, maintenance create/delete
+- `Makefile` `frontend-test` target'ı
 
 **Hedef:** `pnpm dev` ile boş ama navigasyonlu uygulama açılsın.
 

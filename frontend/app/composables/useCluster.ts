@@ -1,4 +1,4 @@
-import type { ClusterState, ConfigSyncSnapshot } from '../../types/api'
+import type { ClusterState, ConfigSyncSnapshot } from '~/types/api'
 
 export const useCluster = () => {
   const api = useApi()

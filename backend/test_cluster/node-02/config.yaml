@@ -1,124 +1,83 @@
-{
-  "port": "40002",
-  "state_file": "test_cluster/node-02/state.json",
-  "timeout": 2,
-  "max_retries": 1,
-  "retry_interval_sec": 5,
-  "probe_interval_sec": 10,
-  "reload_interval_sec": 5,
-  "admin": {
-    "token": "test_token"
-  },
-  "notifications": {
-    "webhook-alert": {
-      "type": "webhook",
-      "parameters": {
-        "url": "http://127.0.0.1:9999/webhook"
-      }
-    }
-  },
-  "default_notify": [
-    "webhook-alert"
-  ],
-  "cluster": {
-    "enabled": true,
-    "node_name": "node-02",
-    "bind_port": 50002,
-    "peers": [
-      "127.0.0.1:50001"
-    ],
-    "keyring": [
-      "N9VySoOC7n3BJW3Y2dXeMW5SZM5o0vEtzA4sOkSZ+Ok="
-    ],
-    "expected_node_count": 20,
-    "min_quorum_ratio": 0.5,
-    "probe_replication_factor": 3,
-    "region": "eu-central"
-  },
-  "targets": [
-    {
-      "id": "db-primary",
-      "name": "Primary Database",
-      "type": "http",
-      "target": "http://127.0.0.1:9999/db-primary",
-      "options": {
-        "expected_status": {
-          "in": [
-            200
-          ]
-        }
-      }
-    },
-    {
-      "id": "api-gateway",
-      "name": "API Gateway",
-      "type": "http",
-      "target": "http://127.0.0.1:9999/api-gateway",
-      "depends_on": [
-        "db-primary"
-      ],
-      "options": {
-        "expected_status": {
-          "in": [
-            200
-          ]
-        }
-      }
-    },
-    {
-      "id": "checkout",
-      "name": "Checkout Service",
-      "type": "http",
-      "target": "http://127.0.0.1:9999/checkout",
-      "depends_on": [
-        "api-gateway"
-      ],
-      "options": {
-        "expected_status": {
-          "in": [
-            200
-          ]
-        }
-      }
-    },
-    {
-      "id": "standalone-target",
-      "name": "Standalone Target",
-      "type": "http",
-      "target": "http://127.0.0.1:9999/standalone-target",
-      "probe_from": [
-        "node-10",
-        "node-11"
-      ],
-      "options": {
-        "expected_status": {
-          "in": [
-            200
-          ]
-        }
-      }
-    }
-  ],
-  "apps": [
-    {
-      "name": "payment-gateway",
-      "owner_team": "fintech-sre",
-      "uses": [
-        "db-primary",
-        "api-gateway",
-        "checkout"
-      ]
-    }
-  ],
-  "slo": {
-    "enabled": true,
-    "retention_days": 90,
-    "targets": [
-      {
-        "id": "db-primary",
-        "target_uptime": 0.99,
-        "window": "24h"
-      }
-    ]
-  }
-}
+admin:
+  token: test_token
+apps:
+- name: payment-gateway
+  owner_team: fintech-sre
+  uses:
+  - db-primary
+  - api-gateway
+  - checkout
+cluster:
+  bind_port: 50002
+  enabled: true
+  expected_node_count: 20
+  keyring:
+  - N9VySoOC7n3BJW3Y2dXeMW5SZM5o0vEtzA4sOkSZ+Ok=
+  min_quorum_ratio: 0.5
+  node_name: node-02
+  peers:
+  - 127.0.0.1:50001
+  probe_replication_factor: 3
+  region: eu-central
+default_notify:
+- webhook-alert
+max_retries: 1
+notifications:
+  webhook-alert:
+    parameters:
+      url: http://127.0.0.1:9999/webhook
+    type: webhook
+port: "40002"
+probe_interval_sec: 10
+recovery_probes: 3
+reload_interval_sec: 5
+retry_interval_sec: 5
+slo:
+  enabled: true
+  retention_days: 90
+  targets:
+  - id: db-primary
+    target_uptime: 0.99
+    window: 24h
+state_file: node-02/state.json
+targets:
+- id: db-primary
+  name: Primary Database
+  options:
+    expected_status:
+      in:
+      - 200
+  target: http://127.0.0.1:9999/db-primary
+  type: http
+- depends_on:
+  - db-primary
+  id: api-gateway
+  name: API Gateway
+  options:
+    expected_status:
+      in:
+      - 200
+  target: http://127.0.0.1:9999/api-gateway
+  type: http
+- depends_on:
+  - api-gateway
+  id: checkout
+  name: Checkout Service
+  options:
+    expected_status:
+      in:
+      - 200
+  target: http://127.0.0.1:9999/checkout
+  type: http
+- id: standalone-target
+  name: Standalone Target
+  options:
+    expected_status:
+      in:
+      - 200
+  probe_from:
+  - node-10
+  - node-11
+  target: http://127.0.0.1:9999/standalone-target
+  type: http
+timeout: 2

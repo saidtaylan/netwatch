@@ -1,5 +1,5 @@
-import type { FleetSnapshot, FleetTarget } from '../../types/api'
-import type { AlertEntry } from '../../types/api'
+import type { FleetSnapshot, FleetTarget } from '~/types/api'
+import type { AlertEntry } from '~/types/api'
 
 export const useFleet = () => {
   const api    = useApi()

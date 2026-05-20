@@ -87,19 +87,83 @@ backend/
   deploy/netwatch.service, helm/, notifications/
 ```
 
-### Frontend Dosya Yapısı (`frontend/`) — Sprint 1'den itibaren doluyor
+### Frontend Dosya Yapısı (`frontend/`) — Sprint 1-4 tamamlandı
 
 ```
 frontend/
-  nuxt.config.ts       # ssr:false, runtimeConfig
-  pages/               # File-based routing (tüm sayfalar)
-  components/          # common/ cluster/ targets/ topology/ slo/ maintenance/ config/
-  composables/         # useApi, useAuth, useNodeConnection, usePolling, …
-  stores/              # auth, nodes (persisted), ui, alerts
-  middleware/          # auth.global, node-health.global
-  types/api.ts         # Backend response TS tipleri
-  utils/               # format, classifyState, matchers
+  nuxt.config.ts       # ssr:false, runtimeConfig (NUXT_PUBLIC_DEFAULT_BACKEND_URL)
+  tailwind.config.ts   # status/scope renkler, dark mode
+  vitest.config.ts     # @nuxt/test-utils env, 67 unit test
+  tests/
+    unit/utils/        # format.test.ts, classifyState.test.ts
+    unit/stores/       # auth, nodes, alerts, ui
+    unit/composables/  # useNodeConnection
+    setup.ts           # $fetch + navigateTo global stubs
+
+  app/
+    app.vue            # NuxtLayout + NuxtPage
+    layouts/
+      default.vue      # Sidebar + TopBar + Toast
+      auth.vue         # Centered card (setup)
+    pages/
+      index.vue        # Cluster overview (quorum, drift, down targets, members)
+      setup.vue        # Multi-node URL + token form → connect
+      login.vue        # Redirect → /setup (single-user app)
+      targets/
+        index.vue      # Target list: search, status/type filter, TargetRow table
+        [id].vue       # Target detail: scope, by-node, deps, probers, geo
+      topology.vue     # Root/dependent + full table; graph visualizasyon bekliyor
+      slo.vue          # SLO per-target: uptime/budget/incidents; 503 = disabled
+      apps.vue         # App → target grouping, down badge
+      alerts.vue       # In-memory ring buffer + B5 Ack placeholder
+      maintenance.vue  # Window CRUD (create/cancel), gossip-replicated
+      geo.vue          # Per-target/per-node latency + anomaly
+      silences.vue     # B1 placeholder "Coming Soon"
+      audit.vue        # B7 placeholder "Coming Soon"
+      config/
+        index.vue      # Config drift view + sync now
+        push.vue       # PUT /cluster/config form
+        keyring.vue    # Keyring add/use/remove + rotation steps
+      settings/
+        index.vue      # Polling interval, theme, disconnect
+        nodes.vue      # Backend node CRUD (test/use/remove)
+    components/
+      common/          # StatusBadge, SeverityBadge (B2 ready), ConnectionStatus,
+                       # Toast, EmptyState, ConfirmDialog, Sidebar, TopBar
+      cluster/         # NodeCard, QuorumIndicator, ConfigDriftCard
+      targets/         # TargetRow, ByNodeBreakdown, ScopeClassificationCard,
+                       # DependencyChip
+    composables/
+      useApi.ts        # Bearer inject, 401 → logout, failover retry
+      useAuth.ts       # Single-token auth (self-hosted), checkToken → /auth/whoami
+      useNodeConnection.ts  # Promise.any race, ensureActive, seedFromEnv
+      usePolling.ts    # Visibility-aware interval fetcher
+      useCluster.ts    # /cluster/state + /cluster/config polling
+      useFleet.ts      # /fleet/status + state-change → alerts store
+      useMaintenance.ts # GET/PUT/DELETE /cluster/maintenance
+      useTopology.ts   # /topology polling
+      useGeoLatency.ts # /geo/latency/{id} polling
+      useSLO.ts        # /slo polling
+    stores/
+      auth.ts          # token, role — persisted
+      nodes.ts         # configured[], active, health — persisted
+      ui.ts            # pollingIntervalMs, sidebarCollapsed, toasts (partial persist)
+      alerts.ts        # in-memory ring buffer cap=100
+    middleware/
+      auth.global.ts   # Token yoksa → /setup
+      node-health.global.ts  # No nodes → /setup; null active → race
+    types/api.ts       # Backend response TS tipleri (B1-B11 için hazır alanlar dahil)
+    utils/
+      format.ts        # fmtDurationSec, fmtPercent, fmtLatency, capitalize, fmtRelative
+      classifyState.ts # stateStyle, isDown, SCOPE_STYLE, CLASS_STYLE
+    plugins/
+      pinia-persist.client.ts  # localStorage persistence
+    assets/css/main.css        # Tailwind directives + scrollbar + page transitions
 ```
+
+**Auth modeli:** Single admin token (config.yaml `admin.token`). Token → `/auth/whoami` ile verify. Self-hosted, SaaS değil. İleride LDAP eklenirse `WhoAmIResponse.role` genişletilir.
+
+**Multi-node failover:** `stores/nodes.ts` birden fazla URL tutar. `useNodeConnection.selectActiveNode()` → `Promise.any($fetch /health)` ile en hızlı yanıt veren. Active node down → `markUnhealthy` + failover.
 
 ## Yol Haritası
 
@@ -119,16 +183,13 @@ frontend/
 | Sprint | Kapsam | Durum |
 |--------|--------|-------|
 | S0 | Repo reorganizasyonu (backend/ split) | ✅ Tamamlandı |
-| S1 | Nuxt 3 iskelet, layout, routing | 🔄 Sonraki |
-| S2 | Auth + multi-node connection | ⏳ Bekliyor |
-| S3 | Cluster overview + targets list | ⏳ Bekliyor |
-| S4 | Target detail + topology | ⏳ Bekliyor |
-| S5 | SLO + apps + geo latency | ⏳ Bekliyor |
-| S6 | Maintenance CRUD (yazma) | ⏳ Bekliyor |
-| S7 | Config management (push + keyring) | ⏳ Bekliyor |
-| S8 | Alerts feed + settings + polish | ⏳ Bekliyor |
-| S9 | Production-hardening + systemd target | ⏳ Bekliyor |
-| S10 | Tests (Vitest + Playwright) | ⏳ Bekliyor |
+| S1 | Nuxt 3 iskelet, layout, routing, backend endpoints | ✅ Tamamlandı |
+| S2 | Auth (single-token) + multi-node connection + 67 unit test | ✅ Tamamlandı |
+| S3 | Tüm sayfalar: targets, slo, maintenance, alerts, config, geo, placeholders | ✅ Tamamlandı |
+| S4 | Target detail + topology | ✅ Tamamlandı |
+| S5 | Polish: loading skeletons, error bounds, a11y | 🔄 Sonraki |
+| S6 | Production-hardening + systemd target | ⏳ Bekliyor |
+| S7 | Playwright e2e tests | ⏳ Bekliyor |
 
 ### Backend Backlog (B-items) — UI sonrası
 

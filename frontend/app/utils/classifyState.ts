@@ -1,4 +1,4 @@
-import type { TargetState, Scope, Classification } from '../../types/api'
+import type { TargetState, Scope, Classification } from '~/types/api'
 
 export interface StateStyle {
   color:   string   // Tailwind text color class

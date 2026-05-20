@@ -1,7 +1,11 @@
+/**
+ * auth.global — Redirect unauthenticated users to /setup.
+ *
+ * Single-token self-hosted app: no login page separate from setup.
+ * /setup handles both first-time connection and re-authentication.
+ */
 export default defineNuxtRouteMiddleware((to) => {
-  // Skip auth check on setup/login pages
-  const publicRoutes = ['/setup', '/login']
-  if (publicRoutes.includes(to.path)) return
+  if (to.path === '/setup') return
 
   const auth = useAuthStore()
   if (!auth.isAuthenticated) {

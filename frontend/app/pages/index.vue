@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { TargetCounts } from '../../types/api'
+import type { TargetCounts } from '~/types/api'
 import { fmtRelative } from '../utils/format'
 
 const api = useApi()

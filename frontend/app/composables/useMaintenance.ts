@@ -1,4 +1,4 @@
-import type { MaintenanceWindow } from '../../types/api'
+import type { MaintenanceWindow } from '~/types/api'
 
 export const useMaintenance = () => {
   const api = useApi()

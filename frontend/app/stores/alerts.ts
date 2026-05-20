@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import type { AlertEntry } from '../../types/api'
+import type { AlertEntry } from '~/types/api'
 
 const MAX_ALERTS = 100
 

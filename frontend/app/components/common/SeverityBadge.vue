@@ -1,6 +1,6 @@
 <!-- B2 — ready for when backend adds severity field -->
 <script setup lang="ts">
-import type { Severity } from '../../../types/api'
+import type { Severity } from '~/types/api'
 
 const props = defineProps<{ severity?: Severity }>()
 

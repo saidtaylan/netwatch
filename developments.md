@@ -16,6 +16,56 @@ Bu belge, netwatch projesinin günlük güncellemelerini ve teknik detaylarını
 
 ---
 
+## 2026-05-20 (devam — frontend Sprint 1-4 + testler)
+
+- [frontend] **Unit test altyapısı kuruldu (Sprint 1 sonrası)**
+
+  Vitest 4.1.6 + `@nuxt/test-utils` + `@vue/test-utils` + `happy-dom` + `@vitest/coverage-v8` kuruldu. `@nuxt/test-utils/config` ile Nuxt auto-import desteği sağlandı — Pinia store'ları ve composable'lar gerçek Nuxt ortamında test ediliyor.
+
+  - `tests/unit/utils/format.test.ts` — 9 test: `fmtDurationSec`, `fmtPercent`, `fmtLatency`, `capitalize`
+  - `tests/unit/utils/classifyState.test.ts` — 14 test: `stateStyle` (fallback dahil), `isDown`, tüm SCOPE_STYLE ve CLASS_STYLE kayıtları
+  - `tests/unit/stores/auth.test.ts` — 5 test: login, logout, isAdmin, default role
+  - `tests/unit/stores/nodes.test.ts` — 11 test: add, deduplicate, normalize URL, setActive, markHealthy/Unhealthy, failover, removeNode, reset
+  - `tests/unit/stores/alerts.test.ts` — 11 test: push, dedup by (target_id, seq), FIFO ring buffer cap=100, ack, mute, unresolvedCount, clear, recent
+  - `tests/unit/stores/ui.test.ts` — 7 test: polling clamp, sidebarToggle, toast auto-remove, removeToast
+  - `tests/unit/composables/useNodeConnection.test.ts` — 8 test: selectActiveNode (no nodes, single, multi-fallback), markUnhealthy, ensureActive (cache hit, null active), seedFromEnv
+  - **Toplam: 67 test, 7 dosya, tümü -race ile yeşil**
+
+- [frontend] **Auth sadeleştirildi (Sprint 2)**
+
+  Self-hosted single-admin-token modeli. `useAuth.ts` yorumuna "SaaS değil" notu eklendi. `/login` sayfası `/setup`'a yönlendiriyor — tek giriş noktası. `auth.global.ts` logout → `/setup` (login sayfası ortadan kalktı). Token yoksa `/setup`'a yönlendir. Gelecekte LDAP entegrasyonu için `WhoAmIResponse.role` genişletilebilir.
+
+- [frontend] **Sprint 2 — Node Connection tamamlandı**
+
+  `useNodeConnection` (Promise.any race, failover, seedFromEnv), `useApi` (Bearer inject, 401 auto-logout, failover retry), `usePolling` (visibilitychange, global interval), middleware'lar tüm testlerden geçiyor.
+
+- [frontend] **Sprint 3 — Tüm sayfa ve component'ler**
+
+  - `pages/targets/index.vue` — Arama + status/type filtresi + tablo; `TargetRow.vue` ile state renk, scope, classification, app
+  - `pages/apps.vue` — App → target gruplaması, down sayacı
+  - `pages/slo.vue` — target_uptime/actual_uptime/error_budget/incident listesi; 503 → "disabled" mesajı
+  - `pages/maintenance.vue` — Aktif window listesi, form (targetId/duration/reason), cancel (ConfirmDialog), gossip-replicated
+  - `pages/alerts.vue` — In-memory ring buffer (state change detection), B5 Ack placeholder
+  - `pages/settings/index.vue` — Polling interval, dark mode, session (disconnect)
+  - `pages/settings/nodes.vue` — Node listesi CRUD, test/use/remove butonları
+  - `pages/config/index.vue` — Config drift view, sync now butonu
+  - `pages/config/push.vue` — SharedConfig form, PUT /cluster/config, push result
+  - `pages/config/keyring.vue` — Add/Use/Remove key; sıfır-kesinti rotasyon talimatları
+  - `pages/geo.vue` — Per-target/per-node latency, anomaly highlight
+  - `pages/silences.vue` + `pages/audit.vue` — B1/B7 placeholder "Coming Soon"
+  - `components/cluster/` — NodeCard, QuorumIndicator (isolated/quorum/standalone), ConfigDriftCard
+  - `composables/` — useCluster, useFleet (alert change detection), useMaintenance (create/cancel), useTopology, useGeoLatency, useSLO
+
+- [frontend] **Sprint 4 — Target detail + Topology**
+
+  - `pages/targets/[id].vue` — Header (state/scope/classification), ScopeClassificationCard (down/up nodes), ByNodeBreakdown tablosu, DependencyChip (root_cause/deps/impact), ProberAssignment listesi, GeoLatency per-node tablo
+  - `pages/topology.vue` — Root/bağımsız target'lar, bağımlı target'lar, tam tablo (depends_on + cascading); graph visualizasyon sprint'e bırakıldı
+  - `components/targets/` — ByNodeBreakdown, ScopeClassificationCard, DependencyChip
+  - `pnpm build` → clean `.output/` (1.8 MB) ✓
+  - Backend: `GET /auth/whoami`, `GET /version`, CORS middleware, `AdminConfig.CORSOrigin` — build + 202 test ✓
+
+---
+
 ## 2026-05-20 (devam — frontend hazırlık)
 
 - [refactor] **Sprint 0 — Repo Reorganizasyonu (frontend/backend split)**

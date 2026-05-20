@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { TargetState } from '../../../types/api'
+import type { TargetState } from '~/types/api'
 import { stateStyle } from '../../utils/classifyState'
 
 const props = defineProps<{ state: TargetState; size?: 'sm' | 'md' }>()
