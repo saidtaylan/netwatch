@@ -1,10 +1,292 @@
-# netwatch Sprint — Bekleyen Aşamalar
+# netwatch Sprint — Aktif ve Bekleyen Aşamalar
 
 Bu dosya aktif geliştirme planını içerir. Tamamlananlar → **developments.md**. Mimari kararlar → **CLAUDE.md**.
 
+**Etiketler:** `[backend]` `[frontend]` — her başlıkta hangi bileşeni etkilediği belirtilir.
+
 ---
 
-## ✅ Sprint Tamamlandı — Production Quality Features (F1-F4)
+## 🔄 Aktif Sprint — [frontend] Nuxt 3 UI
+
+**Başlangıç:** 2026-05-20
+**Hedef:** Tüm backend endpoint'lerini kapsayan, production'a hazır admin UI
+
+### Genel Kararlar (Önceki session'da alındı)
+
+| Konu | Karar |
+|---|---|
+| Framework | Nuxt 3 (SPA, `ssr:false`) + Tailwind CSS + Pinia |
+| Deployment | Standalone servis (backend'den ayrı), systemd target ile birlikte başlatılır |
+| Auth | Kibana benzeri — ilk açılışta backend URL + admin token istenir; localStorage'a yazılır |
+| Node conn. | Birden fazla backend URL girilebilir; en hızlı cevap verene bağlanır, failover otomatik |
+| Repo yapısı | `backend/` + `frontend/` — tek git repo, paylaşılan changelog/sprint/docs |
+
+**Detaylı mimari plan:** `frontend-plan.md`
+
+---
+
+### ✅ S0 — Repo Reorganizasyonu (Tamamlandı 2026-05-20)
+
+- Go kodu `backend/` dizinine `git mv` ile taşındı
+- `.gitignore` frontend entries eklendi
+- `CLAUDE.md`, `developments.md`, `system_map.md` güncellendi
+- `backend/` altında `go test -race` 202 test yeşil ✓
+
+---
+
+### 🔄 S1 — [frontend] Nuxt 3 İskelet
+
+**Hedef:** `pnpm dev` ile boş ama navigasyonlu uygulama açılsın.
+
+**Görevler:**
+1. `npx nuxi@latest init frontend` — proje oluştur
+2. `pnpm add -D @nuxtjs/tailwindcss @nuxtjs/color-mode`
+3. `pnpm add @pinia/nuxt pinia-plugin-persistedstate`
+4. `pnpm add date-fns @heroicons/vue chart.js vue-chartjs`
+5. `nuxt.config.ts` ayarları:
+   - `ssr: false`
+   - `modules: ['@nuxtjs/tailwindcss', '@pinia/nuxt', '@nuxtjs/color-mode']`
+   - `runtimeConfig.public.defaultBackendUrl: ''` (env: `NUXT_PUBLIC_DEFAULT_BACKEND_URL`)
+6. `layouts/default.vue` — Sidebar + Topbar + `<slot />`
+7. `layouts/auth.vue` — Minimal, centered card layout
+8. `components/common/Sidebar.vue` — Tüm route'lara nav linkleri (disabled badge ile B1/Silences, Audit dahil)
+9. `components/common/TopBar.vue` — Backend bağlantı durumu chip'i, dark mode toggle
+10. `components/common/ConnectionStatus.vue` — healthy / failover / disconnected
+11. `components/common/StatusBadge.vue` — UP/DOWN/SOFT_DOWN/SOFT_UP renkli
+12. `components/common/SeverityBadge.vue` — critical/warning/info (B2 için şimdiden hazır)
+13. `pages/index.vue` — placeholder "connecting..."
+14. `pages/setup.vue` — layout: auth
+15. Tailwind tema renkleri konfigürasyonu
+
+**Backend değişikliği (S1 içinde):**
+- `GET /auth/whoami` endpoint'i ekle (`cmd/linux/main.go`): token varsa ve doğruysa `{"role":"admin"}`, token yoksa `{"role":"anonymous"}`, token yanlışsa 401
+- CORS header'ı ekle: `Access-Control-Allow-Origin`, `Access-Control-Allow-Headers` — config'den `cors_origins` listesi (default `*`)
+- `GET /version` endpoint'i: `{"version":"dev","build_time":"..."}` (basit)
+
+**Kabul kriterleri:**
+- `pnpm dev` → `localhost:3000` açılır, sidebar görünür
+- Tüm nav linkleri var (bazıları disabled)
+- Dark mode toggle çalışır
+- Backend endpoint'leri (`/auth/whoami`, `/version`, CORS) yanıt verir
+
+---
+
+### S2 — [frontend] Auth + Node Connection
+
+**Görevler:**
+1. `stores/auth.ts` (Pinia persisted) — token, isAuthenticated
+2. `stores/nodes.ts` (Pinia persisted) — configured[], active, health map
+3. `composables/useApi.ts` — `$fetch` wrapper: token inject, 401 handler, base URL from active node
+4. `composables/useAuth.ts` — login(), logout(), checkToken()
+5. `composables/useNodeConnection.ts` — `selectActiveNode()` (Promise.any race), `failover()`, `markUnhealthy()`
+6. `middleware/auth.global.ts` — token yoksa `/setup`'a yönlendir
+7. `middleware/node-health.global.ts` — her route geçişinde active node sağlığını kontrol et
+8. `pages/setup.vue` — form: node URL(lar), admin token, "Connect" butonu → healthcheck race → token check → localStorage → `/`
+9. `pages/login.vue` — token re-entry (logout sonrası)
+10. `composables/usePolling.ts` — `useIntervalFn`-benzeri; `visibilitychange` aware
+
+**Kabul kriterleri:**
+- Token yokken `/` → `/setup`'a yönlendirilir
+- Setup formunda birden fazla node URL'si girilebilir
+- Connect → en hızlı node seçilir, token check yapılır, başarılıysa anasayfaya geçilir
+- Logout → token silinir, `/login`'e gider
+- Active node down → otomatik failover, ConnectionStatus güncellenir
+
+---
+
+### S3 — [frontend] Cluster Overview + Targets List
+
+**Görevler:**
+1. `composables/useCluster.ts` — `GET /cluster/state` + `GET /cluster/config` polling 5s
+2. `composables/useFleet.ts` — `GET /fleet/status` polling 5s
+3. `pages/index.vue` — Cluster overview:
+   - Node listesi (name, zone, status, gossip address)
+   - Quorum indicator (yeşil/kırmızı)
+   - Isolated flag, config drift badge
+   - Target özet sayacı: X up, Y down, Z unknown
+   - Son down target'lar listesi (cap: 5)
+4. `pages/targets/index.vue` — Target list:
+   - Tablo: name, type, status, scope, classification, confidence, affected apps
+   - Filtre: status (all/up/down), scope, search by name
+   - Satıra tıklayınca `/targets/[id]` geçişi
+5. `components/cluster/NodeCard.vue`, `QuorumIndicator.vue`, `ConfigDriftCard.vue`
+6. `components/targets/TargetRow.vue`, `ScopeClassificationCard.vue`
+
+**Kabul kriterleri:**
+- Çalışan backend'e bağlıyken target listesi görünür
+- Status renkleri doğru (UP=yeşil, DOWN=kırmızı, SOFT_DOWN=turuncu)
+- Scope/Classification gösteriliyor
+- 5s polling çalışıyor (tab hidden iken durur)
+
+---
+
+### S4 — [frontend] Target Detail + Topology
+
+**Görevler:**
+1. `pages/targets/[id].vue`:
+   - Header: name, type, target address, current state, seq
+   - `GET /fleet/status` → by_node breakdown tablosu
+   - Classification + confidence + scope
+   - Dependency: depends_on listesi (root cause chip'i, cascading impact chip'i)
+   - Prober assignment: `GET /cluster/probers` → bu target için hangi node'lar probe ediyor
+   - `GET /geo/latency/{id}` → per-node latency tablosu, anomaly highlight
+2. `pages/topology.vue`:
+   - `GET /topology` → her target için deps + reverse deps + cascading impact
+   - MVP: tablo formatı (kaynak → bağımlılar). v2 için `GraphCanvas.vue` placeholder
+3. `components/targets/ByNodeBreakdown.vue`, `DependencyChip.vue`, `ProbeAssignmentList.vue`
+4. `components/topology/GraphCanvas.vue` — şimdilik boş placeholder
+
+**Kabul kriterleri:**
+- Target detay sayfası `/targets/db-primary` açılır
+- By-node tablo görünür, her node'un state'i ayrı ayrı
+- `depends_on` varsa bağımlılık chip'leri görünür
+
+---
+
+### S5 — [frontend] SLO + Apps + Geo
+
+**Görevler:**
+1. `composables/useSLO.ts` — `GET /slo` polling 60s
+2. `pages/slo.vue`:
+   - Per-target: target uptime%, actual uptime%, error budget (saniye), window (30d/7d)
+   - Breach: kırmızı vurgulu, "SLO İhlali" badge
+   - Incident tablosu: started_at, ended_at, duration
+3. `pages/apps.vue`:
+   - `/fleet/status`'tan apps map'ini derive et
+   - Her app: name, owner_team, uses (target listesi), overall status
+4. `pages/geo.vue`:
+   - Tüm target'lar için `/geo/latency/{id}` listesi
+   - Anomaly varsa highlight
+   - Per-node region etiketi
+
+**Kabul kriterleri:**
+- SLO dashboard açılır, `slo.enabled:false` ise "disabled" gösterir
+- Apps listesi görünür (config'de app yoksa empty state)
+
+---
+
+### S6 — [frontend] Maintenance CRUD
+
+**Görevler:**
+1. `composables/useMaintenance.ts` — `GET/PUT/DELETE /cluster/maintenance` polling 15s
+2. `pages/maintenance.vue`:
+   - Aktif maintenance window listesi: target ID, reason, starts_at, ends_at, created_by
+   - "New Maintenance" formu: target ID (select veya text), duration (1h/2h/4h/8h/custom), reason
+   - Delete butonu (confirm dialog)
+3. `components/maintenance/MaintenanceForm.vue`, `MaintenanceList.vue`
+4. `components/common/ConfirmDialog.vue`
+5. Yazma işlemlerinde `Authorization: Bearer` header — admin token
+
+**Kabul kriterleri:**
+- UI'dan maintenance window oluştur → backend gossip ile diğer node'lara yayar
+- Window süresi dolunca listeden kalkar
+- Delete ile iptal edilebilir
+
+---
+
+### S7 — [frontend] Config Management
+
+**Görevler:**
+1. `pages/config/index.vue`:
+   - Bu node'un config hash'i + her peer'ın hash'i
+   - Drift var/yok badge
+   - `POST /cluster/config/sync` butonu: "Sync my config to peers"
+2. `pages/config/push.vue`:
+   - `PUT /cluster/config` form
+   - Field'lar: timeout, max_retries, retry_interval_sec, probe_interval_sec, ticker_interval_sec, recovery_probes
+   - Notifications map (JSON textarea, schema hint ile)
+   - "Push to all nodes" butonu
+3. `pages/config/keyring.vue`:
+   - `GET /cluster/keyring/rotate` → key count + primary prefix
+   - "Add key", "Use key (rotate primary)", "Remove key" butonları
+   - JSON body ile `POST /cluster/keyring/rotate`
+
+**Kabul kriterleri:**
+- Config push form → tüm node'larda config güncellenir
+- Keyring rotate → zero-downtime (ikinci key eklendikten sonra use, sonra remove)
+
+---
+
+### S8 — [frontend] Alerts Feed + Settings + Polish
+
+**Görevler:**
+1. `pages/alerts.vue`:
+   - In-memory ring buffer (son 100 alert) — backend B7 hazır olunca `GET /alerts` ile değişir
+   - Backend'den event feed olmadığı için: `/fleet/status` polling + state change detection ile UI tarafında alert generate et
+   - Tablo: target, status, scope, classification, timestamp
+   - B5 için: Ack/Mute butonları disabled (placeholder)
+2. `pages/settings/index.vue`:
+   - Polling interval slider (1s - 60s, default 5s)
+   - Theme seçimi (light/dark/system)
+3. `pages/settings/nodes.vue`:
+   - Backend node listesi yönetimi
+   - Node ekle/sil, health durumu, ping latency
+4. Placeholder route'lar (disabled badge):
+   - `/silences` — B1
+   - `/audit` — B7
+5. `stores/alerts.ts` — in-memory ring buffer
+6. Loading skeleton animasyonları tüm sayfalarda
+7. Empty state bileşenleri tüm sayfalarda
+8. Error boundary + retry butonu
+
+**Kabul kriterleri:**
+- Tüm sayfalar açılıyor (tam ya da placeholder)
+- Sidebar'da tüm route'lar var
+- Empty state görünür (backend bağlantısı yokken graceful)
+
+---
+
+### S9 — [frontend] Production-Hardening + Deployment
+
+**Görevler:**
+1. `pnpm build` → `.output/` üretilir, `pnpm preview` çalışır
+2. `deploy-systemd/` dizini (kök):
+   - `netwatch.target` — Wants=netwatch-backend.service netwatch-frontend.service
+   - `netwatch-backend.service` — backend/deploy/netwatch.service'den türetilir
+   - `netwatch-frontend.service` — node .output/server/index.mjs, port 3000
+3. CORS: backend'e `cors_origins: ["http://localhost:3000"]` config alanı eklenir (S1'deki backend değişikliği)
+4. `GET /version` endpoint'i frontend footer'da gösterilir
+5. a11y: focus ring, keyboard navigation, ARIA labels kritik bileşenlerde
+6. Top-level `README.md` "Deployment" bölümü:
+   - "2 servis", systemd kurulum adımları, NUXT_PUBLIC_DEFAULT_BACKEND_URL env var
+
+**Kabul kriterleri:**
+- systemd target ile hem backend hem frontend başlar
+- `/ui` veya `http://host:3000` üzerinden erişim çalışır
+- `pnpm build` clean çıktı (no TypeScript errors)
+
+---
+
+### S10 — [frontend] Tests
+
+**Görevler:**
+1. Vitest unit:
+   - `utils/format.ts` tests
+   - `utils/classifyState.ts` tests
+   - `composables/useNodeConnection.ts` tests (mock $fetch)
+   - `stores/nodes.ts` tests
+2. Playwright e2e (temel):
+   - Login akışı (mock backend ile)
+   - Targets list render
+   - Maintenance create + delete
+3. `package.json` scripts: `test`, `test:e2e`
+4. `Makefile` (kök veya frontend/) `frontend-test` target'ı
+
+**Kabul kriterleri:**
+- `pnpm test` yeşil
+- `pnpm test:e2e` temel akışlar geçer
+
+---
+
+## ⏸ Bekleyen — [backend] B-Items (UI sonrası)
+
+Detay için `todo.md`. Öneri sırası: **B2 → B1 → B7** (Production Polish), sonra **B3 → B6** (Probe Expansion), sonra **B5 → B4** (Operational).
+
+**Ek:** F5 (Kubernetes SD) de bekleyen backend sprinti.
+
+---
+
+## ✅ Sprint Tamamlandı — [backend] Production Quality Features (F1-F4)
 
 Uygulama tarihi: 2026-05-20. F5 (K8s SD) → sonraki sprint.
 

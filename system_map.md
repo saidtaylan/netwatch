@@ -17,9 +17,15 @@
 
 **netwatch**, ağdaki TCP/HTTP/ICMP/DNS/SQL hedeflerini özerk olarak izleyen, Prometheus metrics exporter olarak çalışan bir Go agent'ıdır. Başlangıçta tek-node bir exporter iken; gossip protokolü (memberlist) üzerinde quorum bazlı karar veren, exactly-once alarm garantisi sunan dağıtık bir cluster monitoring sistemine dönüştürülmektedir. SRE ekipleri tarafından infra ve uygulama bağımlılıklarını izlemek için kullanılır.
 
-- **Proje türü:** Distributed systems agent / CLI / Prometheus exporter
-- **Module:** `github.com/saidtaylan/netwatch`
+Sistemin iki bileşeni vardır:
+- **backend**: Go agent — probe, gossip, alarm, metrik
+- **frontend**: Nuxt 3 SPA — tüm endpoint'leri kapsayan admin UI
+
+- **Proje türü:** Distributed monitoring system (backend: Go agent, frontend: Nuxt 3 SPA)
+- **Module (backend):** `github.com/saidtaylan/netwatch`
 - **Root:** `/Users/saidtaylan/Documents/network cluster/`
+- **Backend:** `backend/` — Go 1.25.7
+- **Frontend:** `frontend/` — Nuxt 3, Node 20+, pnpm
 
 ---
 
@@ -38,29 +44,66 @@
 
 ---
 
-## Mevcut Dosya Yapısı (F1-F4 sonrası güncel)
+## Mevcut Dosya Yapısı (Sprint 0 sonrası — backend/frontend split)
+
+### Kök Dizin (Paylaşılan)
 
 ```
-internal/engine/
-  engine.go          # Config (recovery_probes eklendi), Engine struct (maintMgr, pendingRecovery)
-  loop.go            # startProbeLoop (stagger offset), processPending (2-phase), runCheck (soft-up)
-  maintenance.go     # MaintenanceWindow, maintenanceManager (RAM + disk), GenerateWindowID  ← YENİ
-  configpush.go      # SharedConfig (recovery_probes eklendi)
-  join.go            # GenerateKeyringKey, LocalClusterAddr, ClusterPrimaryKey
-  ...diğer mevcut dosyalar...
-
-internal/cluster/
-  cluster.go         # maintenanceHandler field, NotifyMsg maintenance dispatch
-  maintenance.go     # MaintenanceBroadcast, MaintenanceHandler interface, Broadcast*  ← YENİ
-  ...diğer mevcut dosyalar...
-
-<state_file_dir>/
-  state.json         # target up/down state (v2)
-  incidents.json     # SLO incident history
-  maintenance.json   # ad-hoc maintenance windows (F3, yeni)  ← YENİ
+network cluster/
+  backend/             ← Go kodu (tüm ayrıntı aşağıda)
+  frontend/            ← Nuxt 3 SPA (Sprint 1'den itibaren doluyor)
+  developments.md      ← [backend]/[frontend] etiketli changelog
+  sprint.md            ← Aktif sprint (backend + frontend sprint'leri ayrı başlıklarda)
+  system_map.md        ← Bu dosya
+  todo.md              ← Backend backlog (B1-B11)
+  CLAUDE.md            ← Build komutları, mimari kararlar (her iki servis için)
+  README.md            ← Proje tanıtımı, "iki servis nasıl çalıştırılır"
+  frontend-plan.md     ← UI mimari planı (Sprint 0-10 sırası, sayfa/endpoint haritası)
 ```
 
-## Yol Haritası — Tamamlanan Sprint (2026-05-20)
+### Backend Dosya Yapısı (`backend/`)
+
+```
+backend/
+  internal/engine/
+    engine.go          # Config (recovery_probes eklendi), Engine struct (maintMgr, pendingRecovery)
+    loop.go            # startProbeLoop (stagger offset), processPending (2-phase), runCheck (soft-up)
+    maintenance.go     # MaintenanceWindow, maintenanceManager (RAM + disk), GenerateWindowID  ← F3
+    configpush.go      # SharedConfig (recovery_probes eklendi)
+    join.go            # GenerateKeyringKey, LocalClusterAddr, ClusterPrimaryKey
+    ...diğer mevcut dosyalar...
+
+  internal/cluster/
+    cluster.go         # maintenanceHandler field, NotifyMsg maintenance dispatch
+    maintenance.go     # MaintenanceBroadcast, MaintenanceHandler interface, Broadcast*  ← F3
+    ...diğer mevcut dosyalar...
+
+  <state_file_dir>/
+    state.json         # target up/down state (v2) — gitignored
+    incidents.json     # SLO incident history — gitignored
+    maintenance.json   # ad-hoc maintenance windows — gitignored
+
+  Makefile, Dockerfile, go.mod, go.sum, config.example.yaml
+  deploy/netwatch.service, helm/, notifications/
+```
+
+### Frontend Dosya Yapısı (`frontend/`) — Sprint 1'den itibaren doluyor
+
+```
+frontend/
+  nuxt.config.ts       # ssr:false, runtimeConfig
+  pages/               # File-based routing (tüm sayfalar)
+  components/          # common/ cluster/ targets/ topology/ slo/ maintenance/ config/
+  composables/         # useApi, useAuth, useNodeConnection, usePolling, …
+  stores/              # auth, nodes (persisted), ui, alerts
+  middleware/          # auth.global, node-health.global
+  types/api.ts         # Backend response TS tipleri
+  utils/               # format, classifyState, matchers
+```
+
+## Yol Haritası
+
+### Backend Sprint — Tamamlandı (2026-05-20)
 
 | ID | Özellik | Durum |
 |----|---------|-------|
@@ -68,8 +111,28 @@ internal/cluster/
 | F2 | Cross-Node ROOT_CAUSE Fix (bug fix) | ✅ Tamamlandı |
 | F3 | Maintenance Window (API-driven) | ✅ Tamamlandı |
 | F4 | Soft-Up State (recovery_probes) | ✅ Tamamlandı |
-| F5 | Kubernetes Service Discovery | ⏸ Sonraki sprint |
+| F5 | Kubernetes Service Discovery | ⏸ Sonraki backend sprint |
 | F6 | Process-Level Auto Discovery | ❌ Reddedildi (APM scope) |
+
+### Frontend Sprint — Aktif (2026-05-20+)
+
+| Sprint | Kapsam | Durum |
+|--------|--------|-------|
+| S0 | Repo reorganizasyonu (backend/ split) | ✅ Tamamlandı |
+| S1 | Nuxt 3 iskelet, layout, routing | 🔄 Sonraki |
+| S2 | Auth + multi-node connection | ⏳ Bekliyor |
+| S3 | Cluster overview + targets list | ⏳ Bekliyor |
+| S4 | Target detail + topology | ⏳ Bekliyor |
+| S5 | SLO + apps + geo latency | ⏳ Bekliyor |
+| S6 | Maintenance CRUD (yazma) | ⏳ Bekliyor |
+| S7 | Config management (push + keyring) | ⏳ Bekliyor |
+| S8 | Alerts feed + settings + polish | ⏳ Bekliyor |
+| S9 | Production-hardening + systemd target | ⏳ Bekliyor |
+| S10 | Tests (Vitest + Playwright) | ⏳ Bekliyor |
+
+### Backend Backlog (B-items) — UI sonrası
+
+Detay için `todo.md`. Önerilen sıra: B2 (Severity) → B1 (Silence Rules) → B7 (Audit Log) → B3 (Latency Alerting) → B6 (gRPC).
 
 **F5 (Kubernetes SD) sonraki sprint'te aktive olursa yeni yapı:**
 

@@ -255,6 +255,11 @@ type AdminConfig struct {
 	// POST /cluster/leave). Supports ${VAR} substitution from credentials_file.
 	// When empty, those endpoints accept any request without authentication.
 	Token string `json:"token,omitempty"`
+
+	// CORSOrigin is the value for the Access-Control-Allow-Origin header.
+	// When empty, the server defaults to "*" (permissive).
+	// Example: "https://netwatch.yourcompany.local"
+	CORSOrigin string `json:"cors_origin,omitempty"`
 }
 
 // AdminToken returns the configured admin token (empty = no auth required).
@@ -265,6 +270,16 @@ func (e *Engine) AdminToken() string {
 		return ""
 	}
 	return e.cfg.Admin.Token
+}
+
+// CORSOrigin returns the configured CORS origin (empty = use "*").
+func (e *Engine) CORSOrigin() string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.cfg.Admin == nil {
+		return ""
+	}
+	return e.cfg.Admin.CORSOrigin
 }
 
 func (c Config) globalMaxRetries() int {

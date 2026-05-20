@@ -13,14 +13,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ---
 
-## Build Komutları
+## Repo Yapısı
+
+Tek git repo, iki servis:
+
+```
+network cluster/
+  backend/        ← Go kodu (github.com/saidtaylan/netwatch)
+  frontend/       ← Nuxt 3 SPA
+  developments.md, system_map.md, sprint.md, todo.md, CLAUDE.md   ← Paylaşılan
+```
+
+---
+
+## Build Komutları — Backend
 
 ```bash
+cd backend   # tüm Go komutları buradan çalışır
+
 # Sadece macOS/Linux'ta derle (Windows cmd'i platform kısıtlı)
 go build ./internal/engine/ ./internal/cluster/ ./cmd/linux/
 
 # Makefile üzerinden (tercih edilen):
-make build-linux          # bin/netwatch-linux-amd64 üretir
+make build-linux          # backend/bin/netwatch-linux-amd64 üretir
 make test                 # go test -race
 make vet                  # go vet
 make all                  # build-linux + test + vet
@@ -42,9 +57,24 @@ go vet ./internal/engine/ ./internal/cluster/ ./cmd/linux/
 
 ---
 
-## Paket Yapısı
+## Build Komutları — Frontend
+
+```bash
+cd frontend   # tüm Node komutları buradan çalışır
+
+pnpm dev              # Geliştirme sunucusu (localhost:3000)
+pnpm build            # .output/ üretir
+pnpm preview          # Production build önizleme
+pnpm lint             # ESLint
+pnpm test             # Vitest unit tests
+```
+
+---
+
+## Paket Yapısı — Backend (`backend/`)
 
 ```
+backend/
 internal/engine/          ← business logic paketi
   protocol.go             # Checker interface (Run, ValidateOptions, ParseAddr)
   engine.go               # Config, Engine struct, state persistence, hot-reload, metrikler
@@ -75,7 +105,49 @@ notifications/            # Alert scriptleri buraya konur (.sh veya .ps1)
 config.yaml               # Canlı config (sample — içinde açıklamalar var)
 ```
 
-**KRİTİK KARAR:** Proje yalnızca **iki dizin** üzerine kurulu: `internal/engine/` + `internal/cluster/`. Hiçbir başka alt-paket oluşturulMAYACAK.
+**KRİTİK KARAR (backend):** Backend yalnızca **iki dizin** üzerine kurulu: `internal/engine/` + `internal/cluster/`. Hiçbir başka alt-paket oluşturulMAYACAK.
+
+---
+
+## Paket Yapısı — Frontend (`frontend/`)
+
+```
+frontend/
+  nuxt.config.ts           # ssr:false (SPA), runtimeConfig (NUXT_PUBLIC_BACKEND_URL)
+  pages/                   # File-based routing
+    index.vue              # Cluster overview (landing)
+    setup.vue              # İlk giriş: backend URL + admin token
+    login.vue              # Token re-entry
+    targets/index.vue      # Target list
+    targets/[id].vue       # Target detail (by-node, scope, deps, geo)
+    topology.vue           # Dependency graph
+    slo.vue                # SLO dashboard
+    apps.vue               # Apps & teams
+    alerts.vue             # Alert feed (in-memory, B7 öncesi)
+    maintenance.vue        # Maintenance CRUD
+    silences.vue           # B1 placeholder
+    config/index.vue       # Cluster config view + drift
+    config/push.vue        # PUT /cluster/config form
+    config/keyring.vue     # Keyring rotate
+    geo.vue                # Per-region latency
+    settings/index.vue     # UI prefs
+    settings/nodes.vue     # Backend node listesi
+  layouts/
+    default.vue            # Sidebar + topbar
+    auth.vue               # Setup/login minimal layout
+  components/              # common/ cluster/ targets/ topology/ slo/ maintenance/ config/
+  composables/             # useApi, useAuth, useNodeConnection, usePolling, useTargets, useCluster, …
+  stores/                  # auth.ts, nodes.ts (persisted), ui.ts, alerts.ts
+  middleware/
+    auth.global.ts         # Token yoksa /setup'a yönlendir
+    node-health.global.ts  # Failover tetikler
+  types/api.ts             # Backend response TS tipleri (FleetSnapshot, ClusterState, …)
+  utils/                   # format.ts, classifyState.ts, matchers.ts
+```
+
+**Multi-node failover:** `stores/nodes.ts` birden fazla backend URL tutar. `useNodeConnection.ts` başlangıçta `Promise.any` ile en hızlı cevap vereni seçer; aktif node 401/network error verirse otomatik fallback.
+
+**Auth akışı:** Token yoksa `auth.global.ts` → `/setup`. Token `POST` ile check edilir (`GET /auth/whoami`). Başarılıysa Pinia+localStorage'a yazılır. Her API çağrısına `Authorization: Bearer` eklenir. 401 → otomatik logout.
 
 ---
 

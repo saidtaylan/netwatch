@@ -118,6 +118,36 @@ func main() {
 		_, _ = w.Write([]byte("OK"))
 	})
 
+	// /version — build metadata for the UI footer.
+	mux.HandleFunc("/version", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"version":    engine.BinaryName + "-dev",
+			"build_time": "",
+		})
+	})
+
+	// /auth/whoami — token validation for the UI setup/login flow.
+	// Returns {"role":"admin"} when the token is valid, {"role":"anonymous"} when
+	// no auth is configured, or 401 when the token is wrong.
+	mux.HandleFunc("/auth/whoami", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		adminToken := e.AdminToken()
+		if adminToken == "" {
+			// Auth not configured — everyone is allowed.
+			_ = json.NewEncoder(w).Encode(map[string]string{"role": "anonymous"})
+			return
+		}
+		const prefix = "Bearer "
+		auth := r.Header.Get("Authorization")
+		if len(auth) > len(prefix) && auth[:len(prefix)] == prefix && auth[len(prefix):] == adminToken {
+			_ = json.NewEncoder(w).Encode(map[string]string{"role": "admin"})
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid token"})
+	})
+
 	mux.HandleFunc("/status", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(e.Status()); err != nil {
@@ -561,7 +591,30 @@ func main() {
 		printJoinBanner(e)
 	}
 
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
+	// CORS middleware — wraps the entire mux so the Nuxt UI can call this backend
+	// from a different origin (e.g. http://localhost:3000 during development or a
+	// separate subdomain in production).
+	//
+	// The allowed origin is read from cfg.CORSOrigin; when empty, "*" is used
+	// (permissive default — suitable for internal/trusted deployments). For
+	// production use, set cors_origin: "https://netwatch.yourcompany.local" in
+	// config.yaml.
+	corsOrigin := e.CORSOrigin()
+	if corsOrigin == "" {
+		corsOrigin = "*"
+	}
+	withCORS := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", corsOrigin)
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+
+	if err := http.ListenAndServe(":"+port, withCORS); err != nil {
 		slog.Error("server error", "err", err)
 		os.Exit(1)
 	}

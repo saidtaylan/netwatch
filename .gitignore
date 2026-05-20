@@ -8,21 +8,38 @@
 *.swp
 *.swo
 
-# Build artifacts
+# Backend — build artifacts
 bin/
 /linux
 /windows
 /netwatch
 /netwatch-*
+backend/bin/
+backend/linux
+backend/windows
+backend/netwatch
+backend/netwatch-*
 *.exe
 *.test
 *.out
 
-# Runtime / generated
+# Backend — runtime / generated
 *.log
 state.json
+incidents.json
+maintenance.json
 *.tmp
 demo/
+backend/config.yaml
+backend/credentials.env
+
+# Frontend — build / cache
+frontend/node_modules/
+frontend/.nuxt/
+frontend/.output/
+frontend/dist/
+frontend/.env
+frontend/.env.*
 
 # Local secrets / credentials
 credentials.env

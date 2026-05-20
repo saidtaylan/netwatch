@@ -5,7 +5,7 @@ Bu dosya projenin değişiklik günlüğüdür. Her tarih bloğunda:
 - **1. seviye bullet** = Sade özet (ne eklendi / ne değişti)
 - **2. seviye bullet** = Teknik detay (dosya yolları, ne değişti)
 
-Etiketler: [backend] [altyapi] [devops] [dokuman] [test]
+Etiketler: [backend] [frontend] [altyapi] [devops] [dokuman] [test] [refactor]
 
 Arşiv: Henüz arşiv yok. Son 4 haftadan eski → docs/archive/development_YYYY_MM.md
 -->
@@ -13,6 +13,26 @@ Arşiv: Henüz arşiv yok. Son 4 haftadan eski → docs/archive/development_YYYY
 # netwatch Changelog
 
 Bu belge, netwatch projesinin günlük güncellemelerini ve teknik detaylarını takip eder.
+
+---
+
+## 2026-05-20 (devam — frontend hazırlık)
+
+- [refactor] **Sprint 0 — Repo Reorganizasyonu (frontend/backend split)**
+
+  Tek git reposu içinde iki servis olarak yapılandırıldı. Backend Go kodu `backend/` dizinine taşındı, `frontend/` dizini Nuxt 3 için ayrıldı.
+
+  - `git mv cmd/ internal/ test/ tests/ tests/ deploy/ helm/ notifications/ Dockerfile Makefile go.mod go.sum config.example.yaml config.yaml → backend/`
+  - `git mv CLUSTER_TESTING_GUIDE.md GUIDE.md GUIDE_EN.md .dockerignore → backend/`
+  - `.gitignore` güncellendi: frontend node_modules, .nuxt, .output, dist; backend bin/ yolları prefix'lendi
+  - `CLAUDE.md` güncellendi: build komutları `cd backend &&` prefix'i aldı, frontend bölümü eklendi
+  - Module path değişmedi: `github.com/saidtaylan/netwatch`
+  - Smoke test: `cd backend && go build ./internal/engine/ ./internal/cluster/ ./cmd/linux/` ✓ `go test -race` 202 test yeşil ✓
+  - Kök dizinde yalnızca paylaşılan dok'lar kaldı: developments.md, sprint.md, system_map.md, todo.md, CLAUDE.md, README.md
+
+- [dokuman] **Frontend mimari planı yazıldı** (`frontend-plan.md`)
+
+  Nuxt 3 + Tailwind + Pinia + standalone deployment kararları, sprint sırası (Sprint 0-10), tüm sayfa → endpoint eşlemeleri, B1-B11 için UI placeholder stratejisi, multi-node failover algoritması, systemd target yapısı, ve auth akışı belgelendi.
 
 ---
 
