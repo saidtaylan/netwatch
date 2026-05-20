@@ -4,9 +4,9 @@ Bu dosya aktif geliştirme planını içerir. Tamamlananlar → **developments.m
 
 ---
 
-## 🎯 Aktif Sprint — Production Quality Features (2026-05-16 onaylı)
+## ✅ Sprint Tamamlandı — Production Quality Features (F1-F4)
 
-Kullanıcı onayı bekliyor. Sıra: F1 → F2 → F3 → F4 → F5.
+Uygulama tarihi: 2026-05-20. F5 (K8s SD) → sonraki sprint.
 
 ### F1 — Probe Interval Staggering (KÜÇÜK, ÖNCE)
 

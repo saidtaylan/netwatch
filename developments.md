@@ -16,14 +16,14 @@ Bu belge, netwatch projesinin günlük güncellemelerini ve teknik detaylarını
 
 ---
 
-## Planlanan (Aktif Sprint — 2026-05-16 onaylı, implementasyon kullanıcı onayını bekliyor)
+## ✅ F1–F4 tamamlandı (2026-05-20)
 
 > Detaylı tasarım → `sprint.md` → "Aktif Sprint" bölümü.
 
-- **F1 — Probe Interval Staggering**: Aynı target'ı izleyen N node, probe'larını `probe_interval / N` offset ile dağıtacak. Burst yerine düz yük + daha hızlı mean detection latency.
-- **F2 — Multi-Node depends_on / ROOT_CAUSE Cross-Node Lookup Fix** (GERÇEK BUG): Disjoint prober set'lerinde ROOT_CAUSE çözümü çalışmıyor (local lastKnown'a bakıyor, peer state'i atlıyor). Fix: `rootCauseEnv()` peer gossip state'ini de birleştirecek.
-- **F3 — Maintenance Window (API-driven)**: `PUT /cluster/maintenance` ile target'lar geçici alarm bastırma. RAM + `maintenance.json` persistence + gossip propagation. Cron-based recurring opsiyonu Faz 2'de.
-- **F4 — Soft-Up State (Symmetric Recovery)**: `recovery_probes: N` config. HARD_DOWN → SOFT_UP → UP transition'ı ile flap-resilient recovery. Default N=1 (mevcut davranış).
+- **F1 — Probe Interval Staggering** ✅: `offset = (probe_interval / N) * prober_index`. Burst yok, mean detection latency N kat azaldı.
+- **F2 — ROOT_CAUSE Cross-Node Fix (BUG FIX)** ✅: `processPending()` iki aşamaya ayrıldı. Eş zamanlı çöküşlerde doğru ROOT_CAUSE.
+- **F3 — Maintenance Window** ✅: `PUT/GET/DELETE /cluster/maintenance`. maintenance.json + gossip + shouldAlert entegre.
+- **F4 — Soft-Up State** ✅: `recovery_probes: N` (default 1). HARD_DOWN → SOFT_UP → UP. SharedConfig sync.
 - **F5 — Kubernetes Service Discovery**: Atlandı, ayrı sprint'e bırakıldı. Detay `sprint.md`'de.
 - **F6 — Process-Level Auto Discovery**: Reddedildi (APM scope'u, OpenTelemetry/Datadog alanı).
 

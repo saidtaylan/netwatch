@@ -100,6 +100,9 @@ config.yaml               # Canlı config (sample — içinde açıklamalar var)
 | `GET /cluster/keyring/rotate` | Keyring durumu: key sayısı + primary prefix. |
 | `POST /cluster/keyring/rotate` | Sıfır-kesinti AES key rotasyonu: `{"action":"add|use|remove","key":"base64..."}`. |
 | `POST /cluster/leave` | Graceful cluster leave + process exit |
+| `GET /cluster/maintenance` | Aktif maintenance window listesi |
+| `PUT /cluster/maintenance` | Yeni maintenance window; gossip ile tüm node'lara yayılır; auth gerekir |
+| `DELETE /cluster/maintenance/{id}` | Maintenance window iptal; auth gerekir |
 
 ---
 
@@ -150,6 +153,7 @@ retry_interval_sec: 30
 ticker_interval_sec: 5
 probe_interval_sec: 60        # per-target interval_sec ile override edilebilir
 reload_interval_sec: 30       # 0 = hot-reload kapalı
+recovery_probes: 1            # hard_down → recovery için gereken ardışık başarı (default 1, SharedConfig'e eklendi)
 watchdog_threshold_sec: 120   # scrape bu kadar sn gelmezse [WATCHDOG] log + metrik=0; 0 = devre dışı
 credentials_file: "credentials.env"  # ${VAR} injection için
 
@@ -210,6 +214,8 @@ cluster:
 ```
 
 **Phase 13 — Distributed Probe Ownership:**
+
+**Probe Interval Staggering:** N prober'lı bir target'ta offset = `(probe_interval / N) * prober_index`. Burst yok; mean detection latency ≈ probe_interval/N. Standalone'da offset=0.
 
 Cluster modda her node her target'ı probe etmez. `probe_replication_factor` (default 3) kadar node seçilir:
 - Candidate set = peerStates'ten gelen + local LocalTargetProvider'dan (alive olanlar)
