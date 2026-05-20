@@ -8,7 +8,7 @@ Bu dosya aktif geliştirme planını içerir. Tamamlananlar → **developments.m
 
 Uygulama tarihi: 2026-05-20. F5 (K8s SD) → sonraki sprint.
 
-### F1 — Probe Interval Staggering (KÜÇÜK, ÖNCE)
+### ✅ F1 — Probe Interval Staggering
 
 **Hedef:** Aynı target'ı probe eden N node, hepsi aynı anda probe atmasın. Probe yükü interval içinde eşit dağıtılsın.
 
@@ -129,7 +129,7 @@ func TestStartProbeLoop_Stagger_SingleProberZeroOffset(t *testing.T) {
 
 ---
 
-### F2 — Multi-Node depends_on / ROOT_CAUSE Cross-Node Lookup Fix
+### ✅ F2 — ROOT_CAUSE Cross-Node Fix (Bug Fix)
 
 **Hedef:** Bir target'ın bağımlılığı başka bir node'da probe ediliyor olabilir. ROOT_CAUSE hesabı sadece local state'e değil, peer gossip state'ine de bakmalı.
 
@@ -239,7 +239,7 @@ E2E (yeni `tests/domain/crossnode_rootcause_test.go`):
 
 ---
 
-### F3 — Maintenance Window (API-Driven)
+### ✅ F3 — Maintenance Window (API-Driven)
 
 **Hedef:** Operatör elle config dosyası düzenlemeden, REST API ile belirli target'ları belirli süre için "alarm üretmesi durdurulmuş" duruma getirebilsin. Restart-survivable, gossip-replicated.
 
@@ -434,7 +434,7 @@ Gossip propagation test:
 
 ---
 
-### F4 — Soft-Up State (Symmetric Recovery)
+### ✅ F4 — Soft-Up State (Symmetric Recovery)
 
 **Hedef:** Recovery alarmları flap'leri filtrelesin. Tek başarılı probe yerine N consecutive başarılı probe sonrası "reachable" alarmı atılsın.
 

@@ -16,18 +16,65 @@ Bu belge, netwatch projesinin günlük güncellemelerini ve teknik detaylarını
 
 ---
 
-## ✅ F1–F4 tamamlandı (2026-05-20)
+## 2026-05-20
 
-> Detaylı tasarım → `sprint.md` → "Aktif Sprint" bölümü.
+- [backend] **F1 — Probe Interval Staggering**
 
-- **F1 — Probe Interval Staggering** ✅: `offset = (probe_interval / N) * prober_index`. Burst yok, mean detection latency N kat azaldı.
-- **F2 — ROOT_CAUSE Cross-Node Fix (BUG FIX)** ✅: `processPending()` iki aşamaya ayrıldı. Eş zamanlı çöküşlerde doğru ROOT_CAUSE.
-- **F3 — Maintenance Window** ✅: `PUT/GET/DELETE /cluster/maintenance`. maintenance.json + gossip + shouldAlert entegre.
-- **F4 — Soft-Up State** ✅: `recovery_probes: N` (default 1). HARD_DOWN → SOFT_UP → UP. SharedConfig sync.
-- **F5 — Kubernetes Service Discovery**: Atlandı, ayrı sprint'e bırakıldı. Detay `sprint.md`'de.
-- **F6 — Process-Level Auto Discovery**: Reddedildi (APM scope'u, OpenTelemetry/Datadog alanı).
+  Aynı target'ı probe eden N node artık hepsi aynı anda atmıyor. Her prober `(probe_interval / N) * prober_index` kadar bekleyip ilk probe'unu atar, sonra normal ticker'a geçer.
 
-Sıralama: F1 → F2 → F3 → F4. F3 ve F4 birlikte ele alınabilir (state machine ve maintenance birbirini tamamlar). Her aşama sonunda kullanıcı onayı.
+  - `internal/engine/loop.go` `startProbeLoop()`: stagger offset hesabı eklendi
+  - Standalone (cluster yok) veya tek prober: offset=0, mevcut davranış korunur
+  - Prober assignment değişince (NotifyJoin/Leave) yeni offset otomatik hesaplanır
+  - Etki: 3 prober × 60s interval → artık 0s / 20s / 40s probe; ortalama down tespiti 60s → 20s
+
+- [backend] **F2 — ROOT_CAUSE Cross-Node Fix (BUG FIX)**
+
+  Gerçek bir bug: `processPending()` aynı ticker tick'inde birden fazla target'ı hard_down'a escalate ediyorsa, birincinin alert'i ikincisi henüz `lastKnown`'a yazılmadan gönderiliyordu. ROOT_CAUSE hesabı "db-primary=up" görüyordu, yanlış çözüm dönüyordu.
+
+  - `internal/engine/loop.go` `processPending()` iki aşamaya ayrıldı:
+    - **Faz 1**: tüm due entry'leri probe et, hard_down olanları `markHardDown()` ile `lastKnown`'a yaz
+    - **Faz 2**: alert gönder (tüm state geçişleri commit edilmiş, allStates snapshot doğru)
+  - `tests/domain/crossnode_rootcause_test.go` eklendi: standalone + cluster (disjoint prober set) senaryoları
+
+- [backend] **F3 — Maintenance Window (API-driven, gossip-replicated)**
+
+  Operatör `PUT /cluster/maintenance` ile target'ları geçici olarak alarm bastırır. Restart'tan sağ çıkar, tüm cluster node'larına gossip ile yayılır.
+
+  - **Yeni dosyalar**: `internal/engine/maintenance.go`, `internal/cluster/maintenance.go`
+  - `maintenance.go`: `MaintenanceWindow` struct, `maintenanceManager` (RAM + `maintenance.json` disk persistence, atomic write)
+  - `cluster/maintenance.go`: `MaintenanceBroadcast` gossip mesajı (`msgType: "maintenance"`), `MaintenanceHandler` interface, `BroadcastMaintenanceSet/Cancel`
+  - `cluster.go` `NotifyMsg`: `msgTypeMaintenance` dispatch eklendi
+  - `engine.go` `shouldAlert()`: `maintMgr.IsInMaintenance(targetID)` önce kontrol edilir → false → alarm bastır
+  - `engine.go` `Init()`: `newMaintenanceManager()` + `runMaintenancePruner()` goroutine
+  - `engine.go`: `MaintenanceHandler` interface implementasyonu (`ApplyMaintenanceSet`, `ApplyMaintenanceCancel`)
+  - **Yeni endpoint'ler** (`cmd/linux/main.go` + `cmd/windows/main.go`):
+    - `GET  /cluster/maintenance` — aktif window listesi (auth gerektirmez)
+    - `PUT  /cluster/maintenance` — yeni window (`{target_ids, duration, reason, started_by}`); gossip broadcast; auth zorunlu
+    - `DELETE /cluster/maintenance/{id}` — iptal; gossip broadcast; auth zorunlu
+  - Persistence: `<state_file_dir>/maintenance.json` (v1 format)
+  - Restart davranışı: load → süresi dolmuş entry'ler atılır → aktifler uygulanır
+  - Probe'lar çalışmaya devam eder; sadece `shouldAlert()` bastırılır
+
+- [backend] **F4 — Soft-Up State (Symmetric Recovery)**
+
+  `recovery_probes: N` (default 1) ile recovery flap koruması. N ardışık başarılı probe olmadan "reachable" alarmı atılmaz.
+
+  - `Config.RecoveryProbes *int` + `Config.globalRecoveryProbes()` yeni alanlar
+  - `Target.RecoveryProbes *int` — per-target override
+  - `Engine.pendingRecovery map[string]int` — soft_up sayacı, `stateMu` ile korunur
+  - `loop.go` `runCheck()`: N=1 → mevcut davranış (fast path); N>1 → soft_up counter
+  - Soft_up sırasında probe fail gelirse counter sıfırlanır (hâlâ hard_down sayılır)
+  - `SharedConfig.RecoveryProbes` eklendi → `PUT /cluster/config/sync` ile tüm cluster'a yayılabilir
+  - Default N=1: geriye dönük uyumlu, mevcut davranış değişmez
+
+  **Build + Test:**
+  ```
+  go build ./internal/engine/ ./internal/cluster/ ./cmd/linux/   ✓
+  GOOS=windows go build ./cmd/windows/                           ✓
+  go test -race ./internal/engine/... ./internal/cluster/...     ✓ (202 test)
+  go test -race ./tests/engine/... ./tests/cluster/...           ✓ (86 test)
+  go test -race ./tests/domain/...                               ✓ (18 test)
+  ```
 
 ---
 

@@ -38,39 +38,40 @@
 
 ---
 
-## Yol Haritası — Aktif Sprint (2026-05-16, kullanıcı onaylı, implementasyon beklemede)
-
-Bu özellikler **planlandı**, kullanıcı izniyle implementasyona başlanacak. Detay → `sprint.md` "Aktif Sprint" bölümü.
-
-| ID | Özellik | Karmaşıklık | Etki | Sıra |
-|----|---------|-------------|------|------|
-| F1 | Probe Interval Staggering | Düşük | Orta — burst azaltır, detection latency'i N kat hızlandırır | 1 |
-| F2 | Cross-Node ROOT_CAUSE Lookup (BUG FIX) | Düşük | Yüksek — disjoint prober set'lerinde ROOT_CAUSE çalışmıyor | 2 |
-| F3 | Maintenance Window (API-driven) | Yüksek | Yüksek — her ops ekibinin günlük ihtiyacı | 3 |
-| F4 | Soft-Up State (Symmetric Recovery) | Orta | Orta — flap-resilient recovery | 4 |
-| F5 | Kubernetes Service Discovery | Yüksek | Yüksek (k8s ortamı) | Sonraki sprint |
-| F6 | Process-Level Auto Discovery | Çok yüksek | Out of scope (APM alanı) | Reddedildi |
-
-**Beklenen yeni dosya yapısı (F3 sonrası):**
+## Mevcut Dosya Yapısı (F1-F4 sonrası güncel)
 
 ```
 internal/engine/
-  ...mevcut dosyalar...
-  maintenance.go        # F3: maintenance manager (RAM + maintenance.json)
+  engine.go          # Config (recovery_probes eklendi), Engine struct (maintMgr, pendingRecovery)
+  loop.go            # startProbeLoop (stagger offset), processPending (2-phase), runCheck (soft-up)
+  maintenance.go     # MaintenanceWindow, maintenanceManager (RAM + disk), GenerateWindowID  ← YENİ
+  configpush.go      # SharedConfig (recovery_probes eklendi)
+  join.go            # GenerateKeyringKey, LocalClusterAddr, ClusterPrimaryKey
+  ...diğer mevcut dosyalar...
 
 internal/cluster/
-  ...mevcut dosyalar...
-  maintenancesync.go    # F3: gossip mesaj tipi "maintenance" (set/cancel)
-
-cmd/linux/main.go       # F3: PUT/DELETE /cluster/maintenance, GET maintenance/list
+  cluster.go         # maintenanceHandler field, NotifyMsg maintenance dispatch
+  maintenance.go     # MaintenanceBroadcast, MaintenanceHandler interface, Broadcast*  ← YENİ
+  ...diğer mevcut dosyalar...
 
 <state_file_dir>/
-  state.json            # mevcut
-  incidents.json        # SLO incident history
-  maintenance.json      # F3: ad-hoc maintenance window'lar (yeni)
+  state.json         # target up/down state (v2)
+  incidents.json     # SLO incident history
+  maintenance.json   # ad-hoc maintenance windows (F3, yeni)  ← YENİ
 ```
 
-**F5 (Kubernetes SD) gelecekte aktive olursa:**
+## Yol Haritası — Tamamlanan Sprint (2026-05-20)
+
+| ID | Özellik | Durum |
+|----|---------|-------|
+| F1 | Probe Interval Staggering | ✅ Tamamlandı |
+| F2 | Cross-Node ROOT_CAUSE Fix (bug fix) | ✅ Tamamlandı |
+| F3 | Maintenance Window (API-driven) | ✅ Tamamlandı |
+| F4 | Soft-Up State (recovery_probes) | ✅ Tamamlandı |
+| F5 | Kubernetes Service Discovery | ⏸ Sonraki sprint |
+| F6 | Process-Level Auto Discovery | ❌ Reddedildi (APM scope) |
+
+**F5 (Kubernetes SD) sonraki sprint'te aktive olursa yeni yapı:**
 
 ```
 internal/discovery/
@@ -80,10 +81,6 @@ internal/discovery/
     reconciler.go
     config.go
 ```
-
-Yapısal değişiklik gerekiyor; CLAUDE.md güncellenecek.
-
----
 
 ---
 
