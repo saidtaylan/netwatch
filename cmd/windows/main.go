@@ -23,6 +23,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/saidtaylan/netwatch/internal/cluster"
 	"github.com/saidtaylan/netwatch/internal/engine"
 	sigs_yaml "sigs.k8s.io/yaml"
 	"golang.org/x/sys/windows/svc"
@@ -249,6 +250,80 @@ func runAgent(configPath string, leaveCh chan string) {
 		if err := json.NewEncoder(w).Encode(snap); err != nil {
 			slog.Error("slo encode error", "err", err)
 		}
+	})
+
+	// ── Maintenance window endpoints (Windows) ──────────────────────────────────
+	mux.HandleFunc("/cluster/maintenance", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodGet, "":
+			_ = json.NewEncoder(w).Encode(e.MaintenanceWindows())
+		case http.MethodPut:
+			if !checkAdminAuth(e, w, r) {
+				return
+			}
+			var req struct {
+				TargetIDs []string `json:"target_ids"`
+				Duration  string   `json:"duration"`
+				Reason    string   `json:"reason,omitempty"`
+				StartedBy string   `json:"started_by,omitempty"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			dur, err := time.ParseDuration(req.Duration)
+			if err != nil || dur <= 0 || len(req.TargetIDs) == 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid duration or empty target_ids"})
+				return
+			}
+			now := time.Now().UTC()
+			win := engine.MaintenanceWindow{
+				ID: engine.GenerateWindowID(), TargetIDs: req.TargetIDs,
+				StartedAt: now, ExpiresAt: now.Add(dur),
+				Reason: req.Reason, StartedBy: req.StartedBy,
+			}
+			if err := e.SetMaintenance(win); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			if mgr := e.ClusterManager(); mgr != nil {
+				mgr.BroadcastMaintenanceSet(cluster.MaintenanceWindowPayload{
+					ID: win.ID, TargetIDs: win.TargetIDs,
+					StartedAt: win.StartedAt, ExpiresAt: win.ExpiresAt,
+					Reason: win.Reason, StartedBy: win.StartedBy,
+				})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": win.ID, "expires_at": win.ExpiresAt, "targets": win.TargetIDs,
+			})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	})
+	mux.HandleFunc("/cluster/maintenance/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAdminAuth(e, w, r) {
+			return
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/cluster/maintenance/")
+		if err := e.CancelMaintenance(id); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		if mgr := e.ClusterManager(); mgr != nil {
+			mgr.BroadcastMaintenanceCancel(id)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]bool{"cancelled": true})
 	})
 
 	// GET /cluster/config — config-sync drift snapshot (P1.5)

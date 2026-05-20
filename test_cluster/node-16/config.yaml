@@ -1,0 +1,124 @@
+{
+  "port": "40016",
+  "state_file": "test_cluster/node-16/state.json",
+  "timeout": 2,
+  "max_retries": 1,
+  "retry_interval_sec": 5,
+  "probe_interval_sec": 10,
+  "reload_interval_sec": 5,
+  "admin": {
+    "token": "test_token"
+  },
+  "notifications": {
+    "webhook-alert": {
+      "type": "webhook",
+      "parameters": {
+        "url": "http://127.0.0.1:9999/webhook"
+      }
+    }
+  },
+  "default_notify": [
+    "webhook-alert"
+  ],
+  "cluster": {
+    "enabled": true,
+    "node_name": "node-16",
+    "bind_port": 50016,
+    "peers": [
+      "127.0.0.1:50001"
+    ],
+    "keyring": [
+      "N9VySoOC7n3BJW3Y2dXeMW5SZM5o0vEtzA4sOkSZ+Ok="
+    ],
+    "expected_node_count": 20,
+    "min_quorum_ratio": 0.5,
+    "probe_replication_factor": 3,
+    "region": "us-east"
+  },
+  "targets": [
+    {
+      "id": "db-primary",
+      "name": "Primary Database",
+      "type": "http",
+      "target": "http://127.0.0.1:9999/db-primary",
+      "options": {
+        "expected_status": {
+          "in": [
+            200
+          ]
+        }
+      }
+    },
+    {
+      "id": "api-gateway",
+      "name": "API Gateway",
+      "type": "http",
+      "target": "http://127.0.0.1:9999/api-gateway",
+      "depends_on": [
+        "db-primary"
+      ],
+      "options": {
+        "expected_status": {
+          "in": [
+            200
+          ]
+        }
+      }
+    },
+    {
+      "id": "checkout",
+      "name": "Checkout Service",
+      "type": "http",
+      "target": "http://127.0.0.1:9999/checkout",
+      "depends_on": [
+        "api-gateway"
+      ],
+      "options": {
+        "expected_status": {
+          "in": [
+            200
+          ]
+        }
+      }
+    },
+    {
+      "id": "standalone-target",
+      "name": "Standalone Target",
+      "type": "http",
+      "target": "http://127.0.0.1:9999/standalone-target",
+      "probe_from": [
+        "node-10",
+        "node-11"
+      ],
+      "options": {
+        "expected_status": {
+          "in": [
+            200
+          ]
+        }
+      }
+    }
+  ],
+  "apps": [
+    {
+      "name": "payment-gateway",
+      "owner_team": "fintech-sre",
+      "uses": [
+        "db-primary",
+        "api-gateway",
+        "checkout"
+      ]
+    }
+  ],
+  "slo": {
+    "enabled": true,
+    "retention_days": 90,
+    "targets": [
+      {
+        "id": "db-primary",
+        "target_uptime": 0.99,
+        "window": "24h"
+      }
+    ]
+  }
+}

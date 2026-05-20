@@ -328,6 +328,9 @@ func (d *gossipDelegate) NotifyMsg(b []byte) {
 		case msgTypeConfigPush:
 			go d.mgr.handleConfigPush(b)
 			return
+		case msgTypeMaintenance:
+			go d.mgr.handleMaintenance(b)
+			return
 		}
 	}
 	var p GossipPayload
@@ -533,6 +536,10 @@ type Manager struct {
 	// configPushHandler is set by the engine to apply incoming shared-config
 	// push payloads. nil until SetConfigPushHandler is called.
 	configPushHandler ConfigPushHandler
+
+	// maintenanceHandler is set by the engine to apply incoming maintenance
+	// window set/cancel broadcasts. nil until SetMaintenanceHandler is called.
+	maintenanceHandler MaintenanceHandler
 
 	// inventoryRefreshHandler is called on NotifyJoin so the engine
 	// re-broadcasts its local target states to late-joining peers.

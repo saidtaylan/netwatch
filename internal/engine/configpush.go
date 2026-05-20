@@ -47,6 +47,7 @@ type SharedConfig struct {
 	ProbeIntervalSec     *int                          `json:"probe_interval_sec,omitempty" yaml:"probe_interval_sec,omitempty"`
 	ReloadIntervalSec    *int                          `json:"reload_interval_sec,omitempty" yaml:"reload_interval_sec,omitempty"`
 	WatchdogThresholdSec *int                          `json:"watchdog_threshold_sec,omitempty" yaml:"watchdog_threshold_sec,omitempty"`
+	RecoveryProbes       *int                          `json:"recovery_probes,omitempty" yaml:"recovery_probes,omitempty"`
 	Notifications        map[string]AlertChannelConfig `json:"notifications,omitempty" yaml:"notifications,omitempty"`
 	DefaultNotify        []string                      `json:"default_notify,omitempty" yaml:"default_notify,omitempty"`
 	Cluster              *SharedClusterConfig          `json:"cluster,omitempty" yaml:"cluster,omitempty"`
@@ -116,6 +117,7 @@ func extractSharedMap(m map[string]interface{}) map[string]interface{} {
 	topLevelShared := []string{
 		"timeout", "max_retries", "retry_interval_sec", "ticker_interval_sec",
 		"probe_interval_sec", "reload_interval_sec", "watchdog_threshold_sec",
+		"recovery_probes",
 		"notifications", "default_notify",
 	}
 	for _, k := range topLevelShared {
@@ -223,6 +225,7 @@ func mergeSharedMap(dst, src map[string]interface{}) {
 		"timeout": true, "max_retries": true, "retry_interval_sec": true,
 		"ticker_interval_sec": true, "probe_interval_sec": true,
 		"reload_interval_sec": true, "watchdog_threshold_sec": true,
+		"recovery_probes": true,
 		"notifications": true, "default_notify": true,
 	}
 	clusterShared := map[string]bool{
@@ -280,6 +283,9 @@ func AppliedFields(sc SharedConfig) []string {
 	}
 	if sc.WatchdogThresholdSec != nil {
 		fields = append(fields, "watchdog_threshold_sec")
+	}
+	if sc.RecoveryProbes != nil {
+		fields = append(fields, "recovery_probes")
 	}
 	if len(sc.Notifications) > 0 {
 		fields = append(fields, "notifications")

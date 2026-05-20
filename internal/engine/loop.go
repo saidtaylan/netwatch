@@ -49,8 +49,49 @@ func (e *Engine) startProbeLoop(t Target) {
 	e.probeFastCheck[t.key()] = fastCheckCh
 	e.probesMu.Unlock()
 
+	// Compute stagger offset so multiple probers of the same target spread
+	// their probes evenly across probe_interval rather than all firing at once.
+	//
+	// With N probers and probe_interval I, prober at sorted index i sleeps
+	// (I / N) * i before its first probe and then uses a normal I-second ticker.
+	// Results in:
+	//   prober 0: probes at T=0, T+I, T+2I, ...
+	//   prober 1: probes at T+(I/N), T+(I/N)+I, ...
+	//   prober 2: probes at T+(2I/N), ...
+	//
+	// Benefits: no burst on the target, mean detection latency ≈ I/N instead of I.
+	// Standalone mode (clusterMgr == nil): no stagger (all targets probed locally).
+	var staggerOffset time.Duration
+	if e.clusterMgr != nil {
+		e.mu.RLock()
+		intervalSec := e.cfg.globalProbeInterval()
+		e.mu.RUnlock()
+		if t.IntervalSec != nil {
+			intervalSec = *t.IntervalSec
+		}
+		probers := e.clusterMgr.SelectProbers(t.key()) // sorted deterministically
+		myName := e.clusterNodeName()
+		for i, p := range probers {
+			if p == myName && len(probers) > 1 {
+				staggerOffset = time.Duration(i) *
+					(time.Duration(intervalSec) * time.Second / time.Duration(len(probers)))
+				break
+			}
+		}
+	}
+
 	go func() {
-		// Probe immediately on start so metrics are populated before the first interval.
+		// Apply stagger offset before the first probe (skip if zero).
+		if staggerOffset > 0 {
+			slog.Debug("probe loop staggered", "target", t.key(), "offset", staggerOffset)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(staggerOffset):
+			}
+		}
+
+		// First probe after stagger (or immediately in standalone/single-prober mode).
 		e.runCheck(ctx, t)
 
 		e.mu.RLock()
@@ -135,12 +176,42 @@ func (e *Engine) runCheck(ctx context.Context, t Target) {
 			e.persistState()
 			e.broadcastState(t, firstPS)
 		} else if inPending || !prevUp {
-			// Recovery from soft-down or hard-down.
-			if e.markRecovered(pkey, t) {
-				e.sloRecordEnd(t) // SLO: close open incident (no-op if none open)
-				slog.Info("target recovered", "name", t.key(), "target", t.Target, "latency", elapsed)
-				if e.shouldAlert(t.key()) {
-					e.sendAlert(t, "reachable")
+			// Recovery path: hard_down or soft_down → successful probe.
+			// With recovery_probes > 1, require N consecutive successes (SOFT_UP)
+			// before declaring fully recovered. Default (recovery_probes=1) has
+			// the same behaviour as before this feature was added.
+			threshold := e.effectiveRecoveryProbes(t)
+			if threshold <= 1 {
+				// Fast path: 1 success = recovered (backward compat default).
+				if e.markRecovered(pkey, t) {
+					e.sloRecordEnd(t)
+					slog.Info("target recovered", "name", t.key(), "target", t.Target, "latency", elapsed)
+					if e.shouldAlert(t.key()) {
+						e.sendAlert(t, "reachable")
+					}
+				}
+			} else {
+				// Soft-up path: accumulate consecutive successes.
+				e.stateMu.Lock()
+				e.pendingRecovery[pkey]++
+				count := e.pendingRecovery[pkey]
+				e.stateMu.Unlock()
+
+				if count >= threshold {
+					// Threshold met → fully recovered.
+					e.stateMu.Lock()
+					delete(e.pendingRecovery, pkey)
+					e.stateMu.Unlock()
+					if e.markRecovered(pkey, t) {
+						e.sloRecordEnd(t)
+						slog.Info("target recovered (after soft-up)", "name", t.key(), "target", t.Target, "recovery_probes", count)
+						if e.shouldAlert(t.key()) {
+							e.sendAlert(t, "reachable")
+						}
+					}
+				} else {
+					// Soft-up: waiting for more successes. Log but don't alert.
+					slog.Debug("probe recovered (soft-up, waiting for more)", "name", t.key(), "count", count, "threshold", threshold)
 				}
 			}
 		} else if e.clusterMgr != nil {
@@ -159,6 +230,16 @@ func (e *Engine) runCheck(ctx context.Context, t Target) {
 		if probeErr != nil {
 			errCode = probeErr.Error()
 		}
+
+		// If the target was in soft_up (accumulating recovery probes) and fails
+		// again, reset the counter — it is still considered hard_down.
+		e.stateMu.Lock()
+		if _, recovering := e.pendingRecovery[pkey]; recovering {
+			slog.Debug("probe failed during soft-up, resetting recovery counter", "name", t.key())
+			delete(e.pendingRecovery, pkey)
+		}
+		e.stateMu.Unlock()
+
 		if seen && !prevUp && !inPending {
 			// Already hard-down; retry loop will handle it.
 		} else if !inPending {
@@ -230,6 +311,24 @@ func (e *Engine) processPending(ctx context.Context) {
 	}
 	e.stateMu.RUnlock()
 
+	// Phase 1: probe all due entries and collect outcomes.
+	// Separating probe + state-write from alert dispatch ensures that when
+	// multiple targets escalate to hard_down in the same tick, all of their
+	// states are committed to lastKnown BEFORE any sendAlert() reads the
+	// combined state. This fixes the ROOT_CAUSE race where a dependent target
+	// (e.g. api-gateway) would fire an alert before its dependency (db-primary)
+	// had been written to lastKnown as hard_down.
+	type hardDownAlert struct {
+		target  Target
+		errCode string
+	}
+	type recoveryAlert struct {
+		target     Target
+		retryCount int
+	}
+	var newHardDowns []hardDownAlert
+	var newRecoveries []recoveryAlert
+
 	for _, d := range dues {
 		t := d.entry.Target
 
@@ -258,11 +357,9 @@ func (e *Engine) processPending(ctx context.Context) {
 
 		if ok {
 			if e.markRecovered(pkey, t) {
-				e.sloRecordEnd(t) // SLO: close open incident
+				e.sloRecordEnd(t)
 				slog.Info("target recovered after retries", "name", t.key(), "target", t.Target, "retries", d.entry.RetryCount)
-				if e.shouldAlert(t.key()) {
-					e.sendAlert(t, "reachable")
-				}
+				newRecoveries = append(newRecoveries, recoveryAlert{t, d.entry.RetryCount})
 			}
 			continue
 		}
@@ -270,11 +367,9 @@ func (e *Engine) processPending(ctx context.Context) {
 		newCount := d.entry.RetryCount + 1
 		if newCount >= maxRetries {
 			if e.markHardDown(pkey, t, errCode) {
-				e.sloRecordStart(t, errCode) // SLO: open new incident
+				e.sloRecordStart(t, errCode)
 				slog.Error("target hard-down after retries", "name", t.key(), "target", t.Target, "retries", newCount)
-				if e.shouldAlert(t.key()) {
-					e.sendAlert(t, "unreachable")
-				}
+				newHardDowns = append(newHardDowns, hardDownAlert{t, errCode})
 			}
 		} else {
 			e.stateMu.Lock()
@@ -286,9 +381,21 @@ func (e *Engine) processPending(ctx context.Context) {
 			}
 			e.stateMu.Unlock()
 			slog.Warn("probe retry failed", "name", t.key(), "target", t.Target, "retry", newCount, "max", maxRetries, "next_in", retryInterval)
-			// Re-broadcast soft_down with updated retry count so co-probers
-			// can escalate their urgency accordingly.
 			e.broadcastSoftDown(t, newCount)
+		}
+	}
+
+	// Phase 2: fire alerts now that all state transitions are committed.
+	// Recovery alerts first (targets coming back up), then hard-down alerts.
+	// Order within each group doesn't matter for correctness.
+	for _, r := range newRecoveries {
+		if e.shouldAlert(r.target.key()) {
+			e.sendAlert(r.target, "reachable")
+		}
+	}
+	for _, h := range newHardDowns {
+		if e.shouldAlert(h.target.key()) {
+			e.sendAlert(h.target, "unreachable")
 		}
 	}
 }
@@ -368,6 +475,16 @@ func (e *Engine) execProbe(ctx context.Context, t Target) (bool, error) {
 }
 
 // ── Effective parameter helpers ───────────────────────────────────────────────
+
+func (e *Engine) effectiveRecoveryProbes(t Target) int {
+	if t.RecoveryProbes != nil && *t.RecoveryProbes > 0 {
+		return *t.RecoveryProbes
+	}
+	e.mu.RLock()
+	v := e.cfg.globalRecoveryProbes()
+	e.mu.RUnlock()
+	return v
+}
 
 func (e *Engine) effectiveMaxRetries(t Target) int {
 	if t.MaxRetries != nil {

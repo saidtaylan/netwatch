@@ -136,6 +136,10 @@ type Target struct {
 	Timeout          *int     `json:"timeout,omitempty"`
 	IntervalSec      *int     `json:"interval_sec,omitempty"` // per-target probe cadence
 
+	// RecoveryProbes overrides the global recovery_probes for this specific
+	// target. Default: inherits Config.RecoveryProbes (or 1 if not set).
+	RecoveryProbes *int `json:"recovery_probes,omitempty"`
+
 	// DependsOn lists target IDs (or names) that this target depends on.
 	// When a dependency is hard_down at the time this target goes down, that
 	// dependency is reported as the ROOT_CAUSE in alert notifications.
@@ -204,6 +208,15 @@ type Config struct {
 	RetryIntervalSec  *int `json:"retry_interval_sec,omitempty"`
 	TickerIntervalSec *int `json:"ticker_interval_sec,omitempty"`
 
+	// RecoveryProbes is the number of consecutive successful probes required
+	// before a hard_down target is declared recovered and a "reachable" alert
+	// fires. Default 1 (current behaviour) — set higher (e.g. 2 or 3) on
+	// targets prone to transient false recoveries (flapping).
+	// Symmetric to max_retries: just as max_retries protects against brief blips
+	// causing false alarms, recovery_probes protects against brief recoveries
+	// causing premature "all-clear" alerts.
+	RecoveryProbes *int `json:"recovery_probes,omitempty"`
+
 	CredentialsFile string                        `json:"credentials_file,omitempty"`
 	Notifications   map[string]AlertChannelConfig `json:"notifications,omitempty"`
 	DefaultNotify   []string                      `json:"default_notify,omitempty"`
@@ -259,6 +272,13 @@ func (c Config) globalMaxRetries() int {
 		return *c.MaxRetries
 	}
 	return 1
+}
+
+func (c Config) globalRecoveryProbes() int {
+	if c.RecoveryProbes != nil && *c.RecoveryProbes > 0 {
+		return *c.RecoveryProbes
+	}
+	return 1 // default: 1 successful probe = recovered (backward compat)
 }
 
 func (c Config) globalRetryInterval() int {
@@ -624,6 +644,11 @@ type Engine struct {
 	probeCancel   map[string]context.CancelFunc // key = target.key()
 	probeFastCheck map[string]chan struct{}       // key = target.key(); co-prober soft-down trigger
 
+	// pendingRecovery tracks targets in SOFT_UP state — i.e. hard_down targets
+	// that have seen at least one successful probe but haven't yet reached the
+	// recovery_probes threshold. Guarded by stateMu.
+	pendingRecovery map[string]int // key = typeKey(), value = consecutive success count
+
 	// retryStop cancels the background retry-loop goroutine.
 	retryStop func()
 
@@ -658,6 +683,10 @@ type Engine struct {
 	// read by broadcastState to populate GossipPayload.Latency for P1.6.
 	// sync.Map avoids the engine-wide mu/stateMu for this hot-path field.
 	lastLatency sync.Map
+
+	// maintMgr handles API-driven maintenance windows (suppress alerts for
+	// specific targets for a duration). nil on first use; initialized in Init().
+	maintMgr *maintenanceManager
 
 	// orphanedSet tracks which local targets currently have no cluster prober
 	// assigned, so updateClusterMetrics can log only on transitions (edge-
@@ -781,10 +810,11 @@ func New(hostname string, runner AlertRunner, configPath string) *Engine {
 		hostname:    hostname,
 		alertRunner: runner,
 		configPath:  configPath,
-		lastKnown:      make(map[string]PersistedState),
-		pending:        make(map[string]PendingEntry),
-		probeCancel:    make(map[string]context.CancelFunc),
-		probeFastCheck: make(map[string]chan struct{}),
+		lastKnown:       make(map[string]PersistedState),
+		pending:         make(map[string]PendingEntry),
+		pendingRecovery: make(map[string]int),
+		probeCancel:     make(map[string]context.CancelFunc),
+		probeFastCheck:  make(map[string]chan struct{}),
 	}
 	hck := &httpChecker{client: hc}
 	e.checkers = map[string]Checker{
@@ -860,6 +890,76 @@ func (e *Engine) ClusterManager() *cluster.Manager {
 // Used by cmd/linux/main.go to decide whether to register SLO metrics.
 func (e *Engine) SLOEnabled() bool {
 	return e.sloMgr != nil
+}
+
+// ── Maintenance window public API ─────────────────────────────────────────────
+
+// MaintenanceWindows returns the list of currently active maintenance windows.
+func (e *Engine) MaintenanceWindows() []MaintenanceWindow {
+	if e.maintMgr == nil {
+		return nil
+	}
+	return e.maintMgr.List()
+}
+
+// SetMaintenance adds a maintenance window locally and returns its ID.
+// The caller is responsible for broadcasting to cluster peers via
+// e.ClusterManager().BroadcastMaintenanceSet(...).
+func (e *Engine) SetMaintenance(w MaintenanceWindow) error {
+	if e.maintMgr == nil {
+		return nil
+	}
+	return e.maintMgr.Set(w)
+}
+
+// CancelMaintenance removes a maintenance window by ID locally.
+// The caller is responsible for broadcasting to cluster peers.
+func (e *Engine) CancelMaintenance(id string) error {
+	if e.maintMgr == nil {
+		return nil
+	}
+	return e.maintMgr.Cancel(id)
+}
+
+// ApplyMaintenanceSet implements cluster.MaintenanceHandler.
+// Called when a peer gossips a "set" maintenance broadcast.
+func (e *Engine) ApplyMaintenanceSet(w cluster.MaintenanceWindowPayload) error {
+	if e.maintMgr == nil {
+		return nil
+	}
+	return e.maintMgr.Set(MaintenanceWindow{
+		ID:        w.ID,
+		TargetIDs: w.TargetIDs,
+		StartedAt: w.StartedAt,
+		ExpiresAt: w.ExpiresAt,
+		Reason:    w.Reason,
+		StartedBy: w.StartedBy,
+	})
+}
+
+// ApplyMaintenanceCancel implements cluster.MaintenanceHandler.
+// Called when a peer gossips a "cancel" maintenance broadcast.
+func (e *Engine) ApplyMaintenanceCancel(id string) error {
+	if e.maintMgr == nil {
+		return nil
+	}
+	return e.maintMgr.Cancel(id)
+}
+
+// runMaintenancePruner periodically removes expired maintenance windows.
+func (e *Engine) runMaintenancePruner(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if e.maintMgr != nil {
+				e.maintMgr.PruneExpired()
+			}
+		}
+	}
 }
 
 // LoadConfig reads the config file, resolves variables, validates, and hot-swaps.
@@ -1171,6 +1271,9 @@ func (e *Engine) Init() error {
 		// update, ApplySharedConfigJSON merges it into this node's config.yaml
 		// and triggers Reload().
 		e.clusterMgr.SetConfigPushHandler(e)
+		// Wire maintenance handler: when a peer broadcasts a maintenance
+		// set/cancel, apply it locally (RAM + disk).
+		e.clusterMgr.SetMaintenanceHandler(e)
 		// Wire inventory refresh handler (Phase 13): cluster calls
 		// BroadcastInventory on each NotifyJoin so late-joining peers
 		// receive this node's current target states.
@@ -1218,12 +1321,18 @@ func (e *Engine) Init() error {
 		go e.runClusterMetricsUpdater(rootCtx)
 	}
 
-	// SLO tracker: persists incident history, checks breaches hourly.
-	// Disabled when slo.enabled is false (the default).
+	// Maintenance window manager: loads maintenance.json from disk and starts
+	// a background pruner. Always initialized so API endpoints work regardless
+	// of cluster mode.
 	e.mu.RLock()
 	sloCfg := e.cfg.SLO
 	stateFilePath := e.cfg.StateFile
 	e.mu.RUnlock()
+	e.maintMgr = newMaintenanceManager(stateFilePath)
+	go e.runMaintenancePruner(rootCtx)
+
+	// SLO tracker: persists incident history, checks breaches hourly.
+	// Disabled when slo.enabled is false (the default).
 	if sloCfg != nil && sloCfg.Enabled {
 		e.sloMgr = newSLOManager(stateFilePath)
 		go e.runSLOChecker(rootCtx)
@@ -1476,6 +1585,13 @@ func (e *Engine) computeScope(targetID string, localDown bool) string {
 //   - Cluster + quorum: only the responsible node (primary or secondary) alerts
 //   - min_probe_confirmations > 1: requires N probers to agree on hard_down
 func (e *Engine) shouldAlert(targetID string) bool {
+	// Maintenance window check — takes priority over everything else.
+	// Probes continue to run; only alert dispatch is suppressed.
+	if e.maintMgr != nil && e.maintMgr.IsInMaintenance(targetID) {
+		slog.Debug("alert suppressed: target in maintenance", "target", targetID)
+		return false
+	}
+
 	if e.clusterMgr == nil {
 		return true
 	}
