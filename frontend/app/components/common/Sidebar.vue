@@ -86,8 +86,12 @@ const alertCount = computed(() => alerts.unresolvedCount)
           v-for="item in section.items"
           :key="item.to"
           :to="item.disabled || item.soon ? undefined : item.to"
+          :aria-label="item.label + (item.soon ? ' (coming soon)' : '')"
+          :aria-disabled="item.disabled || item.soon ? 'true' : undefined"
+          :tabindex="item.disabled || item.soon ? -1 : undefined"
           :class="[
             'flex items-center gap-2 px-3 py-2 text-sm rounded-md mx-1 transition',
+            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400',
             item.disabled || item.soon ? 'opacity-40 cursor-not-allowed' : 'hover:bg-gray-800 cursor-pointer',
           ]"
           active-class="bg-gray-800 text-white"

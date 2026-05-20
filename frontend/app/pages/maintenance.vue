@@ -92,6 +92,12 @@ function endsIn(endsAt: string): string {
       </div>
     </div>
 
+    <!-- Error -->
+    <ErrorBanner :error="windows.error.value" title="Failed to load maintenance windows" @retry="windows.refresh()" />
+
+    <!-- Skeleton -->
+    <SkeletonRow v-if="windows.loading.value && !windows.data.value" :rows="3" :cols="3" />
+
     <!-- Active windows -->
     <div v-if="active.length" class="space-y-2">
       <h3 class="text-xs font-semibold text-gray-500 uppercase tracking-wide">Active ({{ active.length }})</h3>

@@ -1,0 +1,44 @@
+[Unit]
+Description=netwatch backend — distributed network monitoring agent
+Documentation=https://github.com/saidtaylan/netwatch
+After=network-online.target
+Wants=network-online.target
+PartOf=netwatch.target
+
+[Service]
+Type=simple
+User=netwatch
+Group=netwatch
+
+# Config and working directory
+WorkingDirectory=/etc/netwatch
+ExecStart=/usr/local/bin/netwatch --config /etc/netwatch/config.yaml
+
+# ICMP ping requires CAP_NET_RAW
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/netwatch /var/lib/netwatch
+PrivateTmp=true
+PrivateDevices=true
+
+# Auto-restart on failure (not during stop/reload)
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Logging — use journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=netwatch-backend
+
+# Gossip port (UDP+TCP)
+# Ensure firewall allows port 7946
+
+[Install]
+WantedBy=multi-user.target netwatch.target

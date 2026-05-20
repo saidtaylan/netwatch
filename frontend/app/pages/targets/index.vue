@@ -81,6 +81,9 @@ const counts = computed(() => {
       <span v-if="fleet.loading.value" class="text-xs text-gray-400 animate-pulse">Refreshing…</span>
     </div>
 
+    <!-- Error -->
+    <ErrorBanner :error="fleet.error.value" title="Failed to load targets" @retry="fleet.refresh()" />
+
     <!-- Table -->
     <div class="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-100 dark:border-gray-700 overflow-hidden">
       <!-- Table header -->
@@ -92,8 +95,11 @@ const counts = computed(() => {
         <span></span>
       </div>
 
+      <!-- Skeleton while loading -->
+      <SkeletonRow v-if="fleet.loading.value && targetList.length === 0" :rows="6" :cols="4" />
+
       <!-- Rows -->
-      <ul class="divide-y divide-gray-100 dark:divide-gray-700">
+      <ul v-else class="divide-y divide-gray-100 dark:divide-gray-700">
         <li v-for="([id, target]) in filtered" :key="id">
           <TargetRow :target="target" :id="id" />
         </li>

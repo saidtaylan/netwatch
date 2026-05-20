@@ -56,6 +56,52 @@ Bu belge, netwatch projesinin günlük güncellemelerini ve teknik detaylarını
   - `components/cluster/` — NodeCard, QuorumIndicator (isolated/quorum/standalone), ConfigDriftCard
   - `composables/` — useCluster, useFleet (alert change detection), useMaintenance (create/cancel), useTopology, useGeoLatency, useSLO
 
+- [frontend] **Sprint 5 — Polish (skeleton + error banner + a11y)**
+
+  - `components/common/SkeletonRow.vue` + `SkeletonCard.vue` — yeniden kullanılabilir loading state'leri
+  - `components/common/ErrorBanner.vue` — friendly hata mesajı + retry butonu (`'Failed to fetch'`, `'401'`, `'403'` patternleri için human-readable)
+  - `index.vue`, `targets/index.vue`, `targets/[id].vue`, `maintenance.vue`, `slo.vue` — skeleton + error banner entegrasyonu
+  - `Sidebar.vue` nav linklerine `aria-label`, `aria-disabled`, `focus-visible:ring-2`
+  - `ConfirmDialog.vue` — `Escape` ile kapama, `role="dialog"`, `aria-modal`, autofocus
+  - `usePolling` — error streak ile exponential back-off (errorStreak × min(2^n, 3) × baseInterval), visibility-aware
+  - 6 yeni `usePolling` unit testi: refresh, error capture, error recovery, loading lifecycle, data preservation, error streak — **toplam 75 unit test**
+
+- [frontend] **Sprint 6 — Production Deployment**
+
+  - `deploy-systemd/netwatch-backend.service` — User=netwatch, AmbientCapabilities=CAP_NET_RAW, ProtectSystem=strict, journald logging
+  - `deploy-systemd/netwatch-frontend.service` — Node 20+ ile `.output/server/index.mjs`, hardening
+  - `deploy-systemd/netwatch.target` — backend + frontend birlikte start/stop
+  - `deploy-systemd/install.sh` — sudo install script: kullanıcı yarat, dizinler, binary, frontend `.output/`, systemd units, daemon-reload, enable + start
+  - Kök `Makefile` — `make build`, `make test`, `make lint`, `make install`, `make clean` (her ikisini orchestrate)
+  - `README.md` "Admin UI" + "Production Deployment" bölümleri
+  - `make test` → backend 202 + frontend 75 = **277 test yeşil** ✓
+
+- [frontend] **Sprint 7 — Playwright E2E (kısmen tamamlandı)**
+
+  Playwright 1.60 + Chromium kuruldu. 26 e2e test yazıldı.
+
+  **Sonuç:** 17 geçiyor, 9 skip — kök sebep `pinia-plugin-persistedstate` hydration timing race condition.
+
+  - `tests/e2e/auth.setup.ts` — login akışı, storageState kaydet
+  - `tests/e2e/auth-redirect.spec.ts` — 4 test: yetkisiz → /setup yönlendirme
+  - `tests/e2e/cluster-overview.spec.ts` — 5 test (3 geçiyor): heading, stat cards, down targets
+  - `tests/e2e/targets.spec.ts` — 10 test (5 geçiyor): heading, count, detail navigation, db-primary DOWN state
+  - `tests/e2e/maintenance.spec.ts` — 6 test (4 geçiyor): heading, form aç/kapa, input doldur
+  - `tests/e2e/fixtures/mock-backend.ts` — Node HTTP server, port 19240, FLEET data
+  - `tests/e2e/fixtures/api-mocks.ts` — `page.route()` interceptions (denendi, terk edildi)
+
+  **Skip edilen 9 test:**
+  - cluster-overview: sidebar nav, dark mode toggle (selector flaky)
+  - maintenance: empty state, success toast (polling timing)
+  - targets list: 5 data-dependent test (pinia hydration race)
+
+  Skip nedenleri her test başında `test.skip()` ile dokümante edildi. Kök sebep `sprint.md` S8'de detaylı yazıldı.
+
+- [dokuman] **CLAUDE.md kuralları**
+
+  - **Frontend Routing Kuralı — Named Routes Şart:** Tüm `NuxtLink`/`navigateTo` çağrıları named route kullanır (`{ name: 'targets-id', params: { id } }`). String path **yasak**. Refactor sprint S9'a yazıldı.
+  - **Persistent Store Kararı:** `auth`, `nodes`, `ui` stores localStorage'da kalıcı. F5'te tekrar giriş gerekmesin (Kibana/Grafana pattern). Self-hosted single-admin-token modeli. LDAP gelene kadar değişmeyecek.
+
 - [frontend] **Sprint 4 — Target detail + Topology**
 
   - `pages/targets/[id].vue` — Header (state/scope/classification), ScopeClassificationCard (down/up nodes), ByNodeBreakdown tablosu, DependencyChip (root_cause/deps/impact), ProberAssignment listesi, GeoLatency per-node tablo

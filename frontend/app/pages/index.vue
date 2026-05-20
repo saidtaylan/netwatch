@@ -27,39 +27,51 @@ const downTargets = computed(() => fleet.data.value?.down_targets ?? [])
       <span v-if="version" class="text-xs text-gray-400">v{{ version.version }}</span>
     </div>
 
+    <!-- Errors -->
+    <ErrorBanner :error="clusterState.error.value" title="Failed to load cluster state" @retry="clusterState.refresh()" />
+    <ErrorBanner :error="fleet.error.value" title="Failed to load fleet status" @retry="fleet.refresh()" />
+
     <!-- Status cards -->
     <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-      <!-- Cluster nodes -->
-      <div class="bg-white dark:bg-gray-800 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-gray-700">
-        <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Cluster Nodes</p>
-        <p class="text-2xl font-bold text-gray-900 dark:text-white">{{ memberCount }}</p>
-        <p v-if="isolated" class="text-xs text-orange-500 mt-1">⚠ Isolated mode</p>
-        <p v-else-if="quorum === true" class="text-xs text-green-500 mt-1">✓ Quorum healthy</p>
-        <p v-else-if="quorum === false" class="text-xs text-red-500 mt-1">✗ Quorum lost</p>
-      </div>
+      <!-- Skeleton while first load -->
+      <template v-if="fleet.loading.value && !fleet.data.value">
+        <SkeletonCard :count="4" />
+      </template>
 
-      <!-- Targets UP -->
-      <div class="bg-white dark:bg-gray-800 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-gray-700">
-        <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Targets Up</p>
-        <p class="text-2xl font-bold text-green-600">{{ counts.up }}</p>
-        <p v-if="counts.soft_up" class="text-xs text-lime-500 mt-1">+{{ counts.soft_up }} recovering</p>
-      </div>
+      <!-- Actual cards -->
+      <template v-else>
+        <!-- Cluster nodes -->
+        <div class="bg-white dark:bg-gray-800 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-gray-700">
+          <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Cluster Nodes</p>
+          <p class="text-2xl font-bold text-gray-900 dark:text-white">{{ memberCount }}</p>
+          <p v-if="isolated" class="text-xs text-orange-500 mt-1">⚠ Isolated mode</p>
+          <p v-else-if="quorum === true" class="text-xs text-green-500 mt-1">✓ Quorum healthy</p>
+          <p v-else-if="quorum === false" class="text-xs text-red-500 mt-1">✗ Quorum lost</p>
+        </div>
 
-      <!-- Targets Down -->
-      <div class="bg-white dark:bg-gray-800 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-gray-700">
-        <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Targets Down</p>
-        <p :class="['text-2xl font-bold', counts.hard_down ? 'text-red-600' : 'text-gray-400']">{{ counts.hard_down }}</p>
-        <p v-if="counts.soft_down" class="text-xs text-orange-500 mt-1">+{{ counts.soft_down }} soft down</p>
-      </div>
+        <!-- Targets UP -->
+        <div class="bg-white dark:bg-gray-800 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-gray-700">
+          <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Targets Up</p>
+          <p class="text-2xl font-bold text-green-600">{{ counts.up }}</p>
+          <p v-if="counts.soft_up" class="text-xs text-lime-500 mt-1">+{{ counts.soft_up }} recovering</p>
+        </div>
 
-      <!-- Config drift -->
-      <div class="bg-white dark:bg-gray-800 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-gray-700">
-        <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Config Drift</p>
-        <p :class="['text-2xl font-bold', drift ? 'text-yellow-600' : 'text-green-600']">
-          {{ drift ? `${drift} peer${drift > 1 ? 's' : ''}` : 'In sync' }}
-        </p>
-        <NuxtLink to="/config" class="text-xs text-blue-500 hover:underline mt-1 block">View →</NuxtLink>
-      </div>
+        <!-- Targets Down -->
+        <div class="bg-white dark:bg-gray-800 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-gray-700">
+          <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Targets Down</p>
+          <p :class="['text-2xl font-bold', counts.hard_down ? 'text-red-600' : 'text-gray-400']">{{ counts.hard_down }}</p>
+          <p v-if="counts.soft_down" class="text-xs text-orange-500 mt-1">+{{ counts.soft_down }} soft down</p>
+        </div>
+
+        <!-- Config drift -->
+        <div class="bg-white dark:bg-gray-800 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-gray-700">
+          <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Config Drift</p>
+          <p :class="['text-2xl font-bold', drift ? 'text-yellow-600' : 'text-green-600']">
+            {{ drift ? `${drift} peer${drift > 1 ? 's' : ''}` : 'In sync' }}
+          </p>
+          <NuxtLink to="/config" class="text-xs text-blue-500 hover:underline mt-1 block">View →</NuxtLink>
+        </div>
+      </template>
     </div>
 
     <!-- Down targets list -->

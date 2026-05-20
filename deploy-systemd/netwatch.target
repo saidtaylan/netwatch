@@ -1,0 +1,13 @@
+[Unit]
+Description=netwatch — backend agent + frontend UI
+Documentation=https://github.com/saidtaylan/netwatch
+
+# Bring up both services together.
+# systemctl start netwatch.target   → starts both
+# systemctl stop  netwatch.target   → stops both
+# systemctl status netwatch.target  → shows aggregate status
+Wants=netwatch-backend.service netwatch-frontend.service
+After=netwatch-backend.service netwatch-frontend.service
+
+[Install]
+WantedBy=multi-user.target

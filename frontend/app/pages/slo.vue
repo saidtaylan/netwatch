@@ -18,6 +18,8 @@ const enabled = computed(() => error.value?.message?.includes('503') === false &
       <button @click="refresh" class="text-xs text-blue-500 hover:underline">Refresh</button>
     </div>
 
+    <ErrorBanner :error="error" title="Failed to load SLO data" @retry="refresh()" />
+
     <div v-if="error?.message?.includes('503')" class="bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-300 rounded-xl p-4">
       <p class="text-sm text-yellow-700 dark:text-yellow-300">SLO tracking is disabled. Set <code>slo.enabled: true</code> in config.yaml.</p>
     </div>

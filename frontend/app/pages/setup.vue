@@ -71,7 +71,7 @@ async function connect() {
           v-model="backendUrls[i]"
           type="url"
           placeholder="http://192.168.1.10:10240"
-          class="flex-1 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+          class="flex-1 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white px-3 py-2 text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
         />
         <button
           v-if="backendUrls.length > 1"
@@ -94,7 +94,7 @@ async function connect() {
         v-model="token"
         type="password"
         placeholder="Leave empty if auth is disabled"
-        class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+        class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white px-3 py-2 text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
       />
       <p class="text-xs text-gray-400 mt-1">This is your <code>admin.token</code> from config.yaml</p>
     </div>

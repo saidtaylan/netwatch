@@ -86,17 +86,66 @@ Detay: `developments.md` 2026-05-20.
 
 Push config + keyring rotate sayfaları S3'te yapıldı. Kalan: smoke test gerçek backend ile.
 
-### S7 — [frontend] Production-Hardening + Deployment (Bekliyor)
+### ✅ S6 — [frontend] Production-Hardening + Deployment (Tamamlandı 2026-05-20)
 
-- systemd target dosyaları
-- Top-level README "Deployment" bölümü
-- `pnpm build` CI gate
+- `deploy-systemd/netwatch-backend.service`, `netwatch-frontend.service`, `netwatch.target`
+- `deploy-systemd/install.sh` — sudo install script (kullanıcı + dizinler + units)
+- Kök `Makefile` — `make build`, `make test`, `make install`
+- `README.md` "Admin UI" + "Production Deployment" bölümleri
+- `pnpm build` clean ✓
 
-### S8 — [frontend] Tests (Bekliyor)
+### ✅ S7 — [frontend] Playwright e2e tests (Kısmen tamamlandı — 2026-05-20)
 
-67 unit test mevcut. Kalan:
-- Playwright e2e: login akışı, targets list render, maintenance create/delete
-- `Makefile` `frontend-test` target'ı
+**Durum:** 26 e2e test yazıldı, **17 geçiyor + 9 skip edildi**.
+- Geçen: auth setup, auth redirect (4), cluster overview (3), maintenance (4), targets (5)
+- Skip edilen: cluster-overview sidebar/dark-mode, maintenance empty/toast, targets list 5 data testi
+
+**Kalan iş → S8.**
+
+---
+
+### S8 — [frontend] E2E Test Reliability Refactor ⏳ Bekliyor
+
+**Hedef:** 9 skip edilen e2e testi tekrar aktive et.
+
+**Kök sebep:** `pinia-plugin-persistedstate` hydration timing'i — store'lar `localStorage`'dan yüklenmeden önce composable'lar (`useFleet` vb.) `onMounted` fetch'ini tetikliyor. İlk API çağrısı `activeUrl=null` görüyor → exception → data null kalıyor.
+
+**Çözüm önerileri (sırayla denenecek):**
+1. `useApi.ensureActive()` 'da küçük retry mekanizması (3 × 50ms) ekle — hydration tamamlansın
+2. Pinia hydration'ı bir Nuxt plugin'i ile zorla beklet
+3. Production manual smoke — gerçek backend ile bu race oluyor mu? UI gerçekte de yarış condition'a giriyorsa **bu test'ten önce kodu düzeltmek gerek**
+4. Alternatif: `useAsyncData` pattern'ine geç (Nuxt'un kendi hydration mekanizması)
+
+**Kabul kriterleri:** 26/26 e2e test yeşil.
+
+**Tahmini efor:** 1-2 saat (kök sebep tespiti) + 1 saat (refactor + retest).
+
+---
+
+### S9 — [frontend] Named Routes Refactor ⏳ Bekliyor
+
+**Hedef:** Tüm string-path route kullanımlarını named route'a çevir. Kural CLAUDE.md "Frontend Routing Kuralı"nda tanımlı.
+
+**Refactor edilecek alanlar (~30 yer):**
+
+| Konum | Adet | Örnek |
+|---|---|---|
+| middleware/composables/pages programatic | 5 | `navigateTo('/setup')` → `navigateTo({ name: 'setup' })` |
+| pages static NuxtLink | 7 | `<NuxtLink to="/config">` → `<NuxtLink :to="{ name: 'config' }">` |
+| Sidebar items array | 14 | `{ to: '/targets' }` → `{ to: { name: 'targets' } }` |
+| targets/[id] dynamic links | 11 | `:to="\`/targets/${id}\`"` → `:to="{ name: 'targets-id', params: { id } }"` |
+
+**Test kapsamı:** Tüm unit + e2e testler hâlâ geçmeli. E2E'deki `expect(page).toHaveURL('/targets')` gibi assertion'lar dokunulmaz (browser'ın URL'sini test ediyoruz).
+
+**Tahmini efor:** 2-3 saat.
+
+---
+
+### S10 — [frontend] CI Gate Integration ⏳ Bekliyor
+
+- `Makefile` `test-frontend` target'ına `test:e2e` ekle
+- GitHub Actions / GitLab CI pipeline'ında frontend test job'u
+- `pnpm build` zorunlu çıktı kontrolü
 
 **Hedef:** `pnpm dev` ile boş ama navigasyonlu uygulama açılsın.
 

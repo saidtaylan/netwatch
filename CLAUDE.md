@@ -21,7 +21,21 @@ Tek git repo, iki servis:
 network cluster/
   backend/        ← Go kodu (github.com/saidtaylan/netwatch)
   frontend/       ← Nuxt 3 SPA
+  deploy-systemd/ ← systemd .service + .target + install.sh
+  Makefile        ← Kök Makefile (her iki servisi orchestrate eder)
   developments.md, system_map.md, sprint.md, todo.md, CLAUDE.md   ← Paylaşılan
+```
+
+---
+
+## Kök Makefile Komutları
+
+```bash
+make build          # backend (linux-amd64) + frontend (.output/) birlikte build
+make test           # backend go test -race + frontend pnpm test
+make lint           # go vet
+make clean          # backend bin/ + frontend .output/.nuxt temizle
+make install        # sudo: systemd servisleri kur (Linux)
 ```
 
 ---
@@ -148,6 +162,83 @@ frontend/
 **Multi-node failover:** `stores/nodes.ts` birden fazla backend URL tutar. `useNodeConnection.ts` başlangıçta `Promise.any` ile en hızlı cevap vereni seçer; aktif node 401/network error verirse otomatik fallback.
 
 **Auth akışı:** Token yoksa `auth.global.ts` → `/setup`. Token `POST` ile check edilir (`GET /auth/whoami`). Başarılıysa Pinia+localStorage'a yazılır. Her API çağrısına `Authorization: Bearer` eklenir. 401 → otomatik logout.
+
+---
+
+## 🚨 Frontend Routing Kuralı — Named Routes Şart
+
+**KURAL:** Tüm `NuxtLink`, `navigateTo`, ve `router.push` çağrılarında **named route** kullanılır. String path **YASAK**.
+
+### Neden?
+
+Path değişirse (örn. `/targets/[id]` → `/services/[id]`), string referansları her dosyada tek tek aramak gerekir. Named route ile sadece dosya adı değişir, name'i kullanan yerler değişmez. Refactor güvencesi.
+
+### Nuxt 4 file-based routing → otomatik isim üretimi
+
+| Dosya | Auto-generated `name` |
+|---|---|
+| `app/pages/index.vue` | `index` |
+| `app/pages/setup.vue` | `setup` |
+| `app/pages/targets/index.vue` | `targets` |
+| `app/pages/targets/[id].vue` | `targets-id` |
+| `app/pages/config/index.vue` | `config` |
+| `app/pages/config/push.vue` | `config-push` |
+| `app/pages/config/keyring.vue` | `config-keyring` |
+| `app/pages/settings/index.vue` | `settings` |
+| `app/pages/settings/nodes.vue` | `settings-nodes` |
+
+### ✅ Doğru kullanım
+
+```vue
+<!-- NuxtLink with route object -->
+<NuxtLink :to="{ name: 'targets' }">Targets</NuxtLink>
+<NuxtLink :to="{ name: 'targets-id', params: { id: targetId } }">Detail</NuxtLink>
+<NuxtLink :to="{ name: 'config-push' }">Push Config</NuxtLink>
+
+<!-- navigateTo with route object -->
+navigateTo({ name: 'setup' })
+navigateTo({ name: 'targets-id', params: { id: 'db-primary' } })
+```
+
+### ❌ Yasak
+
+```vue
+<!-- String path — YASAK -->
+<NuxtLink to="/targets">Targets</NuxtLink>
+<NuxtLink :to="`/targets/${encodeURIComponent(id)}`">Detail</NuxtLink>
+navigateTo('/setup')
+navigateTo(`/targets/${id}`)
+```
+
+### Tek istisna: External URL'ler
+
+```vue
+<a :href="externalUrl">External</a>     <!-- external URL'ler için OK -->
+```
+
+### Test kuralları
+
+Playwright e2e testlerinde de path yerine name veya `route().name` kullanılabilir, ama URL assertion'ları `expect(page).toHaveURL(...)` path olabilir (browser'ın gerçek URL'sini test ediyoruz).
+
+---
+
+## Persistent Store Kararı
+
+Pinia + `pinia-plugin-persistedstate` ile **3 store kalıcı:**
+
+| Store | İçerik | Neden persist? |
+|---|---|---|
+| `auth` | token + role | F5'te tekrar giriş yapmasın (Kibana/Grafana benzeri) |
+| `nodes` | backend URL listesi + aktif node + health | Kullanıcı her seferinde URL girmesin |
+| `ui` | `pollingIntervalMs`, `sidebarCollapsed`, theme (`color-mode`) | Kullanıcı tercihleri kalıcı |
+
+**Persist edilmeyen:** `alerts` (in-memory ring buffer, sayfa kapanınca silinmesi mantıklı — B7 backend hazır olunca `/alerts` endpoint'ine geçecek).
+
+**Alternatifler değerlendirildi:**
+- Cookie + backend session: Şu an gereksiz karmaşıklık. LDAP geldiğinde değerlendirilir.
+- IndexedDB: localStorage yeterli; veri küçük.
+
+**Karar sabittir** — değişmeyecek.
 
 ---
 

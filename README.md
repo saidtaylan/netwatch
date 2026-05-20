@@ -1,5 +1,7 @@
 # netwatch
 
+> **Two services, one repo:** `backend/` (Go agent) + `frontend/` (Nuxt 3 admin UI)
+
 **netwatch** is a distributed network monitoring agent written in Go. It runs as a Prometheus exporter and continuously probes TCP, HTTP/HTTPS, ICMP, DNS, and SQL targets. Multiple instances form a gossip cluster that agrees on which node sends each alert — so the same outage never produces duplicate notifications regardless of how many agents are watching the same target.
 
 ---
@@ -1186,6 +1188,63 @@ Keep state files intact.
 **Config reload (`reload_interval_sec`):** One file read + YAML parse per interval. A 10 KB config file parses in microseconds.
 
 **Cumulative verdict:** Single-digit MB RAM, well under 1% CPU in normal operation. The bottleneck is outbound probe connections, not internal coordination.
+
+---
+
+## Admin UI (Frontend)
+
+netwatch ships with a Nuxt 3 SPA that covers every backend endpoint:
+
+| Section | What you can do |
+|---|---|
+| **Cluster Overview** | Node list, quorum status, config drift, down target summary |
+| **Targets** | Filterable list + per-target detail (scope, classification, by-node breakdown, prober assignment) |
+| **Topology** | Dependency graph — root cause, cascading impact |
+| **SLO** | Per-target uptime, error budget, incident history |
+| **Maintenance** | Schedule/cancel maintenance windows (suppresses alerts, gossip-replicated) |
+| **Alerts** | In-session state-change feed; persistent history with B7 when ready |
+| **Config** | View drift, push shared config to all nodes, keyring rotation |
+| **Geo Latency** | Per-region probe latency with anomaly detection |
+
+### Development
+
+```bash
+# Terminal 1 — backend
+cd backend && go run ./cmd/linux/ --config config.yaml
+
+# Terminal 2 — frontend
+cd frontend && pnpm dev
+# Open http://localhost:3000, enter http://localhost:10240 as backend URL
+```
+
+### Production Deployment (Linux systemd)
+
+```bash
+# 1. Build both
+make build
+
+# 2. Install (creates netwatch user, copies files, installs units)
+sudo make install
+
+# 3. Start both services
+sudo systemctl start netwatch.target
+
+# Status + logs
+sudo systemctl status netwatch.target
+sudo journalctl -u netwatch-backend -u netwatch-frontend -f
+```
+
+The `netwatch.target` unit starts/stops both `netwatch-backend.service` and `netwatch-frontend.service` together.
+
+**Default ports:**
+- Backend (Prometheus/API): `10240`
+- Frontend (admin UI):      `3000`
+
+**Configure frontend backend URL** via env var before starting:
+```bash
+# In /etc/netwatch/frontend.env (uncomment EnvironmentFile in netwatch-frontend.service)
+NUXT_PUBLIC_DEFAULT_BACKEND_URL=http://192.168.1.10:10240
+```
 
 ---
 

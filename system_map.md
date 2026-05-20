@@ -163,6 +163,10 @@ frontend/
 
 **Auth modeli:** Single admin token (config.yaml `admin.token`). Token → `/auth/whoami` ile verify. Self-hosted, SaaS değil. İleride LDAP eklenirse `WhoAmIResponse.role` genişletilir.
 
+**Routing kuralı:** Tüm `NuxtLink`/`navigateTo` çağrıları **named route** kullanır (`{ name: 'targets-id', params: { id } }`). String path **YASAK** (refactor güvencesi). Detay → `CLAUDE.md` "Frontend Routing Kuralı". Mevcut kodda ~30 string-path violation var; S9 sprint'inde toplu temizlenecek.
+
+**Persistent store:** `auth`, `nodes`, `ui` localStorage'da kalıcı (`pinia-plugin-persistedstate`). F5'te tekrar giriş gerekmesin. `alerts` in-memory (B7 sonrası `/alerts` endpoint'i geldiğinde değişir).
+
 **Multi-node failover:** `stores/nodes.ts` birden fazla URL tutar. `useNodeConnection.selectActiveNode()` → `Promise.any($fetch /health)` ile en hızlı yanıt veren. Active node down → `markUnhealthy` + failover.
 
 ## Yol Haritası
@@ -187,9 +191,12 @@ frontend/
 | S2 | Auth (single-token) + multi-node connection + 67 unit test | ✅ Tamamlandı |
 | S3 | Tüm sayfalar: targets, slo, maintenance, alerts, config, geo, placeholders | ✅ Tamamlandı |
 | S4 | Target detail + topology | ✅ Tamamlandı |
-| S5 | Polish: loading skeletons, error bounds, a11y | 🔄 Sonraki |
-| S6 | Production-hardening + systemd target | ⏳ Bekliyor |
-| S7 | Playwright e2e tests | ⏳ Bekliyor |
+| S5 | Polish: skeletons, error banner, a11y, polling back-off | ✅ Tamamlandı |
+| S6 | systemd target + install.sh + root Makefile + README | ✅ Tamamlandı |
+| S7 | Playwright e2e (17 geçen + 9 skip) | ⚠ Kısmen — S8'e taşındı |
+| S8 | E2E reliability — pinia hydration race fix | ⏳ Bekliyor |
+| S9 | Named routes refactor (string path → name) | ⏳ Bekliyor |
+| S10 | CI gate integration | ⏳ Bekliyor |
 
 ### Backend Backlog (B-items) — UI sonrası
 

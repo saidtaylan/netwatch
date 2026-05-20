@@ -43,9 +43,21 @@ const upNodes = computed(() =>
       <NuxtLink to="/targets" class="text-sm text-gray-400 hover:text-gray-600">← Targets</NuxtLink>
     </div>
 
+    <!-- Error -->
+    <ErrorBanner :error="fleet.error.value" title="Failed to load target" @retry="fleet.refresh()" />
+
+    <!-- Skeleton -->
+    <div v-if="fleet.loading.value && !target" class="space-y-4" aria-busy="true">
+      <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-100 dark:border-gray-700 p-5">
+        <div class="h-6 w-48 bg-gray-200 dark:bg-gray-700 rounded animate-pulse mb-3" />
+        <div class="h-4 w-64 bg-gray-100 dark:bg-gray-800 rounded animate-pulse" />
+      </div>
+      <SkeletonRow :rows="4" :cols="4" />
+    </div>
+
     <!-- Not found -->
     <EmptyState
-      v-if="!fleet.loading.value && !target"
+      v-else-if="!fleet.loading.value && !target"
       :title="`Target '${id}' not found`"
       description="It may have been removed or the ID is incorrect."
       icon="🔍"
