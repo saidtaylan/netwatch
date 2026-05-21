@@ -6,7 +6,7 @@ Bu dosya aktif geliştirme planını içerir. Tamamlananlar → **developments.m
 
 ---
 
-## 🔄 Aktif Sprint — [frontend] Nuxt 3 UI
+## ✅ Sprint Tamamlandı — [frontend] Nuxt 4 UI (S0–S11, 2026-05-20 / 2026-05-21)
 
 **Başlangıç:** 2026-05-20
 **Hedef:** Tüm backend endpoint'lerini kapsayan, production'a hazır admin UI
@@ -142,6 +142,20 @@ Tüm string-path route kullanımları named route'a çevrildi.
 - Backend 202 + Frontend unit 75 + E2E 26 = tümü yeşil
 
 ---
+
+### ✅ S11 — [frontend] Temel Kapanış (Tamamlandı 2026-05-21)
+
+Frontend sprint'inin son temel parçaları — production-ready hale getirme:
+
+- **`app/error.vue`** — Nuxt 4 standart error page. 404 / 500 / auth error handler. Kullanıcı butonları: "Go to Cluster Overview" (auth varsa) / "Go to Setup" (auth yoksa) / "Go back". Dev modda stack trace details. `import.meta.dev` kullanıldı (Nuxt 4 standardı, `process.dev` yerine).
+- **`<NuxtLoadingIndicator>`** — `app.vue`'a eklendi. Route geçişlerinde üstte ince blue progress bar.
+- **Composable testleri (toplam +24):**
+  - `useAuth.test.ts` — 9 test: checkToken (Bearer header on/off), login (success, no node, propagate failure), logout (state cleared)
+  - `useApi.test.ts` — 9 test: GET/POST/PUT/DELETE method dispatch, Authorization injection, no-node throw, response parsing, network error failover
+  - `useMaintenance.test.ts` — 8 test: PUT payload, success/error toast, default createdBy, DELETE id, active filter (expired excluded)
+- **E2E error page testleri** — `tests/e2e/error-page.spec.ts` 3 test: 404 görünür, "Go to Cluster Overview" butonu, ana sayfaya dönüş.
+
+**Final test sayısı:** Backend 202 + Frontend unit **99** + E2E **29** = **330 test yeşil** ✓
 
 ### ✅ S10 — [frontend] CI Gate Integration (Tamamlandı 2026-05-21)
 

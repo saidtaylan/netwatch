@@ -101,7 +101,8 @@ frontend/
     setup.ts           # $fetch + navigateTo global stubs
 
   app/
-    app.vue            # NuxtLayout + NuxtPage
+    app.vue            # NuxtLayout + NuxtPage + NuxtLoadingIndicator
+    error.vue          # 404/500/auth-error global handler (Nuxt 4 standart)
     layouts/
       default.vue      # Sidebar + TopBar + Toast
       auth.vue         # Centered card (setup)
@@ -197,6 +198,9 @@ frontend/
 | S8 | E2E reliability (303 test yeşil, 6 kök sebep çözüldü) | ✅ Tamamlandı |
 | S9 | Named routes refactor (~30 yer, 0 string path kaldı) | ✅ Tamamlandı |
 | S10 | CI gate — Makefile + GitHub Actions workflow | ✅ Tamamlandı |
+| S11 | Temel kapanış: error.vue + NuxtLoadingIndicator + 24 composable testi | ✅ Tamamlandı |
+
+**Frontend sprint'i (S0–S11) kapandı.** Toplam: 202 backend + 99 frontend unit + 29 e2e = **330 test yeşil**.
 
 ### Backend Backlog (B-items) — UI sonrası
 

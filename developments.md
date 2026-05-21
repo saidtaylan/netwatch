@@ -16,6 +16,30 @@ Bu belge, netwatch projesinin günlük güncellemelerini ve teknik detaylarını
 
 ---
 
+## 2026-05-21 — Frontend S11: Temel Kapanış + Error Page
+
+- [frontend] **`app/error.vue`** — Nuxt 4 standart error handler eklendi
+  - 404: "Page not found" + "Go to Cluster Overview" / "Go back"
+  - 401/403: "Access denied" + "Go to Setup"
+  - 500: "Something went wrong" + error message
+  - `clearError({ redirect })` ile state cleanup + navigation
+  - Dev modda stack trace details (`import.meta.dev` — Nuxt 4 standardı, `process.dev` deprecated)
+
+- [frontend] **`<NuxtLoadingIndicator>`** — `app.vue`'a eklendi. Route geçişlerinde 2px blue progress bar.
+
+- [frontend] **Composable test kapsamı genişletildi (+24 test)**
+  - `tests/unit/composables/useAuth.test.ts` — 9 test (checkToken, login, logout)
+  - `tests/unit/composables/useApi.test.ts` — 9 test (HTTP methods, auth header, failover)
+  - `tests/unit/composables/useMaintenance.test.ts` — 8 test (CRUD, toasts, active filter)
+
+- [frontend] **E2E error page testleri** — `tests/e2e/error-page.spec.ts` 3 test
+
+**Final sayılar:** Backend 202 + Frontend unit **99** + E2E **29** = **330 test yeşil** ✅
+
+Frontend sprint'i (S0–S11) tamamen kapandı.
+
+---
+
 ## 2026-05-21 — Frontend S8/S9/S10 + Nuxt 4 review
 
 - [frontend] **S8 — E2E Test Reliability (303 test yeşil)** 🎯
