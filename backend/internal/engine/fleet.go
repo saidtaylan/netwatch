@@ -36,6 +36,7 @@ type FleetNodeView struct {
 
 // FleetTarget is one target's entry in the fleet view.
 type FleetTarget struct {
+	ID              string                   `json:"id"` // target.key() — matches config id or name
 	Name            string                   `json:"name"`
 	TargetAddr      string                   `json:"target"`
 	Type            string                   `json:"type"`
@@ -249,6 +250,7 @@ func (e *Engine) FleetSnapshot() FleetSnapshot {
 		}
 
 		ft := FleetTarget{
+			ID:              key,
 			Name:            t.Name,
 			TargetAddr:      t.Target,
 			Type:            t.Type,

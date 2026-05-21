@@ -418,6 +418,66 @@ Detay için `todo.md`. Öneri sırası: **B2 → B1 → B7** (Production Polish)
 
 **Ek:** F5 (Kubernetes SD) de bekleyen backend sprinti.
 
+### Yeni İstekler — Demo & Kullanım Sırasında Fark Edildi (2026-05-21)
+
+Bu istemler `GUIDE_OWNER.md`'de detaylı açıklanmış.
+
+#### B12 — SLO Target CRUD API ⏳ Bekliyor
+
+**Sorun:** SLO target eklemek/güncellemek/silmek için config.yaml'ı elle düzenlemek gerekiyor. Deploy olmadan çalışma zamanında yönetmek mümkün değil.
+
+**Önerilen endpoint'ler:**
+```
+GET    /slo/targets           → mevcut SLO target listesi + hesaplanan değerler
+PUT    /slo/targets/{id}      → target_uptime, window güncelle (yoksa ekle)
+DELETE /slo/targets/{id}      → SLO takibini kaldır (incidents.json temizlenmez)
+```
+
+**Cluster davranışı:** `PUT /cluster/config` mekanizmasına benzer — gossip ile tüm node'lara yayılır. Alternatif: sadece bu node'un `slo.targets` listesini güncelle, `POST /cluster/config/sync` ile senkron et.
+
+**Tahmini efor:** 2-3 saat.  
+**Bağımlılık:** Yok.
+
+---
+
+#### B13 — last_probed_at + last_state_change_at ⏳ Bekliyor
+
+**Sorun:** Frontend'de "ne zaman probe atıldı", "ne zaman UP/DOWN oldu" gösterilemiyor. `seq` numarası var ama timestamp yok.
+
+**Backend değişikliği:**
+```go
+// internal/engine/fleet.go
+type FleetTarget struct {
+    ...
+    LastProbedAt     *time.Time `json:"last_probed_at,omitempty"`
+    LastStateChangeAt *time.Time `json:"last_state_change_at,omitempty"`
+}
+```
+
+Engine'de atomik map:
+```go
+e.lastProbeAt     sync.Map  // key → time.Time
+e.lastStateChange sync.Map  // key → time.Time
+```
+
+**Frontend değişikliği:** Target listesinde "5m ago" badge, target detail'de timestamp göster.
+
+**Tahmini efor:** 1-2 saat (backend + frontend).  
+**Bağımlılık:** Yok.
+
+---
+
+#### B14 — down_since Aktivasyonu ⏳ Bekliyor
+
+**Durum:** `FleetTarget.DownSince *time.Time` backend struct'ında zaten var ama fleet.go'da populate edilmiyor.
+
+**Çözüm:** `markHardDown()` çağrıldığında `downSince = time.Now()`, recovery'de temizle. `FleetSnapshot()` bu değeri `ft.DownSince`'e koy.
+
+**UI:**  Target listesinde "DOWN for 2h 15m" göster.
+
+**Tahmini efor:** 30 dakika.  
+**Bağımlılık:** Yok — en kolay B-item.
+
 ---
 
 ## ✅ Sprint Tamamlandı — [backend] Production Quality Features (F1-F4)

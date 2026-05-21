@@ -6,12 +6,12 @@ import { fmtLatency, fmtRelative } from '~/utils/format'
 const route   = useRoute()
 const id      = computed(() => decodeURIComponent(route.params.id as string))
 
-const { fleet }    = useFleet()
+const { targetById, fleet } = useFleet()
 const { topology } = useTopology()
 const { geo }      = useGeoLatency(id.value)
 const api          = useApi()
 
-const target = computed(() => fleet.data.value?.targets?.[id.value] ?? null)
+const target = computed(() => targetById(id.value))
 const topo   = computed(() => topology.data.value?.targets?.[id.value] ?? null)
 const style  = computed(() => target.value ? stateStyle(target.value.consensus_state) : null)
 

@@ -51,6 +51,7 @@ const sections: { title?: string; items: NavItem[] }[] = [
     items: [
       { label: 'Backend Nodes', icon: '🖥️', to: { name: 'settings-nodes' } },
       { label: 'Preferences',   icon: '⚙️',  to: { name: 'settings' } },
+      { label: 'Docs',          icon: '📖', to: { name: 'docs' } },
     ],
   },
 ]

@@ -2,7 +2,7 @@
 import type { FleetTarget, TargetState, TargetType } from '~/types/api'
 import { isDown } from '~/utils/classifyState'
 
-const { fleet, targetList } = useFleet()
+const { fleet, targetList, counts } = useFleet()
 
 // ── Filters ────────────────────────────────────────────────────────────────
 const search    = ref('')
@@ -15,8 +15,10 @@ const availableTypes = computed<string[]>(() => {
   return ['all', ...Array.from(types).sort()]
 })
 
-const filtered = computed<Array<[string, FleetTarget]>>(() => {
-  return Object.entries(fleet.data.value?.targets ?? {}).filter(([id, t]) => {
+// targets is now an array — filter directly
+const filtered = computed<FleetTarget[]>(() => {
+  return targetList.value.filter(t => {
+    const id = t.id
     if (search.value && !t.name.toLowerCase().includes(search.value.toLowerCase())
         && !t.target.toLowerCase().includes(search.value.toLowerCase())
         && !id.toLowerCase().includes(search.value.toLowerCase())) return false
@@ -27,14 +29,11 @@ const filtered = computed<Array<[string, FleetTarget]>>(() => {
   })
 })
 
-const counts = computed(() => {
-  const all = targetList.value
-  return {
-    total: all.length,
-    up:    all.filter(t => t.consensus_state === 'up').length,
-    down:  all.filter(t => isDown(t.consensus_state)).length,
-  }
-})
+const localCounts = computed(() => ({
+  total: targetList.value.length,
+  up:    targetList.value.filter(t => t.consensus_state === 'up').length,
+  down:  targetList.value.filter(t => isDown(t.consensus_state)).length,
+}))
 </script>
 
 <template>
@@ -44,7 +43,7 @@ const counts = computed(() => {
       <div>
         <h2 class="text-xl font-bold text-gray-900 dark:text-white">Targets</h2>
         <p class="text-sm text-gray-500 dark:text-gray-400 mt-0.5">
-          {{ counts.total }} total · {{ counts.up }} up · {{ counts.down }} down
+          {{ localCounts.total }} total · {{ localCounts.up }} up · {{ localCounts.down }} down
         </p>
       </div>
     </div>
@@ -100,8 +99,8 @@ const counts = computed(() => {
 
       <!-- Rows -->
       <ul v-else class="divide-y divide-gray-100 dark:divide-gray-700">
-        <li v-for="entry in filtered" :key="entry[0]">
-          <TargetRow :target="entry[1]" :id="entry[0]" />
+        <li v-for="t in filtered" :key="t.id">
+          <TargetRow :target="t" :id="t.id" />
         </li>
       </ul>
 

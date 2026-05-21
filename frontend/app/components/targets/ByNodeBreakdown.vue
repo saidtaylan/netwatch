@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import type { PeerTargetState } from '~/types/api'
+import type { FleetNodeView } from '~/types/api'
 import { stateStyle } from '~/utils/classifyState'
 import { fmtLatency } from '~/utils/format'
 
-defineProps<{ byNode: Record<string, PeerTargetState> }>()
+defineProps<{ byNode: Record<string, FleetNodeView> }>()
 </script>
 
 <template>

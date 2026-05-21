@@ -63,47 +63,65 @@ export interface PeerTargetState {
 
 // ── /fleet/status ────────────────────────────────────────────────────────────
 
+// Actual backend response shape (fleet.go FleetSnapshot)
 export interface FleetSnapshot {
-  node_name:      string
-  cluster_enabled: boolean
-  members?:       FleetMember[]
-  quorum_healthy?: boolean
-  isolated?:       boolean
-  target_counts:  TargetCounts
-  down_targets:   string[]
-  targets?:       Record<string, FleetTarget>
+  cluster?:   FleetClusterInfo       // nil in standalone mode
+  summary:    TargetCounts           // rollup counts
+  targets:    FleetTarget[]          // array (not Record)
+  incidents?: FleetIncident[]        // active outages
 }
 
-export interface FleetMember {
-  name:   string
-  zone?:  string
-  region?: string
-  status: string
+export interface FleetClusterInfo {
+  local_node:         string
+  members:            string[]       // member names
+  size:               number
+  alive_count:        number
+  quorum_healthy:     boolean
+  isolated:           boolean
+  replication_factor: number
+}
+
+export interface FleetIncident {
+  target_id:    string
+  target_name:  string
+  scope:        Scope
+  seq:          number
+  error_code?:  string
+  root_cause?:  string
 }
 
 export interface TargetCounts {
+  total?:    number
   up:        number
   hard_down: number
   soft_down: number
-  soft_up:   number
+  soft_up?:  number
   unknown:   number
 }
 
 export interface FleetTarget {
+  id:              string           // target.key() — matches config id/name
   name:            string
-  target:          string
+  target:          string           // probe address
   type:            TargetType
   consensus_state: TargetState
-  scope:           Scope
-  classification:  Classification
-  confidence:      number
-  affected_apps:   string[]
-  root_cause?:     string
-  cascading?:      string[]
-  by_node:         Record<string, PeerTargetState>
-  incidents?:      SLOIncident[]
-  // B2 placeholder
-  severity?:       Severity
+  scope?:          Scope
+  classification?: Classification
+  confidence?:     number           // 0.0–1.0
+  affected_apps?:  string[]
+  owner_teams?:    string[]
+  root_cause?:     string           // target id of root cause
+  cascading_impact?: string[]       // transitive dependents
+  down_since?:     string           // ISO timestamp of first hard_down
+  by_node?:        Record<string, FleetNodeView>
+  severity?:       Severity         // B2 — backend not yet
+}
+
+// Per-node view inside FleetTarget.by_node
+export interface FleetNodeView {
+  state:       TargetState
+  seq:         number
+  error_code?: string
 }
 
 // ── /topology ────────────────────────────────────────────────────────────────

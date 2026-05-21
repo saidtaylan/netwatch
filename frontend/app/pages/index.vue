@@ -4,7 +4,6 @@ import { fmtRelative } from '../utils/format'
 
 const api = useApi()
 const { clusterState, configSync } = useCluster()
-const { fleet } = useFleet()
 
 // Version
 const version = ref<{ version: string } | null>(null)
@@ -12,12 +11,11 @@ onMounted(async () => {
   try { version.value = await api.get('/version') } catch {}
 })
 
-const memberCount = computed(() => clusterState.data.value?.members?.length ?? 0)
-const quorum      = computed(() => fleet.data.value?.quorum_healthy ?? null)
-const isolated    = computed(() => fleet.data.value?.isolated ?? false)
+const { fleet, quorumHealthy, isolated, counts, downTargetIds } = useFleet()
+const memberCount = computed(() => clusterState.data.value?.members?.length ?? fleet.data.value?.cluster?.members?.length ?? 0)
+const quorum      = quorumHealthy
 const drift       = computed(() => configSync.data.value?.drift_count ?? 0)
-const counts      = computed<TargetCounts>(() => fleet.data.value?.target_counts ?? { up: 0, hard_down: 0, soft_down: 0, soft_up: 0, unknown: 0 })
-const downTargets = computed(() => fleet.data.value?.down_targets ?? [])
+const downTargets = downTargetIds
 </script>
 
 <template>
