@@ -44,6 +44,12 @@ export default defineConfig({
       },
       dependencies: ['setup'],
     },
+    // For ad-hoc debugging without going through the setup project
+    {
+      name: 'debug',
+      testMatch: /debug\.spec\.ts/,
+      use: { ...devices['Desktop Chrome'] },
+    },
   ],
 
   // Start the Nuxt preview server for tests

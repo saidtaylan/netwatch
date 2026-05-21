@@ -31,7 +31,7 @@ async function rotate(action: 'add' | 'use' | 'remove', key?: string) {
 <template>
   <div class="max-w-lg space-y-5">
     <div class="flex items-center gap-3">
-      <NuxtLink to="/config" class="text-gray-400 hover:text-gray-600 text-sm">← Config</NuxtLink>
+      <NuxtLink :to="{ name: 'config' }" class="text-gray-400 hover:text-gray-600 text-sm">← Config</NuxtLink>
       <h2 class="text-xl font-bold text-gray-900 dark:text-white">Keyring</h2>
     </div>
     <p class="text-sm text-gray-500">Manage AES encryption keys for gossip traffic. Zero-downtime rotation: add → use → remove.</p>

@@ -30,7 +30,7 @@ test.describe('Cluster Overview', () => {
   // SKIPPED: Pinia hydration timing issue — `ui` store not yet hydrated when
   //          sidebar renders, so `sidebarCollapsed` defaults to whatever, making
   //          selectors flaky. Investigate when refactoring tests.
-  test.skip('sidebar nav is present [SKIP: pinia hydration timing]', async ({ page }) => {
+  test('sidebar nav is present ', async ({ page }) => {
     await page.goto('/')
     await expect(page.getByRole('heading', { name: 'Cluster Overview' })).toBeVisible({ timeout: 10000 })
     // Sidebar renders navigation labels
@@ -42,7 +42,7 @@ test.describe('Cluster Overview', () => {
 
   // SKIPPED: TopBar button selector flaky — multiple buttons in header,
   //          first() doesn't reliably target the color-mode toggle.
-  test.skip('dark mode toggle is clickable [SKIP: selector flaky]', async ({ page }) => {
+  test('dark mode toggle is clickable ', async ({ page }) => {
     await page.goto('/')
     await expect(page.getByRole('heading', { name: 'Cluster Overview' })).toBeVisible({ timeout: 10000 })
     // TopBar has emoji button for dark mode (☀️/🌙)

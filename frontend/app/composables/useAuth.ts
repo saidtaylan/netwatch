@@ -39,7 +39,7 @@ export const useAuth = () => {
 
   function logout() {
     store.logout()
-    return navigateTo('/setup')  // go back to setup, not login — single-user app
+    return navigateTo({ name: 'setup' })  // go back to setup, not login — single-user app
   }
 
   return {

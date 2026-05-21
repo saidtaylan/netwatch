@@ -16,7 +16,7 @@ test.describe('Maintenance Windows', () => {
 
   // SKIPPED: useMaintenance polling not firing in production build with route
   //          mocks — fleet polling works but maintenance polling doesn't return.
-  test.skip('shows empty state when no active windows [SKIP: polling timing]', async ({ page }) => {
+  test('shows empty state when no active windows ', async ({ page }) => {
     await page.goto('/maintenance')
     await expect(page.getByRole('heading', { name: 'Maintenance Windows' })).toBeVisible({ timeout: 10000 })
     await expect(page.getByText('No maintenance windows')).toBeVisible({ timeout: 10000 })
@@ -41,7 +41,7 @@ test.describe('Maintenance Windows', () => {
 
   // SKIPPED: Toast appears after PUT response but page.route() PUT interception
   //          timing flaky in production build. Needs network condition wait.
-  test.skip('submitting form shows success toast [SKIP: toast timing]', async ({ page }) => {
+  test('submitting form shows success toast ', async ({ page }) => {
     // Override maintenance PUT to return success
     await page.route('http://localhost:19240/cluster/maintenance', async r => {
       if (r.request().method() === 'PUT') {

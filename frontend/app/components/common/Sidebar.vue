@@ -2,10 +2,12 @@
 const ui     = useUIStore()
 const alerts = useAlertsStore()
 
+import type { RouteLocationNamedRaw } from 'vue-router'
+
 interface NavItem {
   label:    string
   icon:     string
-  to:       string
+  to:       RouteLocationNamedRaw
   badge?:   string | number
   disabled?: boolean
   soon?:    boolean
@@ -14,41 +16,41 @@ interface NavItem {
 const sections: { title?: string; items: NavItem[] }[] = [
   {
     items: [
-      { label: 'Cluster Overview', icon: '🌐', to: '/' },
-      { label: 'Targets',          icon: '📡', to: '/targets' },
-      { label: 'Apps',             icon: '📦', to: '/apps' },
-      { label: 'Topology',         icon: '🗺️',  to: '/topology' },
+      { label: 'Cluster Overview', icon: '🌐', to: { name: 'index' } },
+      { label: 'Targets',          icon: '📡', to: { name: 'targets' } },
+      { label: 'Apps',             icon: '📦', to: { name: 'apps' } },
+      { label: 'Topology',         icon: '🗺️',  to: { name: 'topology' } },
     ],
   },
   {
     title: 'Observability',
     items: [
-      { label: 'Alerts',    icon: '🔔', to: '/alerts' },
-      { label: 'SLO',       icon: '📊', to: '/slo' },
-      { label: 'Geo Latency', icon: '🌍', to: '/geo' },
-      { label: 'Audit Log', icon: '📋', to: '/audit',    soon: true },
+      { label: 'Alerts',    icon: '🔔', to: { name: 'alerts' } },
+      { label: 'SLO',       icon: '📊', to: { name: 'slo' } },
+      { label: 'Geo Latency', icon: '🌍', to: { name: 'geo' } },
+      { label: 'Audit Log', icon: '📋', to: { name: 'audit' },    soon: true },
     ],
   },
   {
     title: 'Operations',
     items: [
-      { label: 'Maintenance', icon: '🔧', to: '/maintenance' },
-      { label: 'Silences',    icon: '🔕', to: '/silences',   soon: true },
+      { label: 'Maintenance', icon: '🔧', to: { name: 'maintenance' } },
+      { label: 'Silences',    icon: '🔕', to: { name: 'silences' },   soon: true },
     ],
   },
   {
     title: 'Config',
     items: [
-      { label: 'Config Sync',  icon: '⚙️',  to: '/config' },
-      { label: 'Push Config',  icon: '📤', to: '/config/push' },
-      { label: 'Keyring',      icon: '🔑', to: '/config/keyring' },
+      { label: 'Config Sync',  icon: '⚙️',  to: { name: 'config' } },
+      { label: 'Push Config',  icon: '📤', to: { name: 'config-push' } },
+      { label: 'Keyring',      icon: '🔑', to: { name: 'config-keyring' } },
     ],
   },
   {
     title: 'Settings',
     items: [
-      { label: 'Backend Nodes', icon: '🖥️', to: '/settings/nodes' },
-      { label: 'Preferences',   icon: '⚙️',  to: '/settings' },
+      { label: 'Backend Nodes', icon: '🖥️', to: { name: 'settings-nodes' } },
+      { label: 'Preferences',   icon: '⚙️',  to: { name: 'settings' } },
     ],
   },
 ]
@@ -84,7 +86,7 @@ const alertCount = computed(() => alerts.unresolvedCount)
         </p>
         <NuxtLink
           v-for="item in section.items"
-          :key="item.to"
+          :key="item.to.name as string"
           :to="item.disabled || item.soon ? undefined : item.to"
           :aria-label="item.label + (item.soon ? ' (coming soon)' : '')"
           :aria-disabled="item.disabled || item.soon ? 'true' : undefined"

@@ -34,7 +34,7 @@ const enabled = computed(() => error.value?.message?.includes('503') === false &
         <!-- Header -->
         <div class="flex items-center justify-between px-4 py-3 border-b border-gray-100 dark:border-gray-700">
           <div class="flex items-center gap-2">
-            <NuxtLink :to="`/targets/${encodeURIComponent(t.id)}`" class="font-semibold text-gray-900 dark:text-white hover:underline text-sm">
+            <NuxtLink :to="{ name: 'targets-id', params: { id: t.id } }" class="font-semibold text-gray-900 dark:text-white hover:underline text-sm">
               {{ t.name ?? t.id }}
             </NuxtLink>
             <span class="text-xs text-gray-400">{{ t.window }}</span>

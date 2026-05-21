@@ -100,8 +100,8 @@ const counts = computed(() => {
 
       <!-- Rows -->
       <ul v-else class="divide-y divide-gray-100 dark:divide-gray-700">
-        <li v-for="([id, target]) in filtered" :key="id">
-          <TargetRow :target="target" :id="id" />
+        <li v-for="entry in filtered" :key="entry[0]">
+          <TargetRow :target="entry[1]" :id="entry[0]" />
         </li>
       </ul>
 

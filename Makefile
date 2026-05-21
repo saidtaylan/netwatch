@@ -6,8 +6,8 @@
 #   make clean        remove build artifacts
 
 .PHONY: build build-backend build-frontend \
-        test test-backend test-frontend \
-        dev clean install
+        test test-backend test-frontend test-frontend-e2e test-all \
+        ci dev clean install
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 build: build-backend build-frontend
@@ -21,15 +21,28 @@ build-frontend:
 	cd frontend && pnpm build
 
 # ── Test ──────────────────────────────────────────────────────────────────────
+# `make test`  runs unit/integration tests for both services (fast, no browser).
+# `make test-all`  also runs frontend e2e (requires Chromium, slower).
+# `make ci`  is the full CI gate: build + lint + test + e2e.
 test: test-backend test-frontend
+
+test-all: test-backend test-frontend test-frontend-e2e
 
 test-backend:
 	@echo "==> Testing backend"
 	cd backend && go test -race ./internal/engine/... ./internal/cluster/...
 
 test-frontend:
-	@echo "==> Testing frontend"
+	@echo "==> Testing frontend (unit)"
 	cd frontend && pnpm test
+
+test-frontend-e2e: build-frontend
+	@echo "==> Testing frontend (Playwright e2e)"
+	cd frontend && pnpm exec playwright test --reporter=line
+
+# Full CI gate: clean → build → lint → unit + e2e tests
+ci: clean build lint test-all
+	@echo "==> CI gate passed ✓"
 
 # ── Lint / Vet ────────────────────────────────────────────────────────────────
 lint: lint-backend

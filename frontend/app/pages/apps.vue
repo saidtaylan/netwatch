@@ -48,7 +48,7 @@ const appList = computed(() =>
           <NuxtLink
             v-for="t in app.targets"
             :key="t.id"
-            :to="`/targets/${encodeURIComponent(t.id)}`"
+            :to="{ name: 'targets-id', params: { id: t.id } }"
             class="flex items-center gap-1.5 text-xs bg-gray-50 dark:bg-gray-700 rounded-lg px-2.5 py-1 hover:bg-gray-100 dark:hover:bg-gray-600 transition"
           >
             <span :class="['w-1.5 h-1.5 rounded-full', isDown(t.state as any) ? 'bg-red-500' : 'bg-green-500']" />

@@ -8,7 +8,7 @@ const style = computed(() => stateStyle(props.target.consensus_state))
 
 <template>
   <NuxtLink
-    :to="`/targets/${encodeURIComponent(id)}`"
+    :to="{ name: 'targets-id', params: { id } }"
     class="flex items-center gap-3 px-4 py-3 hover:bg-gray-50 dark:hover:bg-gray-700/40 transition cursor-pointer"
   >
     <!-- Status dot -->

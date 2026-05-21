@@ -20,7 +20,7 @@ const prefixes = {
 
 <template>
   <NuxtLink
-    :to="`/targets/${encodeURIComponent(id)}`"
+    :to="{ name: 'targets-id', params: { id } }"
     :class="['inline-flex items-center gap-1 text-xs font-medium rounded-full px-2 py-0.5 ring-1 ring-inset transition hover:opacity-80', styles[role]]"
   >
     <span class="opacity-70">{{ prefixes[role] }}</span>

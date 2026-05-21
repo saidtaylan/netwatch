@@ -19,7 +19,7 @@ setup('authenticate', async ({ page }) => {
   await page.locator('button[type="submit"]').click()
 
   await expect(page).toHaveURL('/', { timeout: 10000 })
-  await expect(page.getByText('Cluster Overview')).toBeVisible({ timeout: 10000 })
+  await expect(page.getByRole('heading', { name: 'Cluster Overview' })).toBeVisible({ timeout: 10000 })
 
   await page.context().storageState({ path: AUTH_FILE })
 })

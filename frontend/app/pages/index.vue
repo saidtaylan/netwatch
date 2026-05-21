@@ -69,7 +69,7 @@ const downTargets = computed(() => fleet.data.value?.down_targets ?? [])
           <p :class="['text-2xl font-bold', drift ? 'text-yellow-600' : 'text-green-600']">
             {{ drift ? `${drift} peer${drift > 1 ? 's' : ''}` : 'In sync' }}
           </p>
-          <NuxtLink to="/config" class="text-xs text-blue-500 hover:underline mt-1 block">View →</NuxtLink>
+          <NuxtLink :to="{ name: 'config' }" class="text-xs text-blue-500 hover:underline mt-1 block">View →</NuxtLink>
         </div>
       </template>
     </div>
@@ -82,7 +82,7 @@ const downTargets = computed(() => fleet.data.value?.down_targets ?? [])
       <ul class="divide-y divide-gray-100 dark:divide-gray-700">
         <li v-for="id in downTargets.slice(0, 10)" :key="id">
           <NuxtLink
-            :to="`/targets/${encodeURIComponent(id)}`"
+            :to="{ name: 'targets-id', params: { id } }"
             class="flex items-center px-4 py-2.5 hover:bg-gray-50 dark:hover:bg-gray-700/50 transition text-sm"
           >
             <span class="flex-1 text-gray-800 dark:text-gray-200 font-mono text-xs">{{ id }}</span>
@@ -92,7 +92,7 @@ const downTargets = computed(() => fleet.data.value?.down_targets ?? [])
       </ul>
       <div v-if="downTargets.length > 10" class="px-4 py-2 text-xs text-gray-400">
         +{{ downTargets.length - 10 }} more
-        <NuxtLink to="/targets" class="text-blue-500 hover:underline ml-1">View all →</NuxtLink>
+        <NuxtLink :to="{ name: 'targets' }" class="text-blue-500 hover:underline ml-1">View all →</NuxtLink>
       </div>
     </div>
 

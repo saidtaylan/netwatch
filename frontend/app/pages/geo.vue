@@ -42,7 +42,7 @@ watch(() => targetList.value.length, loadGeo)
         :class="geo.anomaly ? 'border-orange-300 dark:border-orange-700' : 'border-gray-100 dark:border-gray-700'"
       >
         <div class="flex items-center justify-between px-4 py-3 border-b border-gray-100 dark:border-gray-700">
-          <NuxtLink :to="`/targets/${encodeURIComponent(id)}`" class="text-sm font-semibold text-gray-900 dark:text-white hover:underline">
+          <NuxtLink :to="{ name: 'targets-id', params: { id } }" class="text-sm font-semibold text-gray-900 dark:text-white hover:underline">
             {{ id }}
           </NuxtLink>
           <span v-if="geo.anomaly" class="text-xs text-orange-600 bg-orange-50 dark:bg-orange-900/20 rounded-full px-2 py-0.5">⚠ Latency anomaly</span>

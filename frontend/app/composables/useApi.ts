@@ -4,8 +4,19 @@
  *  - Authorization: Bearer header injection
  *  - 401 → auto logout
  *  - Network error → failover + single retry
+ *  - null active node → short retry for pinia hydration (stores loaded from localStorage async)
  */
 import type { FetchOptions } from 'ofetch'
+
+/** Wait up to `maxMs` for `predicate` to return truthy, polling every `intervalMs`. */
+async function waitFor(predicate: () => boolean, maxMs = 300, intervalMs = 50): Promise<boolean> {
+  const deadline = Date.now() + maxMs
+  while (Date.now() < deadline) {
+    if (predicate()) return true
+    await new Promise(r => setTimeout(r, intervalMs))
+  }
+  return predicate()
+}
 
 export const useApi = () => {
   const auth  = useAuthStore()
@@ -13,7 +24,15 @@ export const useApi = () => {
   const { ensureActive, selectActiveNode } = useNodeConnection()
 
   async function call<T>(path: string, opts: FetchOptions<'json'> = {}): Promise<T> {
-    const baseUrl = await ensureActive()
+    let baseUrl = await ensureActive()
+
+    // Safety net for pinia hydration timing: if nodes.configured is empty (store
+    // not yet hydrated from localStorage), wait briefly and retry.
+    if (!baseUrl && nodes.configured.length === 0) {
+      await waitFor(() => nodes.configured.length > 0)
+      baseUrl = await ensureActive()
+    }
+
     if (!baseUrl) throw new Error('No backend node available')
 
     const headers: Record<string, string> = {
@@ -33,7 +52,7 @@ export const useApi = () => {
       // 401 → logout
       if (err?.response?.status === 401) {
         auth.logout()
-        await navigateTo('/login')
+        await navigateTo({ name: 'setup' })
         throw err
       }
       // Network error → try failover once

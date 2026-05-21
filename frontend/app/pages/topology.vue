@@ -50,7 +50,7 @@ const dependents = computed(() => nodes.value.filter(n => n.depends_on.length > 
         >
           <div class="flex-1 min-w-0">
             <div class="flex items-center gap-2">
-              <NuxtLink :to="`/targets/${encodeURIComponent(n.id)}`" class="text-sm font-semibold text-gray-900 dark:text-white hover:underline">
+              <NuxtLink :to="{ name: 'targets-id', params: { id: n.id } }" class="text-sm font-semibold text-gray-900 dark:text-white hover:underline">
                 {{ n.name }}
               </NuxtLink>
               <StatusBadge :state="n.state" size="sm" />
@@ -75,7 +75,7 @@ const dependents = computed(() => nodes.value.filter(n => n.depends_on.length > 
           :class="n.isDown ? 'border-red-200 dark:border-red-800' : 'border-gray-100 dark:border-gray-700'"
         >
           <div class="flex items-center gap-2 mb-2">
-            <NuxtLink :to="`/targets/${encodeURIComponent(n.id)}`" class="text-sm font-semibold text-gray-900 dark:text-white hover:underline">
+            <NuxtLink :to="{ name: 'targets-id', params: { id: n.id } }" class="text-sm font-semibold text-gray-900 dark:text-white hover:underline">
               {{ n.name }}
             </NuxtLink>
             <StatusBadge :state="n.state" size="sm" />
@@ -105,21 +105,21 @@ const dependents = computed(() => nodes.value.filter(n => n.depends_on.length > 
           <tr v-for="n in nodes" :key="n.id">
             <td class="px-4 py-2.5">
               <div class="flex items-center gap-2">
-                <NuxtLink :to="`/targets/${encodeURIComponent(n.id)}`" class="font-medium text-gray-800 dark:text-gray-200 hover:underline">{{ n.name }}</NuxtLink>
+                <NuxtLink :to="{ name: 'targets-id', params: { id: n.id } }" class="font-medium text-gray-800 dark:text-gray-200 hover:underline">{{ n.name }}</NuxtLink>
                 <StatusBadge :state="n.state" size="sm" />
               </div>
             </td>
             <td class="px-4 py-2.5">
               <div class="flex flex-wrap gap-1">
                 <span v-if="!n.depends_on.length" class="text-xs text-gray-300">—</span>
-                <NuxtLink v-for="dep in n.depends_on" :key="dep" :to="`/targets/${encodeURIComponent(dep)}`"
+                <NuxtLink v-for="dep in n.depends_on" :key="dep" :to="{ name: 'targets-id', params: { id: dep } }"
                   class="text-xs text-orange-600 hover:underline">{{ dep }}</NuxtLink>
               </div>
             </td>
             <td class="px-4 py-2.5">
               <div class="flex flex-wrap gap-1">
                 <span v-if="!n.cascading.length" class="text-xs text-gray-300">—</span>
-                <NuxtLink v-for="dep in n.cascading" :key="dep" :to="`/targets/${encodeURIComponent(dep)}`"
+                <NuxtLink v-for="dep in n.cascading" :key="dep" :to="{ name: 'targets-id', params: { id: dep } }"
                   class="text-xs text-yellow-600 hover:underline">{{ dep }}</NuxtLink>
               </div>
             </td>

@@ -45,7 +45,7 @@ async function connect() {
 
     // Verify token
     await login(token.value.trim())
-    await navigateTo('/')
+    await navigateTo({ name: 'index' })
   } catch (e: any) {
     error.value = e?.message ?? 'Connection failed. Check the URL and token.'
   } finally {

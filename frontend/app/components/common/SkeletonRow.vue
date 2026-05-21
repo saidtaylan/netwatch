@@ -1,6 +1,6 @@
 <!-- Generic skeleton loader row — use inside a list/table while data is loading -->
 <script setup lang="ts">
-defineProps<{ cols?: number; rows?: number }>()
+const props = defineProps<{ cols?: number; rows?: number }>()
 const colCount = computed(() => Math.max(1, props.cols ?? 3))
 const rowCount = computed(() => Math.max(1, props.rows ?? 4))
 </script>

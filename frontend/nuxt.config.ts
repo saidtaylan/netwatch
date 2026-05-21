@@ -10,6 +10,12 @@ export default defineNuxtConfig({
     '@pinia/nuxt',
   ],
 
+  // Auto-import all components without subfolder prefix
+  // (e.g. app/components/targets/TargetRow.vue → <TargetRow>, not <TargetsTargetRow>)
+  components: [
+    { path: '~/components', pathPrefix: false },
+  ],
+
   colorMode: {
     classSuffix: '',
     preference: 'system',

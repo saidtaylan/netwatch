@@ -16,6 +16,47 @@ Bu belge, netwatch projesinin günlük güncellemelerini ve teknik detaylarını
 
 ---
 
+## 2026-05-21 — Frontend S8/S9/S10 + Nuxt 4 review
+
+- [frontend] **S8 — E2E Test Reliability (303 test yeşil)** 🎯
+
+  9 skip edilen e2e test reaktive edildi, 26/26 geçiyor. Çözülen 6 kök sebep:
+
+  1. **`SkeletonRow.vue` props bug** — `defineProps<...>()` `const props =` olmadan çağrılmış. `props.cols` undefined → 500 server error. `app/components/common/SkeletonRow.vue` tek harf fix.
+  2. **Nuxt 4 component auto-import — subfolder pathPrefix** — `app/components/targets/TargetRow.vue` default'ta `TargetsTargetRow` adıyla auto-import ediliyordu. `nuxt.config.ts`'e `components: [{ path: '~/components', pathPrefix: false }]` eklendi. Vue console'da `Failed to resolve component: TargetRow` warning'i ile keşfedildi.
+  3. **Vue v-for destructuring** — `v-for="([id, target]) in filtered"` Vue parser tarafından `(value, key, index)` formu olarak interpret ediliyordu. `app/pages/targets/index.vue`: `v-for="entry in filtered"` + `entry[0]`/`entry[1]` ile yeniden yazıldı.
+  4. **Pinia hydration safety net** — `useApi.ensureActive()` 'a `waitFor` döngüsü eklendi (300ms × 50ms intervals). localStorage'dan store hydrate olana kadar API çağrısı throw etmesin.
+  5. **`pinia-persist.client.ts` enforce: 'pre' + explicit `$hydrate()`** — Plugin diğer plugin'lerden önce çalışsın, auth ve nodes store'ları zorla hydrate edilsin.
+  6. **Playwright strict mode violations** — `getByText('Cluster Overview')` sidebar nav + heading'de 2 yerde matched. `getByRole('heading', ...)` ile spesifikle. `getByText('e2e-node')` → `getByRole('cell', ...)`.
+
+  Debug methodu: `playwright.config.ts`'e `debug` projesi eklendi (dependencies yok), browser console + 4xx/5xx response body yakalandı. `<targetrow target="[object Object]">` raw HTML keşfedildi → root cause.
+
+- [frontend] **S9 — Named Routes Refactor**
+
+  ~30 string-path kullanımı named route'a çevrildi:
+  - 2 middleware, 2 composable (logout, 401 redirect), 2 page programatic (`navigateTo`), 7 static NuxtLink, 8 dynamic target links, 2 component, 14 Sidebar items
+  - `app/components/common/Sidebar.vue` `NavItem.to` tipi `string` → `RouteLocationNamedRaw`
+  - Doğrulama: `grep -rEn ':to="/|to="/[a-z]|navigateTo\(['"\\']/'` → **0 sonuç**
+
+- [devops] **S10 — CI Gate Integration**
+
+  - Kök `Makefile`:
+    - `make test-frontend-e2e` (build önce, sonra Playwright)
+    - `make test-all` (backend + frontend unit + e2e)
+    - `make ci` (clean → build → lint → test-all)
+  - `.github/workflows/ci.yml` — 4 job:
+    - `backend` (Go 1.25 + vet + build + test -race)
+    - `frontend-unit` (pnpm 11 + Node 20 + Vitest)
+    - `frontend-e2e` (Playwright + Chromium install; failure → report artifact)
+    - `ci-passed` (aggregated gate)
+  - Triggers: push/PR on main
+
+- [dokuman] **Nuxt 4 review**
+
+  Kullanıcı talebi: "her aracın en güncel dökümantasyonuna göre kullan". Nuxt 4'ün yeni `app/` directory structure'ı, component auto-import default'ları (`pathPrefix: true`), `pinia-plugin-persistedstate` v4 API'si gözden geçirildi. Tek farkedilen sapma: subfolder pathPrefix'i — yukarıda çözüldü.
+
+---
+
 ## 2026-05-20 (devam — frontend Sprint 1-4 + testler)
 
 - [frontend] **Unit test altyapısı kuruldu (Sprint 1 sonrası)**

@@ -61,7 +61,7 @@ const fields: Field[] = [
 <template>
   <div class="max-w-lg space-y-5">
     <div class="flex items-center gap-3">
-      <NuxtLink to="/config" class="text-gray-400 hover:text-gray-600 text-sm">← Config</NuxtLink>
+      <NuxtLink :to="{ name: 'config' }" class="text-gray-400 hover:text-gray-600 text-sm">← Config</NuxtLink>
       <h2 class="text-xl font-bold text-gray-900 dark:text-white">Push Config</h2>
     </div>
     <p class="text-sm text-gray-500">Push shared config fields to all cluster nodes. Leave fields empty to skip them.</p>

@@ -39,7 +39,7 @@ function statusColor(status: string) {
 
           <div class="flex-1 min-w-0">
             <div class="flex items-center gap-2 flex-wrap">
-              <NuxtLink :to="`/targets/${encodeURIComponent(alert.target_id)}`"
+              <NuxtLink :to="{ name: 'targets-id', params: { id: alert.target_id } }"
                 class="text-sm font-medium text-gray-900 dark:text-white hover:underline">
                 {{ alert.target_name }}
               </NuxtLink>

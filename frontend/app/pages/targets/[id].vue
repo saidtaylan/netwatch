@@ -40,7 +40,7 @@ const upNodes = computed(() =>
   <div class="space-y-5 max-w-4xl">
     <!-- Back -->
     <div class="flex items-center gap-2">
-      <NuxtLink to="/targets" class="text-sm text-gray-400 hover:text-gray-600">← Targets</NuxtLink>
+      <NuxtLink :to="{ name: 'targets' }" class="text-sm text-gray-400 hover:text-gray-600">← Targets</NuxtLink>
     </div>
 
     <!-- Error -->
@@ -132,7 +132,7 @@ const upNodes = computed(() =>
             <p class="text-xs text-gray-500 w-full">Referenced by</p>
             <NuxtLink
               v-for="dep in topo.reverse_deps" :key="dep"
-              :to="`/targets/${encodeURIComponent(dep)}`"
+              :to="{ name: 'targets-id', params: { id: dep } }"
               class="text-xs text-gray-500 hover:text-blue-500 hover:underline"
             >{{ dep }}</NuxtLink>
           </div>

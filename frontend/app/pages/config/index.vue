@@ -29,7 +29,7 @@ async function syncNow() {
           class="text-sm px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition disabled:opacity-60">
           {{ syncing ? 'Syncing…' : '↻ Sync to peers' }}
         </button>
-        <NuxtLink to="/config/push" class="text-sm px-3 py-1.5 bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 rounded-lg transition">
+        <NuxtLink :to="{ name: 'config-push' }" class="text-sm px-3 py-1.5 bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 rounded-lg transition">
           Push config →
         </NuxtLink>
       </div>

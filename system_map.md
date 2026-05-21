@@ -193,10 +193,10 @@ frontend/
 | S4 | Target detail + topology | ✅ Tamamlandı |
 | S5 | Polish: skeletons, error banner, a11y, polling back-off | ✅ Tamamlandı |
 | S6 | systemd target + install.sh + root Makefile + README | ✅ Tamamlandı |
-| S7 | Playwright e2e (17 geçen + 9 skip) | ⚠ Kısmen — S8'e taşındı |
-| S8 | E2E reliability — pinia hydration race fix | ⏳ Bekliyor |
-| S9 | Named routes refactor (string path → name) | ⏳ Bekliyor |
-| S10 | CI gate integration | ⏳ Bekliyor |
+| S7 | Playwright e2e (17 geçen + 9 skip) | ⚠ Kısmen — S8'de çözüldü |
+| S8 | E2E reliability (303 test yeşil, 6 kök sebep çözüldü) | ✅ Tamamlandı |
+| S9 | Named routes refactor (~30 yer, 0 string path kaldı) | ✅ Tamamlandı |
+| S10 | CI gate — Makefile + GitHub Actions workflow | ✅ Tamamlandı |
 
 ### Backend Backlog (B-items) — UI sonrası
 

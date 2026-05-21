@@ -104,48 +104,57 @@ Push config + keyring rotate sayfaları S3'te yapıldı. Kalan: smoke test gerç
 
 ---
 
-### S8 — [frontend] E2E Test Reliability Refactor ⏳ Bekliyor
+### ✅ S8 — [frontend] E2E Test Reliability Refactor (Tamamlandı 2026-05-21)
 
-**Hedef:** 9 skip edilen e2e testi tekrar aktive et.
+**Sonuç:** 26/26 e2e test yeşil. Kök sebepler:
 
-**Kök sebep:** `pinia-plugin-persistedstate` hydration timing'i — store'lar `localStorage`'dan yüklenmeden önce composable'lar (`useFleet` vb.) `onMounted` fetch'ini tetikliyor. İlk API çağrısı `activeUrl=null` görüyor → exception → data null kalıyor.
+1. **`<SkeletonRow>` props bug** — `defineProps<...>()` çağrısı `const props =` olmadan yapılmış, `props.cols` undefined → 500 server error → page render etmiyor. Tek harf fix (`const props = defineProps<...>()`) → tüm data sayfaları çalıştı.
 
-**Çözüm önerileri (sırayla denenecek):**
-1. `useApi.ensureActive()` 'da küçük retry mekanizması (3 × 50ms) ekle — hydration tamamlansın
-2. Pinia hydration'ı bir Nuxt plugin'i ile zorla beklet
-3. Production manual smoke — gerçek backend ile bu race oluyor mu? UI gerçekte de yarış condition'a giriyorsa **bu test'ten önce kodu düzeltmek gerek**
-4. Alternatif: `useAsyncData` pattern'ine geç (Nuxt'un kendi hydration mekanizması)
+2. **Nuxt 4 component auto-import — subfolder pathPrefix** — `app/components/targets/TargetRow.vue` default'ta `TargetsTargetRow` adıyla import oluyordu, biz `<TargetRow>` kullanıyorduk → unresolved component → raw HTML `<targetrow>` render ediliyordu. `nuxt.config.ts`'e `components: [{ path: '~/components', pathPrefix: false }]` eklendi.
 
-**Kabul kriterleri:** 26/26 e2e test yeşil.
+3. **Vue v-for destructuring** — `v-for="([id, target]) in filtered"` Vue parser'ı tarafından `(value, key, index)` formu olarak interpret ediliyordu, destructuring değil. `v-for="entry in filtered"` + `entry[0]`, `entry[1]` ile yeniden yazıldı.
 
-**Tahmini efor:** 1-2 saat (kök sebep tespiti) + 1 saat (refactor + retest).
+4. **Pinia hydration safety net** — `useApi.ensureActive()` 'a 300ms (50ms × 6) bekleme döngüsü eklendi; localStorage'dan store hydrate olana kadar API çağrısı throw etmesin diye.
 
----
+5. **`pinia-persist.client.ts` enforce: 'pre'** — Plugin diğer plugin'lerden önce çalışsın diye `enforce: 'pre'` + explicit `auth.$hydrate?.()` + `nodes.$hydrate?.()` eklendi.
 
-### S9 — [frontend] Named Routes Refactor ⏳ Bekliyor
+6. **Selector strict mode violations** — `getByText('Cluster Overview')` sidebar + heading'de 2 yerde matched → `getByRole('heading', ...)` ile spesifikle. `getByText('e2e-node')` paragraph + cell'de 2 yerde → `getByRole('cell', ...)`.
 
-**Hedef:** Tüm string-path route kullanımlarını named route'a çevir. Kural CLAUDE.md "Frontend Routing Kuralı"nda tanımlı.
-
-**Refactor edilecek alanlar (~30 yer):**
-
-| Konum | Adet | Örnek |
-|---|---|---|
-| middleware/composables/pages programatic | 5 | `navigateTo('/setup')` → `navigateTo({ name: 'setup' })` |
-| pages static NuxtLink | 7 | `<NuxtLink to="/config">` → `<NuxtLink :to="{ name: 'config' }">` |
-| Sidebar items array | 14 | `{ to: '/targets' }` → `{ to: { name: 'targets' } }` |
-| targets/[id] dynamic links | 11 | `:to="\`/targets/${id}\`"` → `:to="{ name: 'targets-id', params: { id } }"` |
-
-**Test kapsamı:** Tüm unit + e2e testler hâlâ geçmeli. E2E'deki `expect(page).toHaveURL('/targets')` gibi assertion'lar dokunulmaz (browser'ın URL'sini test ediyoruz).
-
-**Tahmini efor:** 2-3 saat.
+**Test sayısı:** Backend 202 + Frontend unit 75 + E2E 26 = **303 test yeşil**.
 
 ---
 
-### S10 — [frontend] CI Gate Integration ⏳ Bekliyor
+### ✅ S9 — [frontend] Named Routes Refactor (Tamamlandı 2026-05-21)
 
-- `Makefile` `test-frontend` target'ına `test:e2e` ekle
-- GitHub Actions / GitLab CI pipeline'ında frontend test job'u
-- `pnpm build` zorunlu çıktı kontrolü
+Tüm string-path route kullanımları named route'a çevrildi.
+
+**Değişiklik özeti:**
+- 2 middleware (`auth.global`, `node-health.global`): `to.path === '/setup'` → `to.name === 'setup'`
+- 2 composable (`useAuth.logout`, `useApi` 401 handler): `navigateTo('/setup')` → `navigateTo({ name: 'setup' })`
+- 2 page programatic (`setup.vue` connect, `login.vue` redirect): `navigateTo('/')` → `navigateTo({ name: 'index' })`
+- 7 page static NuxtLink (`index`, `targets/[id]`, `config/*`): `to="/config"` → `:to="{ name: 'config' }"`
+- 8 dynamic target links (`alerts`, `slo`, `geo`, `apps`, `topology` × 5): `:to="\`/targets/${id}\`"` → `:to="{ name: 'targets-id', params: { id } }"`
+- 2 component dynamic (`TargetRow`, `DependencyChip`)
+- 14 Sidebar items: `{ to: '/...' }` → `{ to: { name: '...' } }`, TypeScript `RouteLocationNamedRaw` tip eklendi
+
+**Doğrulama:**
+- `grep -rEn ':to="/|to="/[a-z]|navigateTo\(['"\\']/'` → 0 sonuç
+- Backend 202 + Frontend unit 75 + E2E 26 = tümü yeşil
+
+---
+
+### ✅ S10 — [frontend] CI Gate Integration (Tamamlandı 2026-05-21)
+
+- Kök `Makefile`:
+  - `make test-frontend-e2e` — Playwright e2e (build önce)
+  - `make test-all` — backend + frontend unit + frontend e2e
+  - `make ci` — full CI gate: `clean → build → lint → test-all`
+- `.github/workflows/ci.yml` — 4 job:
+  - `backend`: `go vet` + `go build` + `go test -race`
+  - `frontend-unit`: `pnpm install` + `pnpm build` + `pnpm test` (Vitest 75 test)
+  - `frontend-e2e`: Playwright + Chromium install + run; failure → upload report artifact (7 day retention)
+  - `ci-passed`: aggregated gate (needs all 3)
+- Workflow `push`/`pull_request` ana branch'a tetiklenir.
 
 **Hedef:** `pnpm dev` ile boş ama navigasyonlu uygulama açılsın.
 

@@ -5,10 +5,10 @@
  * /setup handles both first-time connection and re-authentication.
  */
 export default defineNuxtRouteMiddleware((to) => {
-  if (to.path === '/setup') return
+  if (to.name === 'setup') return
 
   const auth = useAuthStore()
   if (!auth.isAuthenticated) {
-    return navigateTo('/setup')
+    return navigateTo({ name: 'setup' })
   }
 })

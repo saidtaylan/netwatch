@@ -32,14 +32,14 @@ test.describe('Targets list', () => {
     await expect(page.getByRole('heading', { name: 'Targets' })).toBeVisible({ timeout: 10000 })
   })
 
-  test.skip('displays targets from fleet API [SKIP: pinia hydration race]', async ({ page }) => {
+  test('displays targets from fleet API ', async ({ page }) => {
     await page.goto('/targets')
     await expect(page.getByText('api-gateway')).toBeVisible({ timeout: 10000 })
     await expect(page.getByText('db-primary')).toBeVisible()
     await expect(page.getByText('web-server')).toBeVisible()
   })
 
-  test.skip('shows DOWN badge for hard_down targets [SKIP: pinia hydration race]', async ({ page }) => {
+  test('shows DOWN badge for hard_down targets ', async ({ page }) => {
     await page.goto('/targets')
     await expect(page.getByText('api-gateway')).toBeVisible({ timeout: 10000 })
     await expect(page.getByText('DOWN').first()).toBeVisible()
@@ -50,7 +50,7 @@ test.describe('Targets list', () => {
     await expect(page.getByText(/3 total/)).toBeVisible({ timeout: 10000 })
   })
 
-  test.skip('search filter narrows results [SKIP: pinia hydration race]', async ({ page }) => {
+  test('search filter narrows results ', async ({ page }) => {
     await page.goto('/targets')
     await expect(page.getByText('api-gateway')).toBeVisible({ timeout: 10000 })
     await page.locator('input[type="search"]').fill('db-')
@@ -58,7 +58,7 @@ test.describe('Targets list', () => {
     await expect(page.getByText('api-gateway')).not.toBeVisible()
   })
 
-  test.skip('status filter Down shows only down targets [SKIP: pinia hydration race]', async ({ page }) => {
+  test('status filter Down shows only down targets ', async ({ page }) => {
     await page.goto('/targets')
     await expect(page.getByText('api-gateway')).toBeVisible({ timeout: 10000 })
     await page.locator('button', { hasText: 'Down' }).click()
@@ -73,10 +73,11 @@ test.describe('Target detail', () => {
     await expect(page.getByRole('heading', { name: 'api-gateway' })).toBeVisible({ timeout: 10000 })
   })
 
-  test.skip('shows by-node breakdown table [SKIP: pinia hydration race]', async ({ page }) => {
+  test('shows by-node breakdown table ', async ({ page }) => {
     await page.goto('/targets/api-gateway')
     await expect(page.getByText('Node Breakdown')).toBeVisible({ timeout: 10000 })
-    await expect(page.getByText('e2e-node')).toBeVisible()
+    // e2e-node appears in both UP nodes panel and table cell — pick the cell
+    await expect(page.getByRole('cell', { name: 'e2e-node' })).toBeVisible()
   })
 
   test('shows DOWN state for db-primary', async ({ page }) => {

@@ -1,6 +1,6 @@
 export default defineNuxtRouteMiddleware(async (to) => {
-  const publicRoutes = ['/setup', '/login']
-  if (publicRoutes.includes(to.path)) return
+  const publicRoutes = ['setup', 'login']
+  if (publicRoutes.includes(to.name as string)) return
 
   const nodes = useNodesStore()
   if (nodes.configured.length === 0) {
@@ -9,7 +9,7 @@ export default defineNuxtRouteMiddleware(async (to) => {
   }
 
   if (nodes.configured.length === 0) {
-    return navigateTo('/setup')
+    return navigateTo({ name: 'setup' })
   }
 
   // Ensure active node is reachable (fast path — only re-race if no active)
