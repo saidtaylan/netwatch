@@ -686,7 +686,35 @@ Bu list tüm B19-B25 sprintlerinin domain'ini önceden tanımlıyor — SQLite m
 
 ---
 
-### B23 — Anti-Entropy: DB row sync ⏳ Bekliyor
+### 🔄 B23 — Cluster ↔ Storage Wiring + Anti-Entropy
+
+**Part 1 ✅ Tamamlandı (2026-05-22): Cluster gossip broadcast integration**
+
+Eklenen dosyalar:
+- `backend/internal/cluster/storage_sync.go` — yeni dosya
+  - `msgTypeStorageChange = "storage_change"` constant
+  - `StorageChangeHandler` interface (satisfies `gossip.Storage.ApplyRemoteChange`)
+  - `Manager.SetStorageChangeHandler(h)` registration
+  - `Manager.BroadcastStorageChange(change)` satisfies `gossip.ChangeBroadcaster`
+  - `handleStorageChange()` dispatch with self-echo filtering + 5s ctx timeout
+  - Compile-time interface compliance checks
+- `backend/internal/cluster/storage_sync_test.go` — 11 unit tests
+- `backend/test/integration/storage_gossip_test.go` — 5 integration tests (real 2-node memberlist cluster)
+
+Modified files:
+- `backend/internal/cluster/cluster.go` — sadece +4 satır (Manager struct field + NotifyMsg dispatch case)
+
+Integration test bulgusu: **Cluster startup window'da yazma reddedilir** (IsolatedMode 5s ticker'a kadar `true` kalır). Bu **production-correct davranış** — quorum onaylanmadan yazma garanti edilemez. HTTP layer 503 + retry-after döner. Test helper'a `wait for !IsolatedMode()` eklendi.
+
+**Test sonuçları (B23 Part 1):**
+- Cluster paket: 138 (127 → +11 yeni)
+- Storage integration: 5/5 yeşil (2-node real memberlist)
+- Backend total: 285 internal + 5 integration = 290
+
+Safety: `checkpoint-B22-complete` tag + `backup/pre-B23-storage-integration` branch oluşturuldu. Geri dönüş: `git reset --hard checkpoint-B22-complete`.
+
+**Part 2 ⏳ Bekliyor: Anti-entropy push-pull (eski plan)**
+
 
 **Hedef:** UDP broadcast'leri kaçıran node'lar push-pull sync ile reconcile olsun.
 
