@@ -41,15 +41,18 @@ export interface StatusEntry {
 // ── /cluster/state ──────────────────────────────────────────────────────────
 
 export interface ClusterMember {
-  name:   string
-  addr:   string
-  status: string
-  zone?:  string
+  name:    string
+  addr:    string
+  port?:   number
+  status:  string
+  self?:   boolean
+  zone?:   string
   region?: string
 }
 
 export interface ClusterState {
-  members:    ClusterMember[]
+  local_node:  string
+  members:     ClusterMember[]
   peer_states: Record<string, Record<string, PeerTargetState>>
 }
 
@@ -140,44 +143,62 @@ export interface TopologyNode {
 }
 
 // ── /slo ─────────────────────────────────────────────────────────────────────
+// Actual backend: slo.go SLOSnapshot → targets is Record<id, SLOResult>
 
 export interface SLOSnapshot {
-  targets: SLOTargetResult[]
+  computed_at: string
+  targets:     Record<string, SLOTargetResult>  // keyed by target_id
 }
 
 export interface SLOTargetResult {
-  id:                    string
-  name?:                 string
-  target_uptime:         number
-  actual_uptime:         number
-  window:                string
-  error_budget_seconds:  number
-  breached:              boolean
-  incidents:             SLOIncident[]
+  target_id:            string
+  target_uptime:        number
+  actual_uptime:        number
+  window:               string
+  window_duration_sec:  number
+  downtime_sec:         number
+  downtime_minutes:     number
+  incident_count:       number
+  longest_incident_sec?: number
+  slo_breached:         boolean
+  remaining_budget_sec: number  // negative = breached
+  incidents?:           SLOIncident[]
 }
 
 export interface SLOIncident {
   started_at:  string
-  ended_at?:   string
+  ended_at?:   string | null
   duration_sec?: number
 }
 
+// ── /slo/targets (B12 — CRUD API, planned) ───────────────────────────────────
+
+export interface SLOTargetConfig {
+  id:            string   // must match a target id in config.yaml
+  target_uptime: number   // 0.0–1.0
+  window:        string   // "24h" | "7d" | "30d"
+}
+
 // ── /cluster/config ──────────────────────────────────────────────────────────
+// Actual backend: cluster/configsync.go ConfigSyncSnapshot
 
 export interface ConfigSyncSnapshot {
-  local_hash:   string
-  local_size:   number
-  loaded_at:    string
-  peers:        Record<string, PeerConfigInfo>
-  in_sync:      boolean
-  drift_count:  number
+  self:        ConfigNodeInfo    // this node's config info
+  peers:       ConfigNodeInfo[]  // peer nodes' config info
+  drift_count: number
 }
 
-export interface PeerConfigInfo {
-  hash:      string
-  size:      number
-  loaded_at: string
+export interface ConfigNodeInfo {
+  msg_type?:    string
+  node_name:    string
+  config_hash:  string  // first 16 hex chars of SHA-256
+  config_size:  number
+  loaded_at:    string  // ISO timestamp
 }
+
+// Computed helpers (derived in component, not from API)
+// in_sync = drift_count === 0
+// local_hash = self.config_hash
 
 // ── /cluster/probers ─────────────────────────────────────────────────────────
 

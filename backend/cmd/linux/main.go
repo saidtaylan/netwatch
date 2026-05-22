@@ -241,6 +241,79 @@ func main() {
 		}
 	})
 
+	// /slo/targets — B12: CRUD for SLO target definitions.
+	//
+	//   GET    /slo/targets          → list current SLO targets
+	//   PUT    /slo/targets/{id}     → upsert (add or update) an SLO target
+	//   DELETE /slo/targets/{id}     → remove an SLO target
+	//
+	// Changes are held in memory and lost on restart until persistent config
+	// write is implemented (tracked in sprint.md B12).
+	mux.HandleFunc("/slo/targets", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet || r.Method == "" {
+			targets := e.SLOTargets()
+			if targets == nil {
+				targets = []engine.SLOTarget{}
+			}
+			_ = json.NewEncoder(w).Encode(targets)
+			return
+		}
+		http.Error(w, `{"error":"use GET /slo/targets or PUT|DELETE /slo/targets/{id}"}`, http.StatusMethodNotAllowed)
+	})
+	mux.HandleFunc("/slo/targets/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id := strings.TrimPrefix(r.URL.Path, "/slo/targets/")
+		if id == "" {
+			http.Error(w, `{"error":"target id required"}`, http.StatusBadRequest)
+			return
+		}
+
+		if r.Method == http.MethodDelete {
+			if !checkAdminAuth(e, w, r) {
+				return
+			}
+			if e.DeleteSLOTarget(id) {
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(map[string]string{"deleted": id})
+			} else {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+			}
+			return
+		}
+
+		if r.Method == http.MethodPut {
+			if !checkAdminAuth(e, w, r) {
+				return
+			}
+			body, err := io.ReadAll(io.LimitReader(r.Body, 4096))
+			if err != nil {
+				http.Error(w, `{"error":"read body"}`, http.StatusBadRequest)
+				return
+			}
+			var st engine.SLOTarget
+			if err := json.Unmarshal(body, &st); err != nil {
+				http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+				return
+			}
+			// Use path id, not body id (body id optional)
+			st.ID = id
+			if st.TargetUptime <= 0 || st.TargetUptime >= 1 {
+				http.Error(w, `{"error":"target_uptime must be between 0 and 1 (exclusive)"}`, http.StatusBadRequest)
+				return
+			}
+			if st.Window == "" {
+				st.Window = "30d"
+			}
+			e.UpsertSLOTarget(st)
+			_ = json.NewEncoder(w).Encode(st)
+			return
+		}
+
+		http.Error(w, `{"error":"use PUT or DELETE"}`, http.StatusMethodNotAllowed)
+	})
+
 	// /geo/latency/{targetID} returns the P1.6 per-node latency view for a
 	// specific target, including region labels and the anomaly flag.
 	mux.HandleFunc("/geo/latency/", func(w http.ResponseWriter, r *http.Request) {

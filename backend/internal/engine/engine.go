@@ -907,6 +907,56 @@ func (e *Engine) SLOEnabled() bool {
 	return e.sloMgr != nil
 }
 
+// ── SLO Target CRUD (B12) ─────────────────────────────────────────────────────
+
+// SLOTargets returns the current list of SLO targets (from in-memory config).
+func (e *Engine) SLOTargets() []SLOTarget {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.cfg.SLO == nil {
+		return nil
+	}
+	out := make([]SLOTarget, len(e.cfg.SLO.Targets))
+	copy(out, e.cfg.SLO.Targets)
+	return out
+}
+
+// UpsertSLOTarget adds or updates an SLO target in the in-memory config.
+// Changes are held in RAM; they survive hot-reload because Reload() re-reads
+// config.yaml (which may not have the change), so callers should persist to
+// config.yaml separately if desired. For now, changes are lost on restart.
+func (e *Engine) UpsertSLOTarget(st SLOTarget) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.cfg.SLO == nil {
+		e.cfg.SLO = &SLOConfig{Enabled: true}
+	}
+	for i, t := range e.cfg.SLO.Targets {
+		if t.ID == st.ID {
+			e.cfg.SLO.Targets[i] = st
+			return
+		}
+	}
+	e.cfg.SLO.Targets = append(e.cfg.SLO.Targets, st)
+}
+
+// DeleteSLOTarget removes an SLO target from the in-memory config.
+// Returns true if it was found and removed.
+func (e *Engine) DeleteSLOTarget(id string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.cfg.SLO == nil {
+		return false
+	}
+	for i, t := range e.cfg.SLO.Targets {
+		if t.ID == id {
+			e.cfg.SLO.Targets = append(e.cfg.SLO.Targets[:i], e.cfg.SLO.Targets[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
 // ── Maintenance window public API ─────────────────────────────────────────────
 
 // MaintenanceWindows returns the list of currently active maintenance windows.
@@ -1262,6 +1312,17 @@ func (e *Engine) Init() error {
 			return fmt.Errorf("cluster: %w", err)
 		}
 		e.clusterMgr = mgr
+
+		// P1.5: LoadConfig ran before clusterMgr was set, so broadcast the
+		// config fingerprint now that the manager is available.
+		e.mu.RLock()
+		raw := e.rawConfigBytes
+		e.mu.RUnlock()
+		if len(raw) > 0 {
+			hash := cluster.ConfigHashOf(raw)
+			e.clusterMgr.SetLocalConfigInfo(hash, int64(len(raw)), time.Now())
+		}
+
 		// Wire anti-entropy: memberlist will call LocalState/MergeRemoteState
 		// during push-pull cycles (join=true) and delegate full-state exchange
 		// to the engine via this interface.

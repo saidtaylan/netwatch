@@ -2,12 +2,12 @@
 import { isDown } from '~/utils/classifyState'
 
 const { topology } = useTopology()
-const { fleet }    = useFleet()
+const { targetIndex } = useFleet()  // targetIndex is Record<id, FleetTarget>
 
 const nodes = computed(() => {
   if (!topology.data.value?.targets) return []
   return Object.entries(topology.data.value.targets).map(([id, node]) => {
-    const fleetTarget = fleet.data.value?.targets?.[id]
+    const fleetTarget = targetIndex.value[id]   // O(1) lookup by ID
     return {
       id,
       name:            node.name || id,

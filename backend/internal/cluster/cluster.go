@@ -421,6 +421,10 @@ func (e *eventDelegate) NotifyJoin(node *memberlist.Node) {
 		if h != nil {
 			h.BroadcastInventory()
 		}
+		// Re-broadcast config fingerprint so the new peer learns our config hash.
+		// Config_sync may be disabled on this node — broadcastConfigInfo is a no-op
+		// when config_sync.enabled=false or delegate is nil.
+		e.mgr.broadcastConfigInfo()
 	}()
 }
 

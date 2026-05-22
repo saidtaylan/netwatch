@@ -6,6 +6,16 @@ const api = useApi()
 const ui  = useUIStore()
 const syncing = ref(false)
 
+const snap = computed(() => configSync.data.value)
+
+// Derived helpers matching actual backend schema:
+// { self: ConfigNodeInfo, peers: ConfigNodeInfo[], drift_count }
+const inSync   = computed(() => (snap.value?.drift_count ?? 0) === 0)
+const selfHash = computed(() => snap.value?.self?.config_hash ?? '')
+const selfSize = computed(() => snap.value?.self?.config_size ?? 0)
+const selfLoaded = computed(() => snap.value?.self?.loaded_at ?? '')
+const hashValid  = computed(() => selfHash.value && selfHash.value.length > 4)  // non-empty, non-zero
+
 async function syncNow() {
   syncing.value = true
   try {
@@ -35,47 +45,57 @@ async function syncNow() {
       </div>
     </div>
 
-    <div v-if="configSync.data.value" class="space-y-4">
-      <!-- Local node -->
+    <div v-if="snap" class="space-y-4">
+      <!-- This node -->
       <div class="bg-white dark:bg-gray-800 rounded-xl border shadow-sm p-4"
-        :class="configSync.data.value.in_sync ? 'border-gray-100 dark:border-gray-700' : 'border-yellow-300 dark:border-yellow-700'">
+        :class="inSync ? 'border-gray-100 dark:border-gray-700' : 'border-yellow-300 dark:border-yellow-700'">
         <div class="flex items-center justify-between mb-3">
-          <h3 class="text-sm font-semibold text-gray-800 dark:text-gray-200">This Node</h3>
-          <span :class="['text-xs font-semibold', configSync.data.value.in_sync ? 'text-green-600' : 'text-yellow-600']">
-            {{ configSync.data.value.in_sync ? '✓ In sync with peers' : `⚠ ${configSync.data.value.drift_count} peer(s) differ` }}
+          <h3 class="text-sm font-semibold text-gray-800 dark:text-gray-200">
+            This Node <span class="text-xs font-normal text-gray-400">{{ snap.self?.node_name }}</span>
+          </h3>
+          <span :class="['text-xs font-semibold', inSync ? 'text-green-600' : 'text-yellow-600']">
+            {{ inSync ? '✓ In sync with peers' : `⚠ ${snap.drift_count} peer(s) differ` }}
           </span>
         </div>
         <div class="text-xs space-y-1 text-gray-600 dark:text-gray-400">
           <div class="flex gap-2">
             <span class="w-20 text-gray-400">Hash</span>
-            <span class="font-mono">{{ configSync.data.value.local_hash }}</span>
+            <span class="font-mono">{{ hashValid ? selfHash : '— loading…' }}</span>
           </div>
           <div class="flex gap-2">
             <span class="w-20 text-gray-400">Size</span>
-            <span>{{ configSync.data.value.local_size }} bytes</span>
+            <span>{{ selfSize > 0 ? `${selfSize} bytes` : '—' }}</span>
           </div>
           <div class="flex gap-2">
             <span class="w-20 text-gray-400">Loaded</span>
-            <span>{{ fmtRelative(configSync.data.value.loaded_at) }}</span>
+            <span>{{ selfLoaded && !selfLoaded.startsWith('0001') ? fmtRelative(selfLoaded) : '—' }}</span>
           </div>
         </div>
       </div>
 
       <!-- Peers -->
-      <div v-if="Object.keys(configSync.data.value.peers).length" class="space-y-2">
+      <div v-if="snap.peers?.length" class="space-y-2">
         <h3 class="text-xs font-semibold text-gray-500 uppercase tracking-wide">Peers</h3>
-        <div v-for="(info, peer) in configSync.data.value.peers" :key="peer"
+        <div v-for="peer in snap.peers" :key="peer.node_name"
           class="bg-white dark:bg-gray-800 rounded-xl border shadow-sm px-4 py-3"
-          :class="info.hash !== configSync.data.value.local_hash ? 'border-yellow-200 dark:border-yellow-800' : 'border-gray-100 dark:border-gray-700'"
+          :class="peer.config_hash !== selfHash ? 'border-yellow-200 dark:border-yellow-800' : 'border-gray-100 dark:border-gray-700'"
         >
           <div class="flex items-center justify-between">
-            <span class="text-sm font-medium text-gray-800 dark:text-gray-200">{{ peer }}</span>
-            <span :class="['text-xs', info.hash === configSync.data.value.local_hash ? 'text-green-600' : 'text-yellow-600']">
-              {{ info.hash === configSync.data.value.local_hash ? '✓ Same' : '⚠ Different' }}
+            <span class="text-sm font-medium text-gray-800 dark:text-gray-200">{{ peer.node_name }}</span>
+            <span :class="['text-xs', peer.config_hash === selfHash ? 'text-green-600' : 'text-yellow-600']">
+              {{ peer.config_hash === selfHash ? '✓ Same' : '⚠ Different' }}
             </span>
           </div>
-          <p class="text-xs font-mono text-gray-400 mt-1">{{ info.hash }}</p>
+          <p class="text-xs font-mono text-gray-400 mt-1">{{ peer.config_hash || '(no hash yet)' }}</p>
+          <p v-if="peer.loaded_at && !peer.loaded_at.startsWith('0001')" class="text-xs text-gray-400 mt-0.5">
+            {{ fmtRelative(peer.loaded_at) }}
+          </p>
         </div>
+      </div>
+
+      <!-- No peers yet -->
+      <div v-else class="text-xs text-gray-400 bg-gray-50 dark:bg-gray-800 rounded-xl p-3">
+        No peer config info yet — peers broadcast their hash on startup. If nodes are running, wait ~30s and refresh.
       </div>
     </div>
 

@@ -12,7 +12,8 @@ onMounted(async () => {
 })
 
 const { fleet, quorumHealthy, isolated, counts, downTargetIds } = useFleet()
-const memberCount = computed(() => clusterState.data.value?.members?.length ?? fleet.data.value?.cluster?.members?.length ?? 0)
+// cluster/state.members includes all peers + self → total node count
+const memberCount = computed(() => clusterState.data.value?.members?.length ?? fleet.data.value?.cluster?.alive_count ?? 0)
 const quorum      = quorumHealthy
 const drift       = computed(() => configSync.data.value?.drift_count ?? 0)
 const downTargets = downTargetIds
@@ -105,11 +106,12 @@ const downTargets = downTargetIds
           :key="m.name"
           class="flex items-center gap-3 px-4 py-2.5 text-sm"
         >
-          <span class="w-2 h-2 rounded-full bg-green-400" />
+          <span :class="['w-2 h-2 rounded-full flex-shrink-0', m.status === 'alive' ? 'bg-green-400' : 'bg-red-400']" />
           <span class="font-medium text-gray-900 dark:text-white">{{ m.name }}</span>
+          <span v-if="m.self" class="text-xs bg-blue-100 dark:bg-blue-900/40 text-blue-600 dark:text-blue-300 rounded px-1.5 py-0.5">you</span>
           <span v-if="m.zone" class="text-xs text-gray-400">{{ m.zone }}</span>
           <span v-if="m.region" class="text-xs text-gray-400">{{ m.region }}</span>
-          <span class="ml-auto text-xs text-gray-400 font-mono">{{ m.addr }}</span>
+          <span class="ml-auto text-xs text-gray-400 font-mono">{{ m.addr }}:{{ m.port }}</span>
         </li>
       </ul>
     </div>
