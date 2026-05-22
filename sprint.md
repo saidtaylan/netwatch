@@ -599,20 +599,26 @@ Bu list tüm B19-B25 sprintlerinin domain'ini önceden tanımlıyor — SQLite m
 
 ---
 
-### B19 — SQLite implementation (GossipLWWStorage core) ⏳ Bekliyor
+### ✅ B19 — SQLite implementation — Tamamlandı 2026-05-22
 
-**Hedef:** SQLite-backed StorageBackend implementation (henüz gossip yok, sadece local persistence).
+**Eklenen dosyalar (`backend/internal/storage/sqlite/`):**
+- `migrations/001_initial.sql` — 11 tablo (slo_targets, apps, notification_channels, silences, maintenance_windows, targets, alerts, alert_events, slo_incidents, target_states, audit_log) — generic schema pattern: `id, payload, seq, updated_at, updated_by, tombstone` + `seq` index
+- `migrations.go` — embed.FS + `schema_migrations` tracking + idempotent apply
+- `storage.go` — full `storage.StorageBackend` implementation (`Open`, `Upsert`, `Delete`, `Get`, `List`, `Watch`, `Close`)
+- `storage_test.go` — 19 test (persistence reopen, migrations idempotent, concurrent writes 5×20, tombstone-aware list, watch emit, …)
 
-**Görevler:**
-1. `modernc.org/sqlite` pure-Go driver (CGO-free)
-2. `internal/storage/sqlite/sqlite.go` — connection pool, transactions
-3. `internal/storage/sqlite/migrations/` — versioned schema migrations
-4. `internal/storage/sqlite/generic.go` — generic CRUD using table+payload pattern
-5. `data_dir` config field — defaults `dirname(state_file)`
-6. Schema bootstrap: init tabloları (sloTargets, apps, channels, silences, maintenance, alerts, audit_log)
+**Dependencies:**
+- `modernc.org/sqlite v1.50.1` — pure-Go SQLite driver, CGO-free
 
-**Tahmini efor:** 2-3 gün.  
-**Bağımlılık:** B18.
+**Connection settings:**
+- WAL journal mode (concurrent reader/writer)
+- busy_timeout = 5000ms (lock contention tolerance)
+- foreign_keys = on (future-proof)
+- MaxOpenConns = 1 (SQLite is single-writer, no point in multi-conn)
+
+**Compile-time interface compliance:** `var _ storage.StorageBackend = (*Storage)(nil)` — typo'lar derleyiciden kaçamaz.
+
+**Total: 19 SQLite test + 25 memory test = 44 storage test, hepsi -race ile yeşil.**
 
 ---
 
