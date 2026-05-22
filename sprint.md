@@ -650,34 +650,39 @@ Bu list tüm B19-B25 sprintlerinin domain'ini önceden tanımlıyor — SQLite m
 
 ---
 
-### B21 — GossipLWWStorage: write broadcast ⏳ Bekliyor
+### ✅ B21 + B22 — GossipLWWStorage + IsolatedMode Guard — Tamamlandı 2026-05-22
 
-**Hedef:** Her `Upsert`/`Delete` çağrısı, local DB'ye yazdıktan sonra cluster'a broadcast eder.
+**Eklenen dosyalar (`backend/internal/storage/gossip/`):**
+- `storage.go` — `GossipLWWStorage` wraps any `storage.StorageBackend` with:
+  - **Gossip broadcast** on Upsert/Delete via `ChangeBroadcaster` interface
+  - **IsolatedMode write guard** via `IsolatedModeChecker` interface
+  - `ApplyRemoteChange()` — public entry for cluster layer to apply peer broadcasts
+  - Auto-monotonic `NextVersion()` — seq counter advances past observed remote Seqs
+  - Stats counters: TotalReceived, TotalRejected (stale), HighestSeq
+- `storage_test.go` — 15 test
 
-**Görevler:**
-1. `internal/storage/gossip/storage.go` — GossipLWWStorage wraps SQLite implementation
-2. `StorageChangeBroadcast` mesaj tipi (table, op, id, payload, version)
-3. Wire to memberlist broadcast queue (mevcut pattern, maintenance.go gibi)
-4. `OnStorageChange` handler — diğer node'dan gelen broadcast'i alır, LWW kuralıyla local DB'ye uygular
-5. `Version.Compare` ile conflict resolution
+**Mimari kararlar:**
+- **Loose coupling:** `internal/storage/gossip` has NO dependency on `internal/cluster`. Interfaces only (`IsolatedModeChecker`, `ChangeBroadcaster`). Cluster wiring happens in B23.
+- **`AlwaysHealthy` + `NoopBroadcaster` defaults:** Single-node deployments use gossip wrapper without cluster, get all benefits except replication.
+- **Stale apply silently dropped:** `ApplyRemoteChange` returns nil (not error) when LWW rejects — this is benign convergence behavior, not a failure.
+- **ApplyRemoteChange ignores IsolatedMode:** Otherwise reconciliation traffic would be blocked when the node needs it most.
+- **Broadcast failure does NOT fail local write:** Anti-entropy (B23) reconciles dropped UDP packets later. Local write must succeed independently.
+- **No re-broadcast loop:** `ApplyRemoteChange` writes to inner directly, never re-broadcasts.
 
-**Tahmini efor:** 2 gün.  
-**Bağımlılık:** B19.
+**Test coverage:**
+- Nil dep defaults (AlwaysHealthy, NoopBroadcaster)
+- Upsert broadcasts; Delete broadcasts with Tombstone=true
+- Broadcast failure → local write still succeeds
+- IsolatedMode rejects Upsert/Delete with `ErrSplitBrain`, no broadcast emitted
+- Reads (Get, List) work during IsolatedMode
+- Auto-recovery: write succeeds after `IsolatedMode()` returns false again
+- `ApplyRemoteChange` upsert + delete + stale-drop + ignore IsolatedMode
+- Seq counter advances past remote observed Seqs (NextVersion() > any peer)
+- Compile-time interface compliance check
 
----
+**Tests:** 274 backend (was 259). Storage subpackage: 72 (25 mem + 19 sqlite + 13 migrate + 15 gossip).
 
-### B22 — IsolatedMode Write Guard (split-brain protection) ⏳ Bekliyor
-
-**Hedef:** Quorum kaybedildiğinde yazma reddet. Sadece okuma.
-
-**Görevler:**
-1. `GossipLWWStorage.Upsert/Delete` çağrısı başında `clusterMgr.IsolatedMode()` kontrolü
-2. `ErrSplitBrain` döndür → HTTP layer 503 + retry-after header
-3. Quorum geri geldiğinde otomatik yazma kabul (manuel müdahale yok)
-4. Test senaryosu: 2 node, 1 izole et, yazma denemesi → 503
-
-**Tahmini efor:** 0.5 gün.  
-**Bağımlılık:** B21.
+**Cluster integration:** B23'te `cluster.Manager` `ChangeBroadcaster` + `IsolatedModeChecker` interface'lerini satisfy edecek. Şu an `gossip.NoopBroadcaster` ile bağımsız kullanılabilir.
 
 ---
 
