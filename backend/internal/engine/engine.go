@@ -717,6 +717,11 @@ type Engine struct {
 	// specific targets for a duration). nil on first use; initialized in Init().
 	maintMgr *maintenanceManager
 
+	// appsMgr is the storage-backed App registry (B24.3). When non-nil, it
+	// is the authoritative source for apps and republishes e.appIndex on
+	// every change. nil before Init() completes.
+	appsMgr *appsManager
+
 	// orphanedSet tracks which local targets currently have no cluster prober
 	// assigned, so updateClusterMetrics can log only on transitions (edge-
 	// triggered) instead of every 5 s. Guarded by orphanedMu.
@@ -863,6 +868,29 @@ func (e *Engine) NodeAlias() string {
 	return e.cfg.NodeAlias
 }
 
+// activeTargetKeys returns the set of currently-active target keys
+// (Target.key()). Used by the apps manager to drop dangling Uses
+// references at runtime.
+func (e *Engine) activeTargetKeys() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make([]string, 0, len(e.cfg.Targets))
+	for _, t := range e.cfg.Targets {
+		if t.active() {
+			out = append(out, t.key())
+		}
+	}
+	return out
+}
+
+// setAppIndex atomically replaces e.appIndex. Called by the apps manager
+// whenever the registry changes (local CRUD or peer gossip).
+func (e *Engine) setAppIndex(idx AppTargetIndex) {
+	e.mu.Lock()
+	e.appIndex = idx
+	e.mu.Unlock()
+}
+
 // clusterNodeName returns the cluster-configured node name when cluster is
 // enabled, and falls back to the OS hostname for standalone mode.
 // This value is the authoritative identity used in gossip payloads and must
@@ -899,6 +927,18 @@ func (e *Engine) Shutdown() {
 
 		if e.retryStop != nil {
 			e.retryStop()
+		}
+
+		// Stop storage Watch goroutines BEFORE leaving the cluster so the
+		// final flurry of peer events doesn't race against the DB close.
+		if e.appsMgr != nil {
+			e.appsMgr.Close()
+		}
+		if e.maintMgr != nil {
+			e.maintMgr.Close()
+		}
+		if e.sloMgr != nil {
+			e.sloMgr.Close()
 		}
 
 		if e.clusterMgr != nil {
@@ -1051,6 +1091,56 @@ func (e *Engine) ApplyMaintenanceCancel(id string) error {
 	return e.maintMgr.Cancel(id)
 }
 
+// ── Apps registry public API (B24.3) ──────────────────────────────────────────
+
+// Apps returns the current list of registered apps from the storage-backed
+// registry. Falls back to the in-memory config snapshot when the apps
+// manager has not yet been initialized (very early startup).
+func (e *Engine) Apps() []App {
+	if e.appsMgr != nil {
+		return e.appsMgr.Apps()
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return append([]App(nil), e.cfg.Apps...)
+}
+
+// UpsertApp adds or replaces an app in the registry. Cluster-replicated
+// via gossip. Returns ErrSplitBrain when the cluster has lost quorum.
+func (e *Engine) UpsertApp(a App) error {
+	if e.appsMgr == nil {
+		// Fall back to in-memory config so a pre-Init call doesn't panic.
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		for i, ex := range e.cfg.Apps {
+			if ex.Name == a.Name {
+				e.cfg.Apps[i] = a
+				return nil
+			}
+		}
+		e.cfg.Apps = append(e.cfg.Apps, a)
+		return nil
+	}
+	return e.appsMgr.Upsert(a)
+}
+
+// DeleteApp removes an app. Returns true when the app existed.
+// Returns ErrSplitBrain when the cluster has lost quorum.
+func (e *Engine) DeleteApp(name string) (bool, error) {
+	if e.appsMgr == nil {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		for i, ex := range e.cfg.Apps {
+			if ex.Name == name {
+				e.cfg.Apps = append(e.cfg.Apps[:i], e.cfg.Apps[i+1:]...)
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	return e.appsMgr.Delete(name)
+}
+
 // runMaintenancePruner periodically removes expired maintenance windows.
 func (e *Engine) runMaintenancePruner(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
@@ -1194,7 +1284,14 @@ func (e *Engine) LoadConfig() error {
 			}
 		}
 	}
-	appIndex := buildAppTargetIndex(newCfg)
+	// appIndex is built from the storage-backed apps manager when present
+	// (B24.3). Before Init() finishes wiring appsMgr, fall back to the
+	// config-driven build path so the very first LoadConfig at startup
+	// still produces a valid index.
+	var appIndex AppTargetIndex
+	if e.appsMgr == nil {
+		appIndex = buildAppTargetIndex(newCfg)
+	}
 
 	// Build dependency graph (nil when no target declares depends_on).
 	topo, topoErr := buildDependencyGraph(newCfg.Targets)
@@ -1244,13 +1341,23 @@ func (e *Engine) LoadConfig() error {
 	e.mu.Lock()
 	e.cfg = newCfg
 	e.channels = channels
-	e.appIndex = appIndex
+	if e.appsMgr == nil {
+		// Pre-Init() path: write the config-derived index directly.
+		e.appIndex = appIndex
+	}
 	e.topoGraph = topo
 	e.localProbeIDs = newProbeIDs
 	if info, err := os.Stat(cfgPath); err == nil {
 		e.configMtime = info.ModTime()
 	}
 	e.mu.Unlock()
+
+	// Post-Init() path: target set may have changed (new keys added, old
+	// keys removed). Ask the apps manager to rebuild the index against
+	// the fresh target keys.
+	if e.appsMgr != nil {
+		e.appsMgr.RebuildIndex()
+	}
 
 	// P1.5: inform the cluster manager of this node's config fingerprint so it
 	// can broadcast and detect drift against peers.
@@ -1463,6 +1570,21 @@ func (e *Engine) Init() error {
 	}
 	e.maintMgr = mm
 	go e.runMaintenancePruner(rootCtx)
+
+	// Apps registry — storage-backed (B24.3). Seeds from config.yaml on
+	// first boot; subsequent edits to config.yaml's apps section are
+	// ignored (DB is authoritative). The manager republishes e.appIndex
+	// on every change so the alert hot-path stays current.
+	seedApps := append([]App(nil), e.cfg.Apps...)
+	am, amErr := newAppsManager(rootCtx, e.storage, e.clusterNodeName(),
+		seedApps,
+		e.activeTargetKeys,
+		e.setAppIndex,
+	)
+	if amErr != nil {
+		return fmt.Errorf("apps manager: %w", amErr)
+	}
+	e.appsMgr = am
 
 	// SLO tracker: persists incident history (local, per-node) and SLO
 	// target definitions (cluster-replicated via gossip). Disabled when
