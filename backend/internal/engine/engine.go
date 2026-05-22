@@ -21,6 +21,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/saidtaylan/netwatch/internal/cluster"
+	gossipstore "github.com/saidtaylan/netwatch/internal/storage/gossip"
 	"sigs.k8s.io/yaml"
 )
 
@@ -671,6 +672,19 @@ type Engine struct {
 	// All cluster code paths are guarded by nil checks.
 	clusterMgr *cluster.Manager
 
+	// storage is the persistent, cluster-replicated storage backend for
+	// dynamic config (SLO targets, apps, channels, silences) and
+	// historical data (alerts, audit log). Non-nil after Init() succeeds.
+	//
+	// In standalone mode (cluster.enabled=false), storage uses
+	// NoopBroadcaster + AlwaysHealthy — persistence works but no replication.
+	//
+	// Field type is *gossip.Storage (not storage.StorageBackend interface)
+	// because callers need NextVersion() and Stats() methods that the
+	// interface doesn't expose. Pass storage.StorageBackend(e.storage) when
+	// only the interface is needed.
+	storage *gossipstore.Storage
+
 	// lastScrapeNano holds the Unix nanosecond timestamp of the most recent
 	// /metrics HTTP request. Written by NotifyScrape, read by runWatchdog.
 	lastScrapeNano atomic.Int64
@@ -892,6 +906,10 @@ func (e *Engine) Shutdown() {
 				slog.Warn("cluster leave error", "err", err)
 			}
 		}
+
+		// Close storage AFTER cluster leave so any in-flight broadcasts
+		// from the leave sequence get applied before we close the DB.
+		e.closeStorage()
 	})
 }
 
@@ -1358,6 +1376,17 @@ func (e *Engine) Init() error {
 		// populate their candidate sets immediately. Cheap one-shot — see
 		// bootstrapInventoryBroadcast.
 		e.bootstrapInventoryBroadcast()
+	}
+
+	// B24.1: Initialize the persistent storage layer.
+	//
+	// Plumbing only — this commit just creates the StorageBackend and wires
+	// it to the cluster (if any). Existing engine code paths still use
+	// in-memory state.json/incidents.json/maintenance.json. Subsequent B24.x
+	// commits will switch each entity (SLO targets, apps, etc.) to the
+	// StorageBackend one at a time.
+	if err := e.initStorage(); err != nil {
+		return fmt.Errorf("storage: %w", err)
 	}
 
 	// Build the local probe ID set so HasLocalProbe can answer O(1).

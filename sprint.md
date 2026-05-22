@@ -730,7 +730,51 @@ Safety: `checkpoint-B22-complete` tag + `backup/pre-B23-storage-integration` bra
 
 ---
 
-### B24 — Migration: Config → StorageBackend (SLO, apps, channels) ⏳ Bekliyor
+### 🔄 B24 — Engine ↔ Storage Wiring + Config Migration
+
+**Part 1 ✅ Tamamlandı (2026-05-22): Engine storage plumbing**
+
+Eklenen / değiştirilen dosyalar:
+- `backend/internal/engine/storage.go` — **yeni dosya** (~140 satır):
+  - `initStorage()` — SQLite open + JSON migration + gossip wrapper + cluster wiring
+  - `Storage()` accessor — returns `*gossip.Storage`
+  - `closeStorage()` — Shutdown'da çağrılıyor
+  - `deriveDataDir()` — `state_file`'dan data dir türetir
+  - `clusterNodeNameLocked()` — Version.UpdatedBy için node ismi
+- `backend/internal/engine/engine.go` — minimal değişiklik:
+  - `storage *gossipstore.Storage` field eklendi (1 alan)
+  - `gossipstore` import eklendi
+  - `Init()` cluster setup sonrası `initStorage()` çağrısı (1 satır + comment)
+  - `Shutdown()` cluster Leave sonrası `closeStorage()` çağrısı (1 satır + comment)
+
+**Davranış:**
+- Engine artık `<dataDir>/netwatch.db` SQLite dosyası açıyor (WAL mode)
+- JSON migration startup'ta tek seferlik çalışıyor:
+  - `state.json` → `target_states` tablosu
+  - `incidents.json` → `slo_incidents` tablosu  
+  - `maintenance.json` → `maintenance_windows` tablosu
+  - Orijinal dosyalar `<name>.migrated` olarak arşivleniyor
+- Cluster mode: `clusterMgr` gossip broadcaster/IsolatedModeChecker olarak wire ediliyor
+- Standalone mode: `NoopBroadcaster + AlwaysHealthy` (persistence çalışıyor ama replication yok)
+
+**Davranış DEĞİŞİKLİĞİ YOK:** Engine hâlâ state.json/incidents.json/maintenance.json'ı in-memory + JSON path'inden okuyor. Sadece backend hazır şu an — B24.2+ ile her entity tek tek storage'a geçirilecek.
+
+**Smoke verified:**
+```
+[STORAGE-MIGRATE] migrated file=state.json records=4 archive=state.json.migrated
+[STORAGE-MIGRATE] migrated file=incidents.json records=2 archive=incidents.json.migrated
+[STORAGE] initialized path=/tmp/nw-demo/n1/netwatch.db replication=true node=node-1
+```
+
+**Tests:** 285 internal + 5 storage integration = 290 backend test geçiyor.
+
+Safety: `checkpoint-B23p1-complete` tag + `backup/pre-B24-engine-wiring` branch oluşturuldu.
+
+**Part 2 ⏳ Bekliyor:** SLO targets storage'a geçirme (B12 in-memory → DB persistent)
+
+---
+
+### B24 (eski plan, devam edecek)
 
 **Hedef:** Dinamik config'i (UI'dan editlenebilen) DB'ye al. config.yaml sadece bootstrap.
 
