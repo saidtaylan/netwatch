@@ -622,19 +622,31 @@ Bu list tüm B19-B25 sprintlerinin domain'ini önceden tanımlıyor — SQLite m
 
 ---
 
-### B20 — Migration: existing JSON → StorageBackend ⏳ Bekliyor
+### ✅ B20 — JSON → StorageBackend migration — Tamamlandı 2026-05-22
 
-**Hedef:** state.json, incidents.json, maintenance.json'ı SQLite tablolarına taşı. Geri uyumlu — JSON varsa oku, SQLite'a yaz, sonra JSON'u arşivle.
+**Eklenen dosyalar (`backend/internal/storage/migrate/`):**
+- `migrate.go` — 3 migrator + `RunAll(ctx, backend, dataDir, nodeName)` orchestrator
+- `migrate_test.go` — 13 test (no-file, v2, v1 fallback, idempotent re-run, bad JSON parse error preservation, plain array, empty ID skip, RunAll mix)
 
-**Görevler:**
-1. `internal/engine/migrate.go` — JSON varsa SQLite'a aktarmaya çalış, `.migrated` suffix ekle
-2. state.json → `target_states` tablosu (Lamport seq zaten var, mapping kolay)
-3. incidents.json → `slo_incidents` tablosu
-4. maintenance.json → `maintenance_windows` tablosu (gossip pattern korunur)
-5. Backward compat tests: v1 JSON formatı hâlâ okunabilir
+**Strateji:**
+- Her migrator JSON dosyasını okur → StorageBackend tablosuna upsert → orijinal dosyayı `<name>.migrated` olarak rename (silmez — kurtarma ve audit için)
+- Parse hatası → dosya **dokunulmaz**, ParseError result'a konur, operatör müdahalesi gerekir
+- ErrStaleWrite migrasyon sırasında benign treated — re-run'larda zaten var olan kayıtlar atlanır
 
-**Tahmini efor:** 2 gün.  
-**Bağımlılık:** B19.
+**Mapping:**
+| Kaynak | Hedef tablo | ID stratejisi |
+|---|---|---|
+| `state.json` (v2 + v1 fallback) | `target_states` | target ID korunur |
+| `incidents.json` (envelope + plain array) | `slo_incidents` | `<target_id>-<unix_started_at>` |
+| `maintenance.json` | `maintenance_windows` | `id` field korunur |
+
+**Idempotent:** Migration ikinci kez çalışırsa hiçbir dosya yok → tüm migrator'lar Skipped döner.
+
+**Backward compat:** state.json v1 (`map[string]bool`) hâlâ okunabilir. v1 `true`→`up`, `false`→`hard_down` mapping ile.
+
+**Engine entegrasyonu B24'te:** Şu an migrate package standalone — `engine.Init()` çağrı zinciri B24'te düzenlenecek.
+
+**Total: 13 migrate test, hepsi -race ile yeşil.**
 
 ---
 
