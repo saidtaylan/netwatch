@@ -1,10 +1,12 @@
 package engine
 
 import (
-	"os"
-	"path/filepath"
+	"context"
 	"testing"
 	"time"
+
+	"github.com/saidtaylan/netwatch/internal/storage"
+	"github.com/saidtaylan/netwatch/internal/storage/gossip"
 )
 
 // ── parseWindow ───────────────────────────────────────────────────────────────
@@ -43,13 +45,28 @@ func TestParseWindow(t *testing.T) {
 
 // ── sloManager: basic incident lifecycle ─────────────────────────────────────
 
-func newTestSLOMgr(t *testing.T) (*sloManager, string) {
+// sloTestEnv keeps the shared backend alive across re-instantiations of the
+// SLO manager within a single test (used by the persistence round-trip test).
+type sloTestEnv struct {
+	mem storage.StorageBackend
+	gs  *gossip.Storage
+}
+
+func newTestSLOMgrEnv(t *testing.T) (*sloManager, *sloTestEnv) {
 	t.Helper()
-	dir := t.TempDir()
-	stateFile := filepath.Join(dir, "state.json")
-	// Touch the state file so the SLO manager can derive its path.
-	_ = os.WriteFile(stateFile, []byte("{}"), 0644)
-	return newSLOManager(stateFile), dir
+	mem := storage.NewMemoryStorage()
+	t.Cleanup(func() { _ = mem.Close() })
+	gs := gossip.NewStorage(mem, nil, nil, "test-node")
+	mm, err := newSLOManager(context.Background(), gs, "test-node", nil)
+	if err != nil {
+		t.Fatalf("newSLOManager: %v", err)
+	}
+	t.Cleanup(mm.Close)
+	return mm, &sloTestEnv{mem: mem, gs: gs}
+}
+
+func newTestSLOMgr(t *testing.T) (*sloManager, *sloTestEnv) {
+	return newTestSLOMgrEnv(t)
 }
 
 func TestSLOManager_RecordStartEnd(t *testing.T) {
@@ -96,15 +113,20 @@ func TestSLOManager_RecordEnd_NoopWhenClosed(t *testing.T) {
 // ── sloManager: persistence round-trip ───────────────────────────────────────
 
 func TestSLOManager_PersistAndLoad(t *testing.T) {
-	m, dir := newTestSLOMgr(t)
+	m, env := newTestSLOMgrEnv(t)
 
 	m.RecordStart("api", "connection refused", "NODE_LOCAL")
 	time.Sleep(5 * time.Millisecond)
 	m.RecordEnd("api")
+	m.Close() // stop watch goroutine on first manager
 
-	// Reload from disk.
-	stateFile := filepath.Join(dir, "state.json")
-	m2 := newSLOManager(stateFile)
+	// Re-instantiate against the SAME underlying memory storage — loadIncidents
+	// should rehydrate the persisted record.
+	m2, err := newSLOManager(context.Background(), env.gs, "test-node", nil)
+	if err != nil {
+		t.Fatalf("second newSLOManager: %v", err)
+	}
+	t.Cleanup(m2.Close)
 	if len(m2.incidents) != 1 {
 		t.Fatalf("loaded: want 1 incident, got %d", len(m2.incidents))
 	}

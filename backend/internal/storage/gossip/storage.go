@@ -235,6 +235,22 @@ func (s *Storage) Watch(ctx context.Context, table string) (<-chan storage.Event
 // Close closes the inner backend.
 func (s *Storage) Close() error { return s.inner.Close() }
 
+// Inner returns the underlying durable backend, bypassing the gossip
+// broadcast layer. Use this for entities that should be persisted but
+// must NOT be replicated to peers — currently only SLO incidents, where
+// each node's incident list reflects that node's individual observation
+// and aggregating them across the cluster would inflate downtime counts.
+//
+// Writes through Inner() still respect LWW (Version.Compare) at the
+// underlying backend level, but skip the broadcast hop. They also bypass
+// IsolatedMode write guard, so callers must accept that local-only writes
+// continue even during cluster partition.
+//
+// Use sparingly: this is an escape hatch from the cluster-replicated
+// contract.  Most data should flow through the regular Upsert/Delete
+// methods on *Storage itself.
+func (s *Storage) Inner() storage.StorageBackend { return s.inner }
+
 // ApplyRemoteChange applies a StorageChange received from a peer. Called
 // by the cluster layer when a gossip broadcast arrives.
 //

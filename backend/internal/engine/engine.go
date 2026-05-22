@@ -927,8 +927,17 @@ func (e *Engine) SLOEnabled() bool {
 
 // ── SLO Target CRUD (B12) ─────────────────────────────────────────────────────
 
-// SLOTargets returns the current list of SLO targets (from in-memory config).
+// SLOTargets returns the current list of SLO targets from the storage
+// backend. Falls back to in-memory config when the SLO manager is not
+// initialized (slo.enabled=false).
+//
+// B24: previously read from e.cfg.SLO.Targets directly. Now the
+// authoritative source is the slo_targets storage table, kept in sync
+// with peers via gossip. config.yaml is used only as bootstrap seed.
 func (e *Engine) SLOTargets() []SLOTarget {
+	if e.sloMgr != nil {
+		return e.sloMgr.Targets()
+	}
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	if e.cfg.SLO == nil {
@@ -939,40 +948,53 @@ func (e *Engine) SLOTargets() []SLOTarget {
 	return out
 }
 
-// UpsertSLOTarget adds or updates an SLO target in the in-memory config.
-// Changes are held in RAM; they survive hot-reload because Reload() re-reads
-// config.yaml (which may not have the change), so callers should persist to
-// config.yaml separately if desired. For now, changes are lost on restart.
-func (e *Engine) UpsertSLOTarget(st SLOTarget) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.cfg.SLO == nil {
-		e.cfg.SLO = &SLOConfig{Enabled: true}
-	}
-	for i, t := range e.cfg.SLO.Targets {
-		if t.ID == st.ID {
-			e.cfg.SLO.Targets[i] = st
-			return
+// UpsertSLOTarget adds or updates an SLO target.
+//
+// B24: writes to the slo_targets storage table (cluster-replicated via
+// gossip). Persists across restarts. Returns ErrSplitBrain when the
+// cluster has lost quorum (HTTP layer translates to 503).
+func (e *Engine) UpsertSLOTarget(st SLOTarget) error {
+	if e.sloMgr == nil {
+		// SLO tracker disabled — fall back to in-memory config mutation
+		// (legacy behavior, lost on restart). This keeps the HTTP CRUD
+		// API working even when slo.enabled=false, so operators can
+		// enable SLO later and pick up these targets.
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		if e.cfg.SLO == nil {
+			e.cfg.SLO = &SLOConfig{Enabled: true}
 		}
+		for i, t := range e.cfg.SLO.Targets {
+			if t.ID == st.ID {
+				e.cfg.SLO.Targets[i] = st
+				return nil
+			}
+		}
+		e.cfg.SLO.Targets = append(e.cfg.SLO.Targets, st)
+		return nil
 	}
-	e.cfg.SLO.Targets = append(e.cfg.SLO.Targets, st)
+	return e.sloMgr.UpsertTarget(st)
 }
 
-// DeleteSLOTarget removes an SLO target from the in-memory config.
-// Returns true if it was found and removed.
-func (e *Engine) DeleteSLOTarget(id string) bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.cfg.SLO == nil {
-		return false
-	}
-	for i, t := range e.cfg.SLO.Targets {
-		if t.ID == id {
-			e.cfg.SLO.Targets = append(e.cfg.SLO.Targets[:i], e.cfg.SLO.Targets[i+1:]...)
-			return true
+// DeleteSLOTarget removes an SLO target. Returns true if it was found
+// and removed. Returns ErrSplitBrain when cluster lost quorum.
+func (e *Engine) DeleteSLOTarget(id string) (bool, error) {
+	if e.sloMgr == nil {
+		// Fall back to in-memory config
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		if e.cfg.SLO == nil {
+			return false, nil
 		}
+		for i, t := range e.cfg.SLO.Targets {
+			if t.ID == id {
+				e.cfg.SLO.Targets = append(e.cfg.SLO.Targets[:i], e.cfg.SLO.Targets[i+1:]...)
+				return true, nil
+			}
+		}
+		return false, nil
 	}
-	return false
+	return e.sloMgr.DeleteTarget(id)
 }
 
 // ── Maintenance window public API ─────────────────────────────────────────────
@@ -1442,12 +1464,25 @@ func (e *Engine) Init() error {
 	e.maintMgr = mm
 	go e.runMaintenancePruner(rootCtx)
 
-	// SLO tracker: persists incident history, checks breaches hourly.
-	// Disabled when slo.enabled is false (the default).
+	// SLO tracker: persists incident history (local, per-node) and SLO
+	// target definitions (cluster-replicated via gossip). Disabled when
+	// slo.enabled is false (the default).
+	//
+	// Seeds the slo_targets table from config.yaml on first boot so
+	// operators don't need to migrate manually — subsequent CRUD changes
+	// flow through storage.
 	if sloCfg != nil && sloCfg.Enabled {
-		e.sloMgr = newSLOManager(stateFilePath)
+		nodeName := e.clusterNodeName()
+		seed := append([]SLOTarget(nil), sloCfg.Targets...)
+		sm, smErr := newSLOManager(rootCtx, e.storage, nodeName, seed)
+		if smErr != nil {
+			return fmt.Errorf("slo manager: %w", smErr)
+		}
+		e.sloMgr = sm
 		go e.runSLOChecker(rootCtx)
 	}
+	_ = stateFilePath // (unused now that maintenance + SLO use storage; kept while
+	                  // state.json is still loaded by loadPersistedState above)
 
 	// Phase 13: pre-seed the cluster's proberAssignments map so the first
 	// reactive recompute does not see "all assignments new" and needlessly

@@ -274,7 +274,21 @@ func main() {
 			if !checkAdminAuth(e, w, r) {
 				return
 			}
-			if e.DeleteSLOTarget(id) {
+			deleted, err := e.DeleteSLOTarget(id)
+			if err != nil {
+				if errors.Is(err, storage.ErrSplitBrain) {
+					w.Header().Set("Retry-After", "10")
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_ = json.NewEncoder(w).Encode(map[string]string{
+						"error": "cluster lost quorum; writes paused until peers recover",
+					})
+					return
+				}
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			if deleted {
 				w.WriteHeader(http.StatusOK)
 				_ = json.NewEncoder(w).Encode(map[string]string{"deleted": id})
 			} else {
@@ -307,7 +321,19 @@ func main() {
 			if st.Window == "" {
 				st.Window = "30d"
 			}
-			e.UpsertSLOTarget(st)
+			if err := e.UpsertSLOTarget(st); err != nil {
+				if errors.Is(err, storage.ErrSplitBrain) {
+					w.Header().Set("Retry-After", "10")
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_ = json.NewEncoder(w).Encode(map[string]string{
+						"error": "cluster lost quorum; writes paused until peers recover",
+					})
+					return
+				}
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
 			_ = json.NewEncoder(w).Encode(st)
 			return
 		}

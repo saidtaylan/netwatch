@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,6 +13,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/saidtaylan/netwatch/internal/storage"
+	gossipstore "github.com/saidtaylan/netwatch/internal/storage/gossip"
 )
 
 // ── SLO Config ────────────────────────────────────────────────────────────────
@@ -112,89 +112,273 @@ type IncidentRecord struct {
 	ErrorCode   string     `json:"error_code,omitempty"`
 }
 
-// incidentFileV1 is the on-disk envelope for incidents.json.
-type incidentFileV1 struct {
-	Version   int              `json:"version"`
-	Incidents []IncidentRecord `json:"incidents"`
-}
-
 // ── sloManager ────────────────────────────────────────────────────────────────
 
-// sloManager persists incident history and answers SLO queries.
-// All exported methods are safe for concurrent use.
+// sloManager persists incident history and SLO target definitions, and
+// answers SLO queries. All exported methods are safe for concurrent use.
+//
+// Storage model (B24):
+//   - **Incidents** live in storage.TableSLOIncidents, written via
+//     gossip.Storage.Inner() (local-only, NOT gossip-replicated). Each
+//     node's incident list reflects its own observation — aggregating
+//     across the cluster would inflate downtime counts in a 3-node
+//     replication factor scenario (3× the same incident).
+//   - **SLO targets** (cfg) live in storage.TableSLOTargets, written via
+//     gossip.Storage.Upsert (cluster-replicated). UI CRUD updates are
+//     visible on all nodes within seconds.
+//
+// In-memory state (runtime, not persisted):
+//   - openStart: tracks which targets currently have an unresolved
+//     incident — drives RecordEnd's "close the open incident" logic.
+//   - breachAlerted: tracks which targets have an active breach alert
+//     so we send only once per breach period (edge-triggered).
 type sloManager struct {
-	mu            sync.Mutex
-	path          string             // absolute path to incidents.json; "" = no persistence
-	incidents     []IncidentRecord   // in-memory + persisted
+	mu sync.Mutex
+
+	// storage backend (gossip-wrapped). incidents use Inner() (no replication);
+	// targets use the wrapped Upsert (cluster broadcast).
+	storage *gossipstore.Storage
+	nodeName string
+
+	// In-memory caches, kept in sync with the SQLite tables.
+	incidents []IncidentRecord     // append+update only, local
+	targets   map[string]SLOTarget // id → target, cluster-replicated cache
+
 	openStart     map[string]time.Time // targetID → start of the currently open incident
-	breachAlerted map[string]bool    // targetID → true once a breach alert has been sent
+	breachAlerted map[string]bool      // targetID → true once a breach alert has been sent
+
+	// watchCancel stops the targets-table Watch goroutine on Close().
+	watchCancel context.CancelFunc
 }
 
-// newSLOManager creates an sloManager that persists incidents next to stateFile.
-// When stateFile is empty, persistence is skipped (in-memory only).
-func newSLOManager(stateFile string) *sloManager {
-	path := ""
-	if stateFile != "" {
-		path = filepath.Join(filepath.Dir(stateFile), "incidents.json")
+// newSLOManager constructs a storage-backed SLO manager. The constructor
+// loads existing incidents (local) and targets (cluster) into the in-memory
+// caches and starts a Watch goroutine for the targets table so peer SLO
+// changes propagate to this node.
+//
+// Returns an error only when the initial storage List fails.
+func newSLOManager(parent context.Context, gs *gossipstore.Storage, nodeName string, seedTargets []SLOTarget) (*sloManager, error) {
+	if gs == nil {
+		return nil, fmt.Errorf("slo: nil storage")
 	}
+	ctx, cancel := context.WithCancel(parent)
 	m := &sloManager{
-		path:          path,
+		storage:       gs,
+		nodeName:      nodeName,
+		incidents:     nil,
+		targets:       make(map[string]SLOTarget),
 		openStart:     make(map[string]time.Time),
 		breachAlerted: make(map[string]bool),
+		watchCancel:   cancel,
 	}
-	if path != "" {
-		m.load()
+	if err := m.loadIncidents(ctx); err != nil {
+		cancel()
+		return nil, fmt.Errorf("slo: load incidents: %w", err)
 	}
-	return m
+	if err := m.loadTargets(ctx); err != nil {
+		cancel()
+		return nil, fmt.Errorf("slo: load targets: %w", err)
+	}
+	// One-time bootstrap: if the targets table is empty AND config.yaml has
+	// SLO targets, seed them. This eases first-boot UX — operators don't
+	// have to do anything special; their existing slo.targets work.
+	if len(m.targets) == 0 && len(seedTargets) > 0 {
+		slog.Info("slo: seeding targets table from config.yaml", "count", len(seedTargets))
+		for _, st := range seedTargets {
+			if err := m.UpsertTarget(st); err != nil {
+				slog.Warn("slo: seed upsert failed", "id", st.ID, "err", err)
+			}
+		}
+	}
+	go m.watchTargetsLoop(ctx)
+	return m, nil
 }
 
-// load reads incidents from disk. Called once at startup.
-func (m *sloManager) load() {
-	data, err := os.ReadFile(m.path)
-	if os.IsNotExist(err) {
-		return
+// Close stops the Watch goroutine. Safe to call multiple times.
+func (m *sloManager) Close() {
+	if m.watchCancel != nil {
+		m.watchCancel()
 	}
+}
+
+// ── Targets (cluster-replicated) ──────────────────────────────────────────
+
+// Targets returns the current SLO target list. Snapshot — caller may
+// modify the returned slice without affecting the manager.
+func (m *sloManager) Targets() []SLOTarget {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]SLOTarget, 0, len(m.targets))
+	for _, t := range m.targets {
+		out = append(out, t)
+	}
+	return out
+}
+
+// GetTarget returns the SLO target by ID, or (zero, false).
+func (m *sloManager) GetTarget(id string) (SLOTarget, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, ok := m.targets[id]
+	return t, ok
+}
+
+// UpsertTarget adds or updates an SLO target. Writes to storage (which
+// broadcasts to peers via gossip) and updates the local cache.
+func (m *sloManager) UpsertTarget(st SLOTarget) error {
+	if st.ID == "" {
+		return fmt.Errorf("slo: empty target id")
+	}
+	payload, err := json.Marshal(st)
 	if err != nil {
-		slog.Error("slo: failed to read incidents file", "path", m.path, "err", err)
+		return fmt.Errorf("slo: marshal target: %w", err)
+	}
+	ver := m.storage.NextVersion()
+	if err := m.storage.Upsert(context.Background(),
+		storage.TableSLOTargets, st.ID, payload, ver); err != nil {
+		return fmt.Errorf("slo: storage upsert: %w", err)
+	}
+	m.mu.Lock()
+	m.targets[st.ID] = st
+	m.mu.Unlock()
+	return nil
+}
+
+// DeleteTarget removes an SLO target. Tombstone is gossip-replicated.
+// Returns false when the target did not exist (idempotent).
+func (m *sloManager) DeleteTarget(id string) (bool, error) {
+	m.mu.Lock()
+	_, exists := m.targets[id]
+	m.mu.Unlock()
+	if !exists {
+		return false, nil
+	}
+	ver := m.storage.NextVersion()
+	if err := m.storage.Delete(context.Background(),
+		storage.TableSLOTargets, id, ver); err != nil {
+		return false, fmt.Errorf("slo: storage delete: %w", err)
+	}
+	m.mu.Lock()
+	delete(m.targets, id)
+	delete(m.breachAlerted, id) // forget breach flag too
+	m.mu.Unlock()
+	return true, nil
+}
+
+// loadTargets populates m.targets from the storage backend.
+func (m *sloManager) loadTargets(ctx context.Context) error {
+	recs, err := m.storage.List(ctx, storage.TableSLOTargets, storage.Filter{})
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, rec := range recs {
+		if rec.Tombstone {
+			continue
+		}
+		var st SLOTarget
+		if err := json.Unmarshal(rec.Payload, &st); err != nil {
+			slog.Warn("slo: malformed target in storage", "id", rec.ID, "err", err)
+			continue
+		}
+		m.targets[st.ID] = st
+	}
+	if n := len(m.targets); n > 0 {
+		slog.Info("slo: targets loaded from storage", "count", n)
+	}
+	return nil
+}
+
+// watchTargetsLoop receives change events for the slo_targets table and
+// applies them to the local cache. Peers' UpsertTarget / DeleteTarget
+// arrive here via the gossip storage layer.
+func (m *sloManager) watchTargetsLoop(ctx context.Context) {
+	ch, err := m.storage.Watch(ctx, storage.TableSLOTargets)
+	if err != nil {
+		slog.Warn("slo: watch targets failed", "err", err)
 		return
 	}
-	var f incidentFileV1
-	if err := json.Unmarshal(data, &f); err != nil {
-		slog.Error("slo: failed to parse incidents file", "path", m.path, "err", err)
-		return
+	for evt := range ch {
+		switch evt.Type {
+		case storage.EventUpsert:
+			var st SLOTarget
+			if err := json.Unmarshal(evt.Record.Payload, &st); err != nil {
+				slog.Warn("slo: watch target unmarshal failed", "id", evt.Record.ID, "err", err)
+				continue
+			}
+			m.mu.Lock()
+			m.targets[st.ID] = st
+			m.mu.Unlock()
+		case storage.EventDelete:
+			m.mu.Lock()
+			delete(m.targets, evt.Record.ID)
+			delete(m.breachAlerted, evt.Record.ID)
+			m.mu.Unlock()
+		}
 	}
-	m.incidents = f.Incidents
-	// Re-register any incidents that were open when the process last exited.
-	for _, inc := range m.incidents {
+}
+
+// ── Incidents (local-only) ────────────────────────────────────────────────
+
+// loadIncidents populates m.incidents from the storage backend (via the
+// non-broadcast inner backend — each node's incident list is local).
+func (m *sloManager) loadIncidents(ctx context.Context) error {
+	inner := m.storage.Inner()
+	recs, err := inner.List(ctx, storage.TableSLOIncidents, storage.Filter{})
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, rec := range recs {
+		if rec.Tombstone {
+			continue
+		}
+		var inc IncidentRecord
+		if err := json.Unmarshal(rec.Payload, &inc); err != nil {
+			slog.Warn("slo: malformed incident in storage", "id", rec.ID, "err", err)
+			continue
+		}
+		m.incidents = append(m.incidents, inc)
+		// Re-register any incidents that were open when the process last exited.
 		if inc.EndedAt == nil {
 			m.openStart[inc.TargetID] = inc.StartedAt
 		}
 	}
-	slog.Info("slo: incidents loaded", "path", m.path, "count", len(m.incidents))
+	if n := len(m.incidents); n > 0 {
+		slog.Info("slo: incidents loaded from storage", "count", n)
+	}
+	return nil
 }
 
-// save atomically writes incidents to disk. Called under m.mu.
-func (m *sloManager) save() {
-	if m.path == "" {
-		return
-	}
-	data, err := json.MarshalIndent(incidentFileV1{Version: 1, Incidents: m.incidents}, "", "  ")
+// persistIncidentLocked writes a single incident to local storage (no
+// gossip). Caller must hold m.mu. Errors are logged, not returned — the
+// in-memory record is the authoritative copy and SLO compute keeps working.
+//
+// The incident's storage ID is "<target_id>-<unix_started_at>" so updates
+// to the same incident (RecordEnd setting EndedAt) reuse the same row.
+func (m *sloManager) persistIncidentLocked(inc IncidentRecord) {
+	payload, err := json.Marshal(inc)
 	if err != nil {
-		slog.Error("slo: marshal error", "err", err)
+		slog.Warn("slo: marshal incident failed", "target", inc.TargetID, "err", err)
 		return
 	}
-	tmp := m.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
-		slog.Error("slo: write error", "path", tmp, "err", err)
-		return
-	}
-	if err := os.Rename(tmp, m.path); err != nil {
-		slog.Error("slo: rename error", "src", tmp, "dst", m.path, "err", err)
+	id := fmt.Sprintf("%s-%d", inc.TargetID, inc.StartedAt.UTC().Unix())
+	ver := m.storage.NextVersion()
+	// Use Inner() — incidents are per-node, not gossip-replicated.
+	if err := m.storage.Inner().Upsert(context.Background(),
+		storage.TableSLOIncidents, id, payload, ver); err != nil {
+		slog.Warn("slo: storage upsert incident failed", "id", id, "err", err)
 	}
 }
 
 // RecordStart opens a new downtime incident for targetID.
 // If an incident is already open for this target, this is a no-op.
+//
+// Persists the incident to the local storage table (no gossip — see
+// type-level comment). Writes complete asynchronously inside the lock;
+// errors are logged.
 func (m *sloManager) RecordStart(targetID, errCode, scope string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -203,13 +387,14 @@ func (m *sloManager) RecordStart(targetID, errCode, scope string) {
 	}
 	now := time.Now().UTC()
 	m.openStart[targetID] = now
-	m.incidents = append(m.incidents, IncidentRecord{
+	inc := IncidentRecord{
 		TargetID:  targetID,
 		StartedAt: now,
 		Scope:     scope,
 		ErrorCode: errCode,
-	})
-	m.save()
+	}
+	m.incidents = append(m.incidents, inc)
+	m.persistIncidentLocked(inc)
 	slog.Debug("slo: incident started", "target", targetID, "scope", scope)
 }
 
@@ -226,37 +411,62 @@ func (m *sloManager) RecordEnd(targetID string) {
 	delete(m.openStart, targetID)
 	dur := now.Sub(start)
 	// Close the most recent open incident record for this target.
+	var closed *IncidentRecord
 	for i := len(m.incidents) - 1; i >= 0; i-- {
 		inc := &m.incidents[i]
 		if inc.TargetID == targetID && inc.EndedAt == nil {
 			inc.EndedAt = &now
 			inc.DurationSec = int64(dur.Seconds())
+			closed = inc
 			break
 		}
 	}
-	m.save()
+	if closed != nil {
+		// Re-upsert with the same storage ID (synthesized from target + start_unix)
+		// so the EndedAt update overwrites the original record.
+		m.persistIncidentLocked(*closed)
+	}
 	slog.Debug("slo: incident ended", "target", targetID, "duration_sec", int64(dur.Seconds()))
 }
 
 // PruneOldIncidents removes incident records that ended before the retention window.
 // Open incidents (EndedAt == nil) are always kept.
+//
+// Tombstones are written to storage (rather than hard-deleting) so the
+// SQLite row count grows bounded by retention × incident frequency. The
+// tombstone path is used because storage Get / List filter them out by
+// default — no manual maintenance needed.
 func (m *sloManager) PruneOldIncidents(retentionDays int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays)
+
 	var kept []IncidentRecord
+	var pruned []IncidentRecord
 	for _, inc := range m.incidents {
 		// Keep: still open, or started/ended within retention window.
 		if inc.EndedAt == nil || inc.EndedAt.After(cutoff) || inc.StartedAt.After(cutoff) {
 			kept = append(kept, inc)
+		} else {
+			pruned = append(pruned, inc)
 		}
 	}
-	if len(kept) != len(m.incidents) {
-		pruned := len(m.incidents) - len(kept)
-		m.incidents = kept
-		m.save()
-		slog.Info("slo: pruned old incidents", "pruned", pruned, "kept", len(kept))
+	if len(pruned) == 0 {
+		return
 	}
+	m.incidents = kept
+
+	// Tombstone the pruned incidents in storage (local-only, no broadcast).
+	inner := m.storage.Inner()
+	ctx := context.Background()
+	for _, inc := range pruned {
+		id := fmt.Sprintf("%s-%d", inc.TargetID, inc.StartedAt.UTC().Unix())
+		ver := m.storage.NextVersion()
+		if err := inner.Delete(ctx, storage.TableSLOIncidents, id, ver); err != nil {
+			slog.Warn("slo: prune storage delete failed", "id", id, "err", err)
+		}
+	}
+	slog.Info("slo: pruned old incidents", "pruned", len(pruned), "kept", len(kept))
 }
 
 // incidentsForTarget returns all incident records for targetID that overlap
@@ -430,6 +640,9 @@ func (e *Engine) sloRecordEnd(t Target) {
 
 // SLOSnapshot computes current SLO metrics for all configured SLO targets.
 // Returns nil when SLO is not enabled.
+//
+// B24: targets are sourced from the storage-backed sloManager (cluster-
+// replicated), not config.yaml directly.
 func (e *Engine) SLOSnapshot() *SLOSnapshot {
 	if e.sloMgr == nil {
 		return nil
@@ -441,11 +654,12 @@ func (e *Engine) SLOSnapshot() *SLOSnapshot {
 		return nil
 	}
 
+	targets := e.sloMgr.Targets()
 	snap := &SLOSnapshot{
 		ComputedAt: time.Now().UTC(),
-		Targets:    make(map[string]SLOResult, len(sloCfg.Targets)),
+		Targets:    make(map[string]SLOResult, len(targets)),
 	}
-	for _, st := range sloCfg.Targets {
+	for _, st := range targets {
 		result, err := e.sloMgr.ComputeSLO(st.ID, st.TargetUptime, st.Window)
 		if err != nil {
 			slog.Warn("slo: compute error", "target", st.ID, "err", err)
@@ -489,6 +703,8 @@ func (e *Engine) runSLOChecker(ctx context.Context) {
 }
 
 // checkSLOBreaches evaluates all SLO targets and dispatches breach alerts.
+//
+// B24: targets sourced from storage-backed sloManager (not config.yaml).
 func (e *Engine) checkSLOBreaches() {
 	e.mu.RLock()
 	sloCfg := e.cfg.SLO
@@ -504,7 +720,7 @@ func (e *Engine) checkSLOBreaches() {
 	retentionDays := sloCfg.retentionDays()
 	e.sloMgr.PruneOldIncidents(retentionDays)
 
-	for _, st := range sloCfg.Targets {
+	for _, st := range e.sloMgr.Targets() {
 		result, err := e.sloMgr.ComputeSLO(st.ID, st.TargetUptime, st.Window)
 		if err != nil {
 			slog.Warn("slo: compute error in breach check", "target", st.ID, "err", err)
