@@ -576,28 +576,26 @@ Conflict resolution: `seq` > `updated_at` > `updated_by` (lex)
 
 ---
 
-### B18 — StorageBackend interface + GossipLWWStorage skeleton ⏳ Bekliyor
+### ✅ B18 — StorageBackend interface + MemoryStorage — Tamamlandı 2026-05-22
 
-**Hedef:** `internal/storage` paketi, interface tanımı, in-memory implementation (testler için), gerçek implementation skeleton.
+**Eklenen dosyalar (`backend/internal/storage/`):**
+- `version.go` — `Version{Seq, UpdatedAt, UpdatedBy}` + `Compare(a,b)` + `NextVersion()` + `IsZero()`
+- `record.go` — `Record`, `Filter`, `Event` types + EventType constants
+- `backend.go` — `StorageBackend` interface + standard errors (`ErrNotFound`, `ErrStaleWrite`, `ErrSplitBrain`, `ErrTableNotKnown`) + `KnownTables()` registry
+- `memory.go` — `MemoryStorage` reference implementation (test backend, no replication)
+- `version_test.go` — 8 testler (compare order, deterministic, NextVersion)
+- `memory_test.go` — 17 test (upsert, get, delete-tombstone, stale rejection, list filters, watch emit, ctx cancel, defensive copy, concurrent writes)
 
-**Görevler:**
-1. `internal/storage/backend.go` — `StorageBackend` interface
-   ```go
-   type StorageBackend interface {
-       Upsert(ctx, table, id, payload, ver Version) error
-       Delete(ctx, table, id, ver Version) error  // soft delete (tombstone)
-       Get(ctx, table, id string) (Record, error)
-       List(ctx, table string, filter Filter) ([]Record, error)
-       Watch(ctx, table string) (<-chan Event, error)
-   }
-   ```
-2. `internal/storage/version.go` — `Version{Seq, UpdatedAt, UpdatedBy}` + `Compare(a,b) int`
-3. `internal/storage/record.go` — `Record`, `Filter`, `Event` types
-4. `internal/storage/memory.go` — `MemoryStorage` (sadece testler için, gossip yok)
-5. Comprehensive unit tests for conflict resolution
+**KnownTables registry:**
+```go
+TableSLOTargets, TableApps, TableNotifChannels, TableSilences,
+TableMaintenance, TableTargets, TableAlerts, TableAlertEvents,
+TableSLOIncidents, TableTargetStates, TableAuditLog
+```
 
-**Tahmini efor:** 1-2 gün.  
-**Bağımlılık:** Yok.
+Bu list tüm B19-B25 sprintlerinin domain'ini önceden tanımlıyor — SQLite migrations bu listeye göre yazılacak.
+
+**Total: 25 storage test, hepsi -race ile yeşil.**
 
 ---
 
