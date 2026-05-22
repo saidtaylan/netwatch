@@ -562,6 +562,110 @@ func main() {
 		_ = json.NewEncoder(w).Encode(map[string]bool{"cancelled": true})
 	})
 
+	// ── Silences endpoints (B24.5) ────────────────────────────────────────────
+	// GET    /cluster/silences      — list active silences (no auth)
+	// PUT    /cluster/silences      — create new silence    (auth required)
+	// DELETE /cluster/silences/{id} — cancel silence        (auth required)
+	mux.HandleFunc("/cluster/silences", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodGet, "":
+			_ = json.NewEncoder(w).Encode(e.Silences())
+
+		case http.MethodPut:
+			if !checkAdminAuth(e, w, r) {
+				return
+			}
+			var req struct {
+				Matchers  []engine.SilenceMatcher `json:"matchers"`
+				Duration  string                  `json:"duration"`
+				Comment   string                  `json:"comment,omitempty"`
+				CreatedBy string                  `json:"created_by,omitempty"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON: " + err.Error()})
+				return
+			}
+			if len(req.Matchers) == 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "matchers must not be empty"})
+				return
+			}
+			dur, err := time.ParseDuration(req.Duration)
+			if err != nil || dur <= 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "duration must be a valid Go duration (e.g. 30m, 2h)"})
+				return
+			}
+
+			now := time.Now().UTC()
+			sil := engine.Silence{
+				ID:        engine.GenerateSilenceID(),
+				Matchers:  req.Matchers,
+				StartedAt: now,
+				ExpiresAt: now.Add(dur),
+				Comment:   req.Comment,
+				CreatedBy: req.CreatedBy,
+			}
+			if err := e.SetSilence(sil); err != nil {
+				if errors.Is(err, storage.ErrSplitBrain) {
+					w.Header().Set("Retry-After", "10")
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_ = json.NewEncoder(w).Encode(map[string]string{
+						"error": "cluster lost quorum; writes paused until peers recover",
+					})
+					return
+				}
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":         sil.ID,
+				"expires_at": sil.ExpiresAt,
+				"matchers":   sil.Matchers,
+			})
+
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "use GET or PUT"})
+		}
+	})
+
+	// DELETE /cluster/silences/{id}
+	mux.HandleFunc("/cluster/silences/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodDelete {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "use DELETE"})
+			return
+		}
+		if !checkAdminAuth(e, w, r) {
+			return
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/cluster/silences/")
+		if id == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "silence ID required"})
+			return
+		}
+		if err := e.CancelSilence(id); err != nil {
+			if errors.Is(err, storage.ErrSplitBrain) {
+				w.Header().Set("Retry-After", "10")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"error": "cluster lost quorum; writes paused until peers recover",
+				})
+				return
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]bool{"cancelled": true})
+	})
+
 	// GET  /cluster/config — P1.5 config-sync snapshot (hash + per-peer drift).
 	// PUT  /cluster/config — distribute a partial SharedConfig to all nodes.
 	// PUT body: JSON or YAML (Content-Type: application/json or application/x-yaml).

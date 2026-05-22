@@ -727,6 +727,11 @@ type Engine struct {
 	// nil before Init() completes.
 	channelsMgr *channelsManager
 
+	// silencesMgr is the storage-backed silence registry (B24.5).
+	// Consulted by shouldAlert via IsSilenced to suppress alerts that
+	// match operator-defined silence rules.
+	silencesMgr *silencesManager
+
 	// orphanedSet tracks which local targets currently have no cluster prober
 	// assigned, so updateClusterMetrics can log only on transitions (edge-
 	// triggered) instead of every 5 s. Guarded by orphanedMu.
@@ -952,6 +957,9 @@ func (e *Engine) Shutdown() {
 		}
 		if e.maintMgr != nil {
 			e.maintMgr.Close()
+		}
+		if e.silencesMgr != nil {
+			e.silencesMgr.Close()
 		}
 		if e.sloMgr != nil {
 			e.sloMgr.Close()
@@ -1219,6 +1227,59 @@ func (e *Engine) runMaintenancePruner(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// runSilencesPruner periodically removes expired silences. Runs on the
+// same 30 s cadence as the maintenance pruner.
+func (e *Engine) runSilencesPruner(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if e.silencesMgr != nil {
+				e.silencesMgr.PruneExpired()
+			}
+		}
+	}
+}
+
+// ── Silences public API (B24.5) ───────────────────────────────────────────────
+
+// Silences returns the list of currently active silence rules.
+func (e *Engine) Silences() []Silence {
+	if e.silencesMgr == nil {
+		return nil
+	}
+	return e.silencesMgr.List()
+}
+
+// SetSilence creates or replaces a silence. Cluster-replicated via gossip.
+// Returns ErrSplitBrain when the cluster has lost quorum.
+func (e *Engine) SetSilence(s Silence) error {
+	if e.silencesMgr == nil {
+		return fmt.Errorf("silences: manager not initialized")
+	}
+	return e.silencesMgr.Set(s)
+}
+
+// CancelSilence removes a silence by ID. Idempotent.
+func (e *Engine) CancelSilence(id string) error {
+	if e.silencesMgr == nil {
+		return nil
+	}
+	return e.silencesMgr.Cancel(id)
+}
+
+// IsSilenced reports whether target t matches any active silence.
+// Called by shouldAlert on the alert hot-path.
+func (e *Engine) IsSilenced(t Target) bool {
+	if e.silencesMgr == nil {
+		return false
+	}
+	return e.silencesMgr.IsSilenced(t)
 }
 
 // LoadConfig reads the config file, resolves variables, validates, and hot-swaps.
@@ -1686,6 +1747,16 @@ func (e *Engine) Init() error {
 	}
 	e.channelsMgr = cm
 
+	// Silences registry — storage-backed (B24.5). Matcher-based alert
+	// mutes; complement to maintenance windows. No first-boot seed
+	// (silences are ad-hoc, created via API only).
+	silMgr, silErr := newSilencesManager(rootCtx, e.storage, e.clusterNodeName())
+	if silErr != nil {
+		return fmt.Errorf("silences manager: %w", silErr)
+	}
+	e.silencesMgr = silMgr
+	go e.runSilencesPruner(rootCtx)
+
 	// SLO tracker: persists incident history (local, per-node) and SLO
 	// target definitions (cluster-replicated via gossip). Disabled when
 	// slo.enabled is false (the default).
@@ -1952,11 +2023,21 @@ func (e *Engine) computeScope(targetID string, localDown bool) string {
 //   - Isolated mode: always false — suppress until quorum recovers
 //   - Cluster + quorum: only the responsible node (primary or secondary) alerts
 //   - min_probe_confirmations > 1: requires N probers to agree on hard_down
-func (e *Engine) shouldAlert(targetID string) bool {
+//   - Maintenance: target-ID-based suppression (planned downtime)
+//   - Silences: matcher-based suppression (ad-hoc acknowledgement)
+func (e *Engine) shouldAlert(t Target) bool {
+	targetID := t.key()
 	// Maintenance window check — takes priority over everything else.
 	// Probes continue to run; only alert dispatch is suppressed.
 	if e.maintMgr != nil && e.maintMgr.IsInMaintenance(targetID) {
 		slog.Debug("alert suppressed: target in maintenance", "target", targetID)
+		return false
+	}
+	// Silences — matcher-based suppression. Checked before cluster
+	// responsibility so a silenced alert is not dispatched even if this
+	// node is the responsible one.
+	if e.silencesMgr != nil && e.silencesMgr.IsSilenced(t) {
+		slog.Debug("alert suppressed: target matches silence", "target", targetID)
 		return false
 	}
 

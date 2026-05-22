@@ -186,7 +186,7 @@ func (e *Engine) runCheck(ctx context.Context, t Target) {
 				if e.markRecovered(pkey, t) {
 					e.sloRecordEnd(t)
 					slog.Info("target recovered", "name", t.key(), "target", t.Target, "latency", elapsed)
-					if e.shouldAlert(t.key()) {
+					if e.shouldAlert(t) {
 						e.sendAlert(t, "reachable")
 					}
 				}
@@ -205,7 +205,7 @@ func (e *Engine) runCheck(ctx context.Context, t Target) {
 					if e.markRecovered(pkey, t) {
 						e.sloRecordEnd(t)
 						slog.Info("target recovered (after soft-up)", "name", t.key(), "target", t.Target, "recovery_probes", count)
-						if e.shouldAlert(t.key()) {
+						if e.shouldAlert(t) {
 							e.sendAlert(t, "reachable")
 						}
 					}
@@ -389,12 +389,12 @@ func (e *Engine) processPending(ctx context.Context) {
 	// Recovery alerts first (targets coming back up), then hard-down alerts.
 	// Order within each group doesn't matter for correctness.
 	for _, r := range newRecoveries {
-		if e.shouldAlert(r.target.key()) {
+		if e.shouldAlert(r.target) {
 			e.sendAlert(r.target, "reachable")
 		}
 	}
 	for _, h := range newHardDowns {
-		if e.shouldAlert(h.target.key()) {
+		if e.shouldAlert(h.target) {
 			e.sendAlert(h.target, "unreachable")
 		}
 	}

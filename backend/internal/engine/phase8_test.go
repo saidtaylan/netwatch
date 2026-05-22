@@ -12,7 +12,7 @@ import (
 func TestShouldAlert_Standalone(t *testing.T) {
 	e := &Engine{}
 	// No cluster manager → always alert
-	if !e.shouldAlert("any-target") {
+	if !e.shouldAlert(Target{Name: "any-target"}) {
 		t.Error("standalone: shouldAlert must return true")
 	}
 }
@@ -22,7 +22,7 @@ func TestShouldAlert_IsolatedMode(t *testing.T) {
 	mgr.SetIsolated(true)
 
 	e := &Engine{clusterMgr: mgr}
-	if e.shouldAlert("any-target") {
+	if e.shouldAlert(Target{Name: "any-target"}) {
 		t.Error("isolated mode: shouldAlert must return false")
 	}
 }
@@ -34,7 +34,7 @@ func TestShouldAlert_NotResponsible(t *testing.T) {
 	// Find a target node-3 is NOT responsible for
 	for _, tid := range []string{"db", "cache", "api", "auth", "search", "queue", "payments", "orders", "x", "y", "z", "1", "2"} {
 		if !mgr.IsResponsible(tid) {
-			if e.shouldAlert(tid) {
+			if e.shouldAlert(Target{Name: tid}) {
 				t.Errorf("shouldAlert(%q): node-3 is not responsible but got true", tid)
 			}
 			return
@@ -50,7 +50,7 @@ func TestShouldAlert_Responsible(t *testing.T) {
 	// Find a target node-1 IS responsible for
 	for _, tid := range []string{"db", "cache", "api", "auth", "search", "queue", "payments", "orders", "x", "y", "z", "1", "2"} {
 		if mgr.IsResponsible(tid) {
-			if !e.shouldAlert(tid) {
+			if !e.shouldAlert(Target{Name: tid}) {
 				t.Errorf("shouldAlert(%q): node-1 is responsible but got false", tid)
 			}
 			return
