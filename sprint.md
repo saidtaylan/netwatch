@@ -418,11 +418,11 @@ Detay için `todo.md`. Öneri sırası: **B2 → B1 → B7** (Production Polish)
 
 **Ek:** F5 (Kubernetes SD) de bekleyen backend sprinti.
 
-### Yeni İstekler — Demo & Kullanım Sırasında Fark Edildi (2026-05-21)
+### Yeni İstekler — Demo & Kullanım Sırasında Fark Edildi (2026-05-21 / 2026-05-22)
 
 Bu istemler `GUIDE_OWNER.md`'de detaylı açıklanmış.
 
-#### B12 — SLO Target CRUD API ⏳ Bekliyor
+#### B12 — SLO Target CRUD API ✅ Backend tamamlandı (2026-05-22), frontend UI bekliyor
 
 **Sorun:** SLO target eklemek/güncellemek/silmek için config.yaml'ı elle düzenlemek gerekiyor. Deploy olmadan çalışma zamanında yönetmek mümkün değil.
 
@@ -477,6 +477,30 @@ e.lastStateChange sync.Map  // key → time.Time
 
 **Tahmini efor:** 30 dakika.  
 **Bağımlılık:** Yok — en kolay B-item.
+
+---
+
+#### B15 — SLO Target UI (add/edit/delete form) ⏳ Bekliyor
+
+**Bağımlılık:** B12 backend tamamlandı. UI gerekli.
+
+**Önerilen UI:** `/slo` sayfasına "Add Target" butonu ve her SLO entry yanına "Edit / Remove" butonları.
+
+Form: `target_id` (select from config targets), `target_uptime` (percent slider), `window` (24h/7d/30d dropdown).
+
+**API:** `PUT /slo/targets/{id}`, `DELETE /slo/targets/{id}` — zaten mevcut.
+
+**Tahmini efor:** 2 saat.
+
+---
+
+#### B16 — "Real Outage" vs "Network Partition" — Açıklama kullanıcıya göster ⏳ Bekliyor
+
+**Sorun:** Kullanıcı "neden Real Outage? Az önce Network Partition diyordu" diye sordu. Gossip yayılınca tüm node'lar anlaştı.
+
+**Öneri:** Classification değiştiğinde Alerts feed'e bir "scope update" kaydı ekle. Target detail'de "Classification changed from NETWORK_PARTITION to REAL_OUTAGE at HH:MM" göster.
+
+**Tahmini efor:** 2-3 saat (backend + frontend).
 
 ---
 

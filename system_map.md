@@ -202,6 +202,18 @@ frontend/
 
 **Frontend sprint'i (S0–S11) kapandı.** Toplam: 202 backend + 99 frontend unit + 29 e2e = **330 test yeşil**.
 
+### Bug Fixes Post-Sprint (2026-05-22)
+
+| Fix | Alan | Açıklama |
+|---|---|---|
+| Fleet type mismatch | backend+frontend | `FleetTarget.ID` eklendi (go clean -cache gerekti), types/api.ts tamamen yeniden yazıldı |
+| Topology UNKNOWN | frontend | `targetIndex.value[id]` — array lookup yerine O(1) Record lookup |
+| Config hash boş | backend | Init(): clusterMgr oluşturulduktan sonra `SetLocalConfigInfo` çağrısı |
+| Config hash sync | backend | `NotifyJoin` → `broadcastConfigInfo()` ile peer'lara hash iletildi |
+| SLO CRUD API (B12) | backend | `GET/PUT/DELETE /slo/targets/{id}` endpoint'leri eklendi |
+| SLO page type fix | frontend | `SLOSnapshot.targets` Record, tüm field isimleri düzeltildi |
+| Demo config | demo | Tüm 5 probe tipi (http, tcp, dns, ping, sql) + 2 app + 5 SLO target |
+
 ### Backend Backlog (B-items) — UI sonrası
 
 Detay için `todo.md`. Önerilen sıra: B2 (Severity) → B1 (Silence Rules) → B7 (Audit Log) → B3 (Latency Alerting) → B6 (gRPC).

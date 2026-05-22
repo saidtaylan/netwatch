@@ -16,6 +16,48 @@ Bu belge, netwatch projesinin günlük güncellemelerini ve teknik detaylarını
 
 ---
 
+## 2026-05-22 — Bug Fixes: Fleet Type Mismatch, Config Sync, SLO CRUD, Demo Expansion
+
+- [backend] **fleet.go FleetTarget.ID field eklendi** — Daha önce `targets[]` array'inde ID yoktu. Frontend `/targets/{id}` routing için target key'e ihtiyaç duyuyordu. `ft.ID = key` (= `t.key()`) eklendi. `go clean -cache` gerektirdi (Go build cache eski struct'ı tutuyordu).
+
+- [backend] **engine.go Init() config hash sırası düzeltildi** — `LoadConfig()`, `clusterMgr` oluşmadan çalışıyordu. Bu yüzden `SetLocalConfigInfo()` içindeki `if e.clusterMgr != nil` check'i geçemiyordu ve config hash hiç gönderilmiyordu. Fix: `e.clusterMgr = mgr` satırından hemen sonra `SetLocalConfigInfo` çağrısı eklendi.
+
+- [backend] **cluster.go NotifyJoin → config hash broadcast** — Yeni bir peer join olduğunda config hash yeniden broadcast yapılmıyordu. Peer config hash'lerini `/cluster/config` endpoint'inde görmek için gerekli. `NotifyJoin` goroutine'ine `e.mgr.broadcastConfigInfo()` eklendi.
+
+- [backend] **SLO CRUD API (B12)** — `GET /slo/targets`, `PUT /slo/targets/{id}`, `DELETE /slo/targets/{id}` endpoint'leri eklendi. Write endpoint'leri admin token gerektirir. In-memory (restart'ta sıfırlanır — config.yaml persist B12 devamında).
+
+- [frontend] **types/api.ts tüm type uyuşmazlıkları düzeltildi:**
+  - `FleetSnapshot`: `targets[]` array (was Record), `cluster` nested object, `summary` (was `target_counts`)
+  - `FleetNodeView` tipi eklendi (was `PeerTargetState` — farklı field'lar)
+  - `ConfigSyncSnapshot`: `{ self, peers[], drift_count }` (was `{ local_hash, in_sync, peers: Record }`)
+  - `SLOSnapshot`: targets `Record<id, SLOResult>` (was `SLOTargetResult[]`)
+  - `SLOTargetResult`: tüm field isimleri düzeltildi (target_id, slo_breached, remaining_budget_sec)
+  - `ClusterMember`: port, self alanları eklendi; `ClusterState`: local_node eklendi
+  - `SLOTargetConfig` interface eklendi (B12 CRUD için)
+
+- [frontend] **topology.vue UNKNOWN → gerçek state** — Linter topology.vue'yu eski `fleet.data.value?.targets?.[id]` koduna döndürmüştü. Targets array olduğu için her string key lookup undefined döndürüyordu. `targetIndex.value[id]` ile düzeltildi (O(1) Record lookup).
+
+- [frontend] **useFleet.ts refactor** — `targetList` (array), `targetIndex` (Record), `quorumHealthy`, `isolated`, `memberNames`, `counts`, `downTargetIds` composable shortcuts eklendi. Alert change detection array iteration'a uyarlandı.
+
+- [frontend] **pages/config/index.vue yeniden yazıldı** — Doğru backend field'ları: `self.config_hash`, `self.config_size`, `peers[]`, `drift_count`. Hash/size/loaded_at boş gelirse graceful fallback. Peer listesi array olarak iteration.
+
+- [frontend] **pages/slo.vue yeniden yazıldı** — `Object.values(targets)` ile Record→array, sort by breach status, doğru field isimleri (`slo_breached`, `remaining_budget_sec`, `target_id`), `computed_at` gösterimi.
+
+- [frontend] **pages/index.vue cluster member list** — `m.self` badge, `m.status` için renk indicator, `m.addr:m.port` gösterimi.
+
+- [demo] **Demo cluster config genişletildi** — Tüm 5 probe tipi eklendi:
+  - `mock-tcp-port` (tcp → 127.0.0.1:9999 mock server) — UP
+  - `loopback-ping` (ping → 127.0.0.1) — UP
+  - `postgres-main` (sql → 127.0.0.1:5432) — DOWN (no DB)
+  - `external-dns` (dns → google.com) — mevcut, korundu
+  - HTTP target'lar mevcut (db-primary, api-gateway, checkout)
+  
+  `external-dns` ve `mock-tcp-port` → payment-platform app'e eklendi.
+  `loopback-ping`, `external-dns`, `postgres-main` → infrastructure app (yeni).
+  SLO: checkout, external-dns, mock-tcp-port için eklendi.
+
+---
+
 ## 2026-05-21 — Frontend S11: Temel Kapanış + Error Page
 
 - [frontend] **`app/error.vue`** — Nuxt 4 standart error handler eklendi
