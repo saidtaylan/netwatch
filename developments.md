@@ -16,6 +16,72 @@ Bu belge, netwatch projesinin günlük güncellemelerini ve teknik detaylarını
 
 ---
 
+## 2026-05-22 — Mimari Karar: Embedded SQLite + Gossip Replikasyon
+
+Kullanıcı tarafından dile getirilen problem: "SLO, alerts, maintenance, real down status gibi knowledge'ı tek bir DB'de tutmalıyız. Şu an config.yaml dosyaları nodelarda farklı olabiliyor. Master yok, sadece eşit node'lar var — DB'yi nereye koyarız?"
+
+**Değerlendirilen 4 seçenek:**
+
+| Seçenek | Pros | Cons |
+|---|---|---|
+| **A. Embedded SQLite + Gossip** ⭐ | Tek binary, leaderless, mevcut pattern ile uyumlu, per-node resilient | Eventual consistency, conflict resolution gerek |
+| B. External PostgreSQL/MySQL | Strong consistency, kolay sorgu | Single point of failure, HA karmaşık, self-hosted felsefesine aykırı |
+| C. etcd / Consul | Distributed config için tasarlanmış | 2 cluster yönetim, storage limit (~8GB), alerts için uygun değil |
+| D. rqlite / dqlite (Raft+SQLite) | Embedded + strong consistency | Tek master yazma → leaderless mimariyi bozar, bootstrap karmaşık |
+
+**Karar: Option A (Embedded SQLite + Gossip)**
+
+Sebepler:
+1. netwatch'ın temel felsefesi single binary + leaderless gossip — bunu korur
+2. Mevcut maintenance windows zaten bu pattern'de çalışıyor (gossip + per-node persistence)
+3. Anti-entropy mekanizması zaten var, genişletilebilir
+4. Eventual consistency state machine için zaten kabul edildi
+5. Operatör external DB yönetmek zorunda kalmaz
+
+**Data classification (hangi veri nerede):**
+
+| Veri tipi | Strateji | Sebep |
+|---|---|---|
+| Real-time state (consensus, by_node) | Gossip only, no DB | Hot path, hızlı |
+| Configuration (targets, SLO, apps, channels) | DB + gossip broadcast | Dinamik, persist |
+| Operational events (maintenance, silences) | DB + gossip broadcast | Cluster-wide |
+| Historical (alerts, incidents) | DB + anti-entropy sync | Sorgulanabilir geçmiş |
+| Audit log | DB local-only | Tampering-resistant |
+
+**Sprint plan (B18-B23, ~2-3 hafta):**
+- B18: SQLite altyapısı + migrations (modernc.org/sqlite — pure Go, CGO-free)
+- B19: Config → DB (SLO, apps, channels, silences, maintenance, targets)
+- B20: Gossip replication (ConfigChangeBroadcast — maintenance pattern'i genişletilir)
+- B21: Anti-entropy (DB row hash + tombstone-aware sync)
+- B22: Alert History (B7 yeni biçim — alerts + alert_events tabloları)
+- B23: Backup/restore CLI
+
+Detay: `sprint.md` "DB Entegrasyon Sprintleri (B18-B22)".
+
+---
+
+## 2026-05-22 — Convergence Time Analiz + Alert Feed Anlatımı
+
+**Soru:** PARTIAL outage tam olarak ne kadar sürede GLOBAL olur?
+
+**Cevap (demo config ile):**
+- `probe_interval_sec: 30` → bir node max 30s'de hata tespit eder
+- `max_retries: 2` + `retry_interval_sec: 10` → 20s retry penceresi
+- Gossip UDP: ~100ms-1s
+- Memberlist anti-entropy: her 30s'de bir (UDP kaybı fallback'i)
+- **Worst case:** 50s (per-node detection) + 30s (anti-entropy) = **~80 saniye**
+- **Typical:** 30-60s
+
+**Soru:** Alert Feed nedir, "in-memory" ne demek?
+
+**Cevap:**
+- Şu an: Vue/Pinia store, JavaScript heap'inde — tab kapanınca silinir
+- UI sadece `/fleet/status` polling ile state geçişlerini yakalar
+- SLO breach, maintenance, config change → görünmez
+- Çözüm: B17 (frontend-only SLO breach detection — acil), B22 (backend persistent alert history — doğru)
+
+---
+
 ## 2026-05-22 — Bug Fixes: Fleet Type Mismatch, Config Sync, SLO CRUD, Demo Expansion
 
 - [backend] **fleet.go FleetTarget.ID field eklendi** — Daha önce `targets[]` array'inde ID yoktu. Frontend `/targets/{id}` routing için target key'e ihtiyaç duyuyordu. `ft.ID = key` (= `t.key()`) eklendi. `go clean -cache` gerektirdi (Go build cache eski struct'ı tutuyordu).

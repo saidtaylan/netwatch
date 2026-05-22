@@ -504,6 +504,124 @@ Form: `target_id` (select from config targets), `target_uptime` (percent slider)
 
 ---
 
+#### B17 — SLO Breach → Alert Feed (frontend-only quick fix) ⏳ Bekliyor
+
+**Sorun:** SLO breach olduğunda alert feed'de görünmüyor. Sadece state change'ler yakalanıyor.
+
+**Çözüm (acil — frontend-only):** `useSLO` composable'a polling içinde diff detection ekle:
+- Önceki snapshot'taki `slo_breached: false` + şimdi `true` → AlertEntry push
+- Tersi (recovery) → resolved alert push
+
+**Çözüm (doğru — B7 sonrası):** Backend `GET /alerts` endpoint'i hem state change hem SLO breach'leri dönsün. Frontend o endpoint'i takip etsin.
+
+**Tahmini efor:** 1 saat frontend-only quick fix, 4 saat backend doğru çözüm.
+
+---
+
+## 🗄️ DB Entegrasyon Sprintleri (B18-B22) — Major Refactor
+
+Kullanıcı tarafından 2026-05-22 talep edildi: "SLO, alerts, maintenance, config gibi knowledge'ı tek bir DB'de tutmalıyız. Şu an config.yaml dosyaları nodelarda farklı olabiliyor."
+
+**Mimari karar:** Embedded SQLite + Gossip replication (Option A — detaylar `developments.md` 2026-05-22).
+
+Felsefe:
+- netwatch single binary kalır (no external DB)
+- Leaderless gossip cluster korunur (no master)
+- Eventual consistency kabul edilir (zaten state machine için kabul)
+- Anti-entropy mevcut mekanizma genişletilir
+
+#### B18 — SQLite altyapısı + migrations ⏳ Bekliyor
+
+**Hedef:** Per-node embedded SQLite, schema versioning, basic CRUD.
+
+**Görevler:**
+1. `modernc.org/sqlite` pure-Go driver (CGO-free, cross-platform)
+2. `internal/storage/db.go` — connection, migrations, query helpers
+3. `internal/storage/migrations/001_initial.sql` — slo_targets, silences, alerts, audit_log tabloları
+4. State.json, incidents.json, maintenance.json → SQLite tablolarına migrasyon (geri uyumlu — JSON varsa yükle, sonra SQLite'a yaz)
+5. `data_dir` config alanı (varsayılan: state_file ile aynı dizin)
+
+**Tahmini efor:** 1-2 gün.  
+**Bağımlılık:** Yok.
+
+#### B19 — Config → DB migrasyonu (SLO, apps, notification channels) ⏳ Bekliyor
+
+**Hedef:** Dinamik config DB'de, statik config (cluster, port, timeouts) hâlâ config.yaml'da.
+
+**DB'ye alınacak:**
+- `slo_targets` (B12 yerini alır)
+- `apps` + `app_target_mappings`
+- `notification_channels`
+- `silences` (B1)
+- `maintenance` (mevcut maintenance.json yerine)
+
+**config.yaml'da kalır:**
+- `port`, `node_alias`, `state_file`, `log_path`
+- `cluster.*` (node_name, bind_addr, peers, keyring)
+- `admin.token`, `cors_origin`
+- Timeouts ve interval'lar (probe_interval_sec, max_retries, ...)
+- **`targets`** (kritik karar — aşağıya bak)
+
+**Tartışmalı:** Targets list. config.yaml'da kalırsa node'lar arası tutarsızlık olabilir. DB'ye alınırsa tek dynamic source. Önerim: **DB'ye al**, config.yaml'daki targets sadece initial seed olarak okunsun.
+
+**Tahmini efor:** 3-4 gün.  
+**Bağımlılık:** B18.
+
+#### B20 — Gossip Replikasyon (config değişiklikleri) ⏳ Bekliyor
+
+**Hedef:** Bir node'da config değişikliği → tüm node'lara yayılır.
+
+**Mevcut maintenance.go pattern'i genişletilir:**
+- `MaintenanceBroadcast` → genel `ConfigChangeBroadcast` (table, op, payload, lamport_ts)
+- `MaintenanceHandler` → genel `ConfigChangeHandler` interface
+- Engine'in `ApplyConfigChange(table, op, payload)` metodu
+
+**Lamport timestamp ile conflict resolution:** İki node aynı kaydı aynı anda değiştirirse en yüksek timestamp kazanır.
+
+**Tahmini efor:** 2-3 gün.  
+**Bağımlılık:** B18, B19.
+
+#### B21 — Anti-Entropy (DB sync) ⏳ Bekliyor
+
+**Hedef:** Net split sonrası DB tablolarını reconcile et.
+
+**Mekanizma:** Memberlist push-pull her 30s'de bir → tablo başına Merkle tree veya basit row hash karşılaştırması → eksik row'lar fetch.
+
+**Detay:**
+- Her tabloda `updated_at`, `lamport_ts`, `tombstone` (silindi mi?) kolonları
+- Sync sırasında tombstones de senkronize (silinmiş kayıt tekrar dirilmesin)
+
+**Tahmini efor:** 3-5 gün.  
+**Bağımlılık:** B20.
+
+#### B22 — Alert History DB (B7 yeni biçim) ⏳ Bekliyor
+
+**Hedef:** B7 (alert history) DB ile birleşir.
+
+**Tablolar:**
+- `alerts` — (id, target_id, status, scope, classification, seq, started_at, ended_at, dispatched_to)
+- `alert_events` — state changes, SLO breaches, maintenance start/end, classification changes
+
+**API:**
+- `GET /alerts?since=&until=&target_id=&severity=` — filter + pagination
+- `POST /alerts/{id}/ack` (B5'in yerini alır)
+
+**Persistence:** Per-node yazma + anti-entropy sync. Anti-entropy sırasında duplicate detection (UUID-based).
+
+**Tahmini efor:** 2-3 gün.  
+**Bağımlılık:** B18, B21.
+
+#### B23 — DB Backup/Restore CLI ⏳ Bekliyor
+
+**Hedef:** `netwatch db backup --output=/path/backup.db`, `netwatch db restore --input=...`.
+
+**Tahmini efor:** 1 gün.  
+**Bağımlılık:** B18.
+
+**Toplam tahmini efor (B18-B23):** ~2-3 hafta.
+
+---
+
 ## ✅ Sprint Tamamlandı — [backend] Production Quality Features (F1-F4)
 
 Uygulama tarihi: 2026-05-20. F5 (K8s SD) → sonraki sprint.
