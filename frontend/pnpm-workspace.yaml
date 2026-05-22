@@ -1,3 +1,9 @@
+# pnpm 11 settings (moved out of package.json's "pnpm" field).
+#
+# allowBuilds whitelists packages whose install-time native build scripts
+# pnpm is allowed to execute. Without this list pnpm 11 silently ignores
+# build scripts and exits with code 1 in CI (ERR_PNPM_IGNORED_BUILDS),
+# which broke the Frontend unit / Frontend e2e jobs.
 allowBuilds:
-  '@parcel/watcher': set this to true or false
-  esbuild: set this to true or false
+  '@parcel/watcher': true
+  esbuild: true
