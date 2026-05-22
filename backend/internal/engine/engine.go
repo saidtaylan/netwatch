@@ -1433,7 +1433,13 @@ func (e *Engine) Init() error {
 	sloCfg := e.cfg.SLO
 	stateFilePath := e.cfg.StateFile
 	e.mu.RUnlock()
-	e.maintMgr = newMaintenanceManager(stateFilePath)
+	// Maintenance manager — storage-backed (B24). Requires e.storage which
+	// was initialized above in initStorage().
+	mm, mmErr := newMaintenanceManager(rootCtx, e.storage)
+	if mmErr != nil {
+		return fmt.Errorf("maintenance manager: %w", mmErr)
+	}
+	e.maintMgr = mm
 	go e.runMaintenancePruner(rootCtx)
 
 	// SLO tracker: persists incident history, checks breaches hourly.

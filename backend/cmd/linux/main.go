@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -23,8 +24,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/saidtaylan/netwatch/internal/cluster"
 	"github.com/saidtaylan/netwatch/internal/engine"
+	"github.com/saidtaylan/netwatch/internal/storage"
 	sigs_yaml "sigs.k8s.io/yaml"
 )
 
@@ -460,22 +461,27 @@ func main() {
 				StartedBy: req.StartedBy,
 			}
 			if err := e.SetMaintenance(win); err != nil {
+				// B24: storage layer returns ErrSplitBrain when cluster has
+				// lost quorum. Translate to 503 so clients retry.
+				if errors.Is(err, storage.ErrSplitBrain) {
+					w.Header().Set("Retry-After", "10")
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_ = json.NewEncoder(w).Encode(map[string]string{
+						"error": "cluster lost quorum; writes paused until peers recover",
+					})
+					return
+				}
 				w.WriteHeader(http.StatusInternalServerError)
 				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 				return
 			}
 
-			// Broadcast to cluster peers.
-			if mgr := e.ClusterManager(); mgr != nil {
-				mgr.BroadcastMaintenanceSet(cluster.MaintenanceWindowPayload{
-					ID:        win.ID,
-					TargetIDs: win.TargetIDs,
-					StartedAt: win.StartedAt,
-					ExpiresAt: win.ExpiresAt,
-					Reason:    win.Reason,
-					StartedBy: win.StartedBy,
-				})
-			}
+			// Note: prior to B24 we also called clusterMgr.BroadcastMaintenanceSet
+			// here. That is no longer needed — the storage layer broadcasts the
+			// upsert automatically through gossip.ChangeBroadcaster. The old
+			// MaintenanceBroadcast path remains in the cluster package for
+			// backward compatibility with peers still running pre-B24 code, but
+			// new writes flow exclusively through storage.
 
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"id":         win.ID,
@@ -508,14 +514,24 @@ func main() {
 			return
 		}
 		if err := e.CancelMaintenance(id); err != nil {
+			// B24: storage layer returns ErrSplitBrain when quorum lost.
+			if errors.Is(err, storage.ErrSplitBrain) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Retry-After", "10")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"error": "cluster lost quorum; writes paused until peers recover",
+				})
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
-		if mgr := e.ClusterManager(); mgr != nil {
-			mgr.BroadcastMaintenanceCancel(id)
-		}
+		// B24: storage layer broadcasts the tombstone automatically through
+		// gossip.ChangeBroadcaster. The old cluster.BroadcastMaintenanceCancel
+		// call is no longer needed.
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]bool{"cancelled": true})
 	})
