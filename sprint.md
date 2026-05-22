@@ -504,17 +504,17 @@ Form: `target_id` (select from config targets), `target_uptime` (percent slider)
 
 ---
 
-#### B17 — SLO Breach → Alert Feed (frontend-only quick fix) ⏳ Bekliyor
+#### ✅ B17 — SLO Breach → Alert Feed (frontend-only quick fix) — Tamamlandı 2026-05-22
 
-**Sorun:** SLO breach olduğunda alert feed'de görünmüyor. Sadece state change'ler yakalanıyor.
+**Yapılanlar:**
+- `useSLO.ts` — `prevBreached` ref ile snapshot diff detection
+- `slo_breached: false → true` → "BREACHED" AlertEntry push
+- `slo_breached: true → false` → "RECOVERED" AlertEntry push
+- Alerts feed'de SLO badge (📊 SLO) + label ("BREACHED"/"RECOVERED")
+- 5 unit test eklendi (no-alert-on-first-poll, breach transition, recovery, stable, multi-target)
+- `alerts.vue` info banner güncellendi (B25'e atıf)
 
-**Çözüm (acil — frontend-only):** `useSLO` composable'a polling içinde diff detection ekle:
-- Önceki snapshot'taki `slo_breached: false` + şimdi `true` → AlertEntry push
-- Tersi (recovery) → resolved alert push
-
-**Çözüm (doğru — B7 sonrası):** Backend `GET /alerts` endpoint'i hem state change hem SLO breach'leri dönsün. Frontend o endpoint'i takip etsin.
-
-**Tahmini efor:** 1 saat frontend-only quick fix, 4 saat backend doğru çözüm.
+**Doğru çözüm (B25 ile gelecek):** Backend `GET /alerts` endpoint'i hem state change hem SLO breach hem maintenance event'leri unified stream'de döner. UI sadece bunu poll eder, client-side diff detection kalkar.
 
 ---
 

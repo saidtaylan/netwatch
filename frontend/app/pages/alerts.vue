@@ -2,12 +2,19 @@
 import { fmtRelative } from '~/utils/format'
 import { SCOPE_STYLE, CLASS_STYLE } from '~/utils/classifyState'
 
-// Fleet polling keeps alerts store populated via change detection
+// Fleet polling keeps alerts store populated via state-change detection.
+// SLO polling pushes breach/recovery alerts via useSLO composable (B17).
 const { fleet } = useFleet()
-const alerts = useAlertsStore()
+const { slo }   = useSLO()
+const alerts    = useAlertsStore()
 
 function statusColor(status: string) {
   return status === 'unreachable' ? 'text-red-600' : 'text-green-600'
+}
+
+// SLO alerts have id prefixed with "slo-"
+function isSLOAlert(id: string): boolean {
+  return id.startsWith('slo-')
 }
 </script>
 
@@ -22,9 +29,9 @@ function statusColor(status: string) {
         class="text-xs text-red-500 hover:text-red-700 hover:underline">Clear</button>
     </div>
 
-    <!-- Note about B7 -->
+    <!-- Note about B25 (persistent alert history) -->
     <div class="bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-700 rounded-xl px-4 py-3 text-sm text-blue-700 dark:text-blue-300">
-      💡 This is a client-side feed based on state changes detected while the UI is open. Persistent alert history (B7) will be available in a future update.
+      💡 Client-side feed: state changes (UP/DOWN) and SLO breaches detected while the UI is open. Persistent alert history with ack/mute (B25) is coming.
     </div>
 
     <div v-if="alerts.items.length" class="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-100 dark:border-gray-700 overflow-hidden">
@@ -43,15 +50,25 @@ function statusColor(status: string) {
                 class="text-sm font-medium text-gray-900 dark:text-white hover:underline">
                 {{ alert.target_name }}
               </NuxtLink>
+              <!-- SLO breach indicator (B17) -->
+              <span v-if="isSLOAlert(alert.id)"
+                class="text-xs font-semibold text-purple-600 bg-purple-50 dark:bg-purple-900/20 ring-1 ring-purple-300 rounded-full px-1.5 py-0.5">
+                📊 SLO
+              </span>
               <span :class="['text-xs font-semibold', statusColor(alert.status)]">
-                {{ alert.status === 'unreachable' ? 'DOWN' : 'UP' }}
+                {{ isSLOAlert(alert.id)
+                   ? (alert.status === 'unreachable' ? 'BREACHED' : 'RECOVERED')
+                   : (alert.status === 'unreachable' ? 'DOWN' : 'UP') }}
               </span>
-              <span :class="['text-xs', SCOPE_STYLE[alert.scope]?.color ?? 'text-gray-400']">
-                {{ SCOPE_STYLE[alert.scope]?.label }}
-              </span>
-              <span :class="['text-xs', CLASS_STYLE[alert.classification]?.color ?? 'text-gray-400']">
-                {{ CLASS_STYLE[alert.classification]?.label }}
-              </span>
+              <!-- State-change alerts: show scope/classification. SLO alerts: skip them -->
+              <template v-if="!isSLOAlert(alert.id)">
+                <span :class="['text-xs', SCOPE_STYLE[alert.scope]?.color ?? 'text-gray-400']">
+                  {{ SCOPE_STYLE[alert.scope]?.label }}
+                </span>
+                <span :class="['text-xs', CLASS_STYLE[alert.classification]?.color ?? 'text-gray-400']">
+                  {{ CLASS_STYLE[alert.classification]?.label }}
+                </span>
+              </template>
             </div>
             <p v-if="alert.error_code" class="text-xs text-gray-500 font-mono mt-0.5 truncate">{{ alert.error_code }}</p>
             <div class="flex items-center gap-3 mt-1">
