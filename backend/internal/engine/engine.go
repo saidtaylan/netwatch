@@ -722,6 +722,11 @@ type Engine struct {
 	// every change. nil before Init() completes.
 	appsMgr *appsManager
 
+	// channelsMgr is the storage-backed notification channel registry
+	// (B24.4). When non-nil, it republishes e.channels on every change.
+	// nil before Init() completes.
+	channelsMgr *channelsManager
+
 	// orphanedSet tracks which local targets currently have no cluster prober
 	// assigned, so updateClusterMetrics can log only on transitions (edge-
 	// triggered) instead of every 5 s. Guarded by orphanedMu.
@@ -891,6 +896,14 @@ func (e *Engine) setAppIndex(idx AppTargetIndex) {
 	e.mu.Unlock()
 }
 
+// setChannels atomically replaces e.channels. Called by the channels
+// manager whenever the registry changes (local CRUD or peer gossip).
+func (e *Engine) setChannels(channels map[string]Alerter) {
+	e.mu.Lock()
+	e.channels = channels
+	e.mu.Unlock()
+}
+
 // clusterNodeName returns the cluster-configured node name when cluster is
 // enabled, and falls back to the OS hostname for standalone mode.
 // This value is the authoritative identity used in gossip payloads and must
@@ -933,6 +946,9 @@ func (e *Engine) Shutdown() {
 		// final flurry of peer events doesn't race against the DB close.
 		if e.appsMgr != nil {
 			e.appsMgr.Close()
+		}
+		if e.channelsMgr != nil {
+			e.channelsMgr.Close()
 		}
 		if e.maintMgr != nil {
 			e.maintMgr.Close()
@@ -1089,6 +1105,54 @@ func (e *Engine) ApplyMaintenanceCancel(id string) error {
 		return nil
 	}
 	return e.maintMgr.Cancel(id)
+}
+
+// ── Notification channels public API (B24.4) ──────────────────────────────────
+
+// NotificationChannels returns the current channel configurations from the
+// storage-backed registry. Falls back to the in-memory config when the
+// channels manager has not yet been initialized.
+func (e *Engine) NotificationChannels() map[string]AlertChannelConfig {
+	if e.channelsMgr != nil {
+		return e.channelsMgr.Channels()
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make(map[string]AlertChannelConfig, len(e.cfg.Notifications))
+	for k, v := range e.cfg.Notifications {
+		out[k] = v
+	}
+	return out
+}
+
+// UpsertNotificationChannel adds or replaces a channel. Cluster-replicated.
+// Validates the config via newAlertChannel before persisting.
+func (e *Engine) UpsertNotificationChannel(name string, c AlertChannelConfig) error {
+	if e.channelsMgr == nil {
+		// Pre-Init fallback: write to in-memory cfg only.
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		if e.cfg.Notifications == nil {
+			e.cfg.Notifications = make(map[string]AlertChannelConfig)
+		}
+		e.cfg.Notifications[name] = c
+		return nil
+	}
+	return e.channelsMgr.Upsert(name, c)
+}
+
+// DeleteNotificationChannel removes a channel. Returns true when it existed.
+func (e *Engine) DeleteNotificationChannel(name string) (bool, error) {
+	if e.channelsMgr == nil {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		if _, ok := e.cfg.Notifications[name]; !ok {
+			return false, nil
+		}
+		delete(e.cfg.Notifications, name)
+		return true, nil
+	}
+	return e.channelsMgr.Delete(name)
 }
 
 // ── Apps registry public API (B24.3) ──────────────────────────────────────────
@@ -1270,9 +1334,22 @@ func (e *Engine) LoadConfig() error {
 		return fmt.Errorf("app validation: %w", err)
 	}
 
-	channels, err := buildAlertChannels(newCfg, e.alertRunner)
-	if err != nil {
-		return fmt.Errorf("notification channels: %w", err)
+	// channels is built from config.yaml ONLY on the initial load (before
+	// channelsMgr is wired). On hot-reload after Init(), the storage-backed
+	// manager owns e.channels; the config.yaml notifications: section is
+	// ignored as a source of truth (DB is authoritative).
+	var channels map[string]Alerter
+	if e.channelsMgr == nil {
+		var err error
+		channels, err = buildAlertChannels(newCfg, e.alertRunner)
+		if err != nil {
+			return fmt.Errorf("notification channels: %w", err)
+		}
+	} else {
+		// Use the live storage-backed snapshot for target validation.
+		e.mu.RLock()
+		channels = e.channels
+		e.mu.RUnlock()
 	}
 	for _, t := range newCfg.Targets {
 		if !t.active() {
@@ -1340,7 +1417,12 @@ func (e *Engine) LoadConfig() error {
 
 	e.mu.Lock()
 	e.cfg = newCfg
-	e.channels = channels
+	if e.channelsMgr == nil {
+		// Pre-Init() path: write the config-derived channel map directly.
+		// After Init(), channelsMgr is the authoritative writer of e.channels
+		// via publishRebuild → setChannels.
+		e.channels = channels
+	}
 	if e.appsMgr == nil {
 		// Pre-Init() path: write the config-derived index directly.
 		e.appIndex = appIndex
@@ -1585,6 +1667,24 @@ func (e *Engine) Init() error {
 		return fmt.Errorf("apps manager: %w", amErr)
 	}
 	e.appsMgr = am
+
+	// Notification channels registry — storage-backed (B24.4). Seeds
+	// from config.yaml's notifications: section on first boot. The
+	// manager rebuilds e.channels on every change so peer CRUD updates
+	// are visible to the alert hot-path within seconds.
+	seedChannels := make(map[string]AlertChannelConfig, len(e.cfg.Notifications))
+	for k, v := range e.cfg.Notifications {
+		seedChannels[k] = v
+	}
+	cm, cmErr := newChannelsManager(rootCtx, e.storage, e.clusterNodeName(),
+		e.alertRunner,
+		seedChannels,
+		e.setChannels,
+	)
+	if cmErr != nil {
+		return fmt.Errorf("channels manager: %w", cmErr)
+	}
+	e.channelsMgr = cm
 
 	// SLO tracker: persists incident history (local, per-node) and SLO
 	// target definitions (cluster-replicated via gossip). Disabled when
