@@ -518,107 +518,306 @@ Form: `target_id` (select from config targets), `target_uptime` (percent slider)
 
 ---
 
-## 🗄️ DB Entegrasyon Sprintleri (B18-B22) — Major Refactor
+## 🗄️ Storage Layer Sprintleri (B18-B25) — Interface-First Approach
 
-Kullanıcı tarafından 2026-05-22 talep edildi: "SLO, alerts, maintenance, config gibi knowledge'ı tek bir DB'de tutmalıyız. Şu an config.yaml dosyaları nodelarda farklı olabiliyor."
+**Tarih:** 2026-05-22. Kullanıcı tarafından talep edildi, Gemini ile ikinci görüş alındı.
 
-**Mimari karar:** Embedded SQLite + Gossip replication (Option A — detaylar `developments.md` 2026-05-22).
+**Karar: Interface-based pragmatic approach** — şimdi `GossipLWWStorage`, V2.0'da `RaftStorage` aynı interface'i implement eder. Upper layer (engine, HTTP handlers) backend swap'inden etkilenmez.
 
-Felsefe:
+**Felsefe:**
 - netwatch single binary kalır (no external DB)
 - Leaderless gossip cluster korunur (no master)
-- Eventual consistency kabul edilir (zaten state machine için kabul)
-- Anti-entropy mevcut mekanizma genişletilir
+- Eventual consistency kabul edilir (admin paneli, yazma frekansı düşük)
+- IsolatedMode write guard → split-brain'de veri kaybı engelle
+- Tüm asset'ler için Lamport seq + LWW: deterministic conflict resolution
+- StorageBackend interface ile V2.0'da Raft'a kapı açık
 
-#### B18 — SQLite altyapısı + migrations ⏳ Bekliyor
+### Mimari Diyagram
 
-**Hedef:** Per-node embedded SQLite, schema versioning, basic CRUD.
+```
+HTTP Handlers / Engine
+        │
+        ▼
+┌─────────────────────────────────┐
+│  StorageBackend (interface)     │  ← Bu interface kalır
+│  - Upsert / Delete / Get / List │
+│  - Watch (event stream)         │
+└─────────────────────────────────┘
+        │                  │
+        ▼                  ▼
+ GossipLWWStorage     RaftStorage
+ (V1, şimdi)          (V2.0, gelecek)
+        │
+        ├─ SQLite (per-node)
+        ├─ Gossip broadcast (writes)
+        └─ Anti-entropy sync (reconcile)
+```
+
+### Tablo Schema Pattern
+
+Her StorageBackend tablosu **3 ekstra kolon** içerir:
+
+```sql
+CREATE TABLE <entity> (
+  -- Domain-specific columns
+  id              TEXT PRIMARY KEY,
+  ...payload...,
+
+  -- LWW / Anti-entropy meta
+  seq             INTEGER NOT NULL DEFAULT 0,  -- Lamport timestamp
+  updated_at      TEXT    NOT NULL,            -- ISO timestamp
+  updated_by      TEXT    NOT NULL,            -- node_name (tiebreaker)
+  tombstone       INTEGER NOT NULL DEFAULT 0   -- soft delete
+);
+CREATE INDEX <entity>_seq ON <entity>(seq);
+```
+
+Conflict resolution: `seq` > `updated_at` > `updated_by` (lex)
+
+---
+
+### B18 — StorageBackend interface + GossipLWWStorage skeleton ⏳ Bekliyor
+
+**Hedef:** `internal/storage` paketi, interface tanımı, in-memory implementation (testler için), gerçek implementation skeleton.
 
 **Görevler:**
-1. `modernc.org/sqlite` pure-Go driver (CGO-free, cross-platform)
-2. `internal/storage/db.go` — connection, migrations, query helpers
-3. `internal/storage/migrations/001_initial.sql` — slo_targets, silences, alerts, audit_log tabloları
-4. State.json, incidents.json, maintenance.json → SQLite tablolarına migrasyon (geri uyumlu — JSON varsa yükle, sonra SQLite'a yaz)
-5. `data_dir` config alanı (varsayılan: state_file ile aynı dizin)
+1. `internal/storage/backend.go` — `StorageBackend` interface
+   ```go
+   type StorageBackend interface {
+       Upsert(ctx, table, id, payload, ver Version) error
+       Delete(ctx, table, id, ver Version) error  // soft delete (tombstone)
+       Get(ctx, table, id string) (Record, error)
+       List(ctx, table string, filter Filter) ([]Record, error)
+       Watch(ctx, table string) (<-chan Event, error)
+   }
+   ```
+2. `internal/storage/version.go` — `Version{Seq, UpdatedAt, UpdatedBy}` + `Compare(a,b) int`
+3. `internal/storage/record.go` — `Record`, `Filter`, `Event` types
+4. `internal/storage/memory.go` — `MemoryStorage` (sadece testler için, gossip yok)
+5. Comprehensive unit tests for conflict resolution
 
 **Tahmini efor:** 1-2 gün.  
 **Bağımlılık:** Yok.
 
-#### B19 — Config → DB migrasyonu (SLO, apps, notification channels) ⏳ Bekliyor
+---
 
-**Hedef:** Dinamik config DB'de, statik config (cluster, port, timeouts) hâlâ config.yaml'da.
+### B19 — SQLite implementation (GossipLWWStorage core) ⏳ Bekliyor
 
-**DB'ye alınacak:**
-- `slo_targets` (B12 yerini alır)
-- `apps` + `app_target_mappings`
-- `notification_channels`
-- `silences` (B1)
-- `maintenance` (mevcut maintenance.json yerine)
+**Hedef:** SQLite-backed StorageBackend implementation (henüz gossip yok, sadece local persistence).
 
-**config.yaml'da kalır:**
-- `port`, `node_alias`, `state_file`, `log_path`
-- `cluster.*` (node_name, bind_addr, peers, keyring)
-- `admin.token`, `cors_origin`
-- Timeouts ve interval'lar (probe_interval_sec, max_retries, ...)
-- **`targets`** (kritik karar — aşağıya bak)
+**Görevler:**
+1. `modernc.org/sqlite` pure-Go driver (CGO-free)
+2. `internal/storage/sqlite/sqlite.go` — connection pool, transactions
+3. `internal/storage/sqlite/migrations/` — versioned schema migrations
+4. `internal/storage/sqlite/generic.go` — generic CRUD using table+payload pattern
+5. `data_dir` config field — defaults `dirname(state_file)`
+6. Schema bootstrap: init tabloları (sloTargets, apps, channels, silences, maintenance, alerts, audit_log)
 
-**Tartışmalı:** Targets list. config.yaml'da kalırsa node'lar arası tutarsızlık olabilir. DB'ye alınırsa tek dynamic source. Önerim: **DB'ye al**, config.yaml'daki targets sadece initial seed olarak okunsun.
+**Tahmini efor:** 2-3 gün.  
+**Bağımlılık:** B18.
+
+---
+
+### B20 — Migration: existing JSON → StorageBackend ⏳ Bekliyor
+
+**Hedef:** state.json, incidents.json, maintenance.json'ı SQLite tablolarına taşı. Geri uyumlu — JSON varsa oku, SQLite'a yaz, sonra JSON'u arşivle.
+
+**Görevler:**
+1. `internal/engine/migrate.go` — JSON varsa SQLite'a aktarmaya çalış, `.migrated` suffix ekle
+2. state.json → `target_states` tablosu (Lamport seq zaten var, mapping kolay)
+3. incidents.json → `slo_incidents` tablosu
+4. maintenance.json → `maintenance_windows` tablosu (gossip pattern korunur)
+5. Backward compat tests: v1 JSON formatı hâlâ okunabilir
+
+**Tahmini efor:** 2 gün.  
+**Bağımlılık:** B19.
+
+---
+
+### B21 — GossipLWWStorage: write broadcast ⏳ Bekliyor
+
+**Hedef:** Her `Upsert`/`Delete` çağrısı, local DB'ye yazdıktan sonra cluster'a broadcast eder.
+
+**Görevler:**
+1. `internal/storage/gossip/storage.go` — GossipLWWStorage wraps SQLite implementation
+2. `StorageChangeBroadcast` mesaj tipi (table, op, id, payload, version)
+3. Wire to memberlist broadcast queue (mevcut pattern, maintenance.go gibi)
+4. `OnStorageChange` handler — diğer node'dan gelen broadcast'i alır, LWW kuralıyla local DB'ye uygular
+5. `Version.Compare` ile conflict resolution
+
+**Tahmini efor:** 2 gün.  
+**Bağımlılık:** B19.
+
+---
+
+### B22 — IsolatedMode Write Guard (split-brain protection) ⏳ Bekliyor
+
+**Hedef:** Quorum kaybedildiğinde yazma reddet. Sadece okuma.
+
+**Görevler:**
+1. `GossipLWWStorage.Upsert/Delete` çağrısı başında `clusterMgr.IsolatedMode()` kontrolü
+2. `ErrSplitBrain` döndür → HTTP layer 503 + retry-after header
+3. Quorum geri geldiğinde otomatik yazma kabul (manuel müdahale yok)
+4. Test senaryosu: 2 node, 1 izole et, yazma denemesi → 503
+
+**Tahmini efor:** 0.5 gün.  
+**Bağımlılık:** B21.
+
+---
+
+### B23 — Anti-Entropy: DB row sync ⏳ Bekliyor
+
+**Hedef:** UDP broadcast'leri kaçıran node'lar push-pull sync ile reconcile olsun.
+
+**Görevler:**
+1. Memberlist `LocalState(join)` → her tablo için `(id, version)` listesi
+2. Memberlist `MergeRemoteState(buf, join)` → peer'ın listesini al, eksik kayıtları/güncel olmayanları talep et
+3. Pull request: `GET /storage/sync?table=X&since_seq=N` endpoint (internal)
+4. Tombstone-aware: silinmiş kayıt yeniden dirilmesin
+5. Performance: tablo başına 1MB cap, paginated
 
 **Tahmini efor:** 3-4 gün.  
-**Bağımlılık:** B18.
+**Bağımlılık:** B21.
 
-#### B20 — Gossip Replikasyon (config değişiklikleri) ⏳ Bekliyor
+---
 
-**Hedef:** Bir node'da config değişikliği → tüm node'lara yayılır.
+### B24 — Migration: Config → StorageBackend (SLO, apps, channels) ⏳ Bekliyor
 
-**Mevcut maintenance.go pattern'i genişletilir:**
-- `MaintenanceBroadcast` → genel `ConfigChangeBroadcast` (table, op, payload, lamport_ts)
-- `MaintenanceHandler` → genel `ConfigChangeHandler` interface
-- Engine'in `ApplyConfigChange(table, op, payload)` metodu
+**Hedef:** Dinamik config'i (UI'dan editlenebilen) DB'ye al. config.yaml sadece bootstrap.
 
-**Lamport timestamp ile conflict resolution:** İki node aynı kaydı aynı anda değiştirirse en yüksek timestamp kazanır.
+**DB'ye geçen tablolar:**
+- `slo_targets` (B12'nin yerini alır, gossip-replicated)
+- `apps` + `app_target_mappings`
+- `notification_channels`
+- `silences` (B1 implementation)
+- `targets` ⚠ — kritik karar (aşağıya bak)
 
-**Tahmini efor:** 2-3 gün.  
-**Bağımlılık:** B18, B19.
+**Tartışmalı: targets**
+- Statik tutmak (config.yaml) → manual config push gerekli
+- DB'ye almak → UI'dan add/edit/delete, anlık cluster sync
 
-#### B21 — Anti-Entropy (DB sync) ⏳ Bekliyor
+**Önerim:** DB'ye al, config.yaml'daki targets sadece **initial seed** olarak okunsun (bootstrap helper). Sonra DB üzerinden yönetilsin.
 
-**Hedef:** Net split sonrası DB tablolarını reconcile et.
+**API'ler (B12 pattern):**
+- `GET /apps`, `PUT /apps/{name}`, `DELETE /apps/{name}`
+- `GET /channels`, `PUT /channels/{name}`, `DELETE /channels/{name}`
+- `GET /silences`, `PUT /silences`, `DELETE /silences/{id}`
+- `GET /targets`, `PUT /targets/{id}`, `DELETE /targets/{id}`
 
-**Mekanizma:** Memberlist push-pull her 30s'de bir → tablo başına Merkle tree veya basit row hash karşılaştırması → eksik row'lar fetch.
+Tüm yazma endpoint'leri admin token + IsolatedMode guard.
 
-**Detay:**
-- Her tabloda `updated_at`, `lamport_ts`, `tombstone` (silindi mi?) kolonları
-- Sync sırasında tombstones de senkronize (silinmiş kayıt tekrar dirilmesin)
+**Tahmini efor:** 3-4 gün.  
+**Bağımlılık:** B22, B23.
 
-**Tahmini efor:** 3-5 gün.  
-**Bağımlılık:** B20.
+---
 
-#### B22 — Alert History DB (B7 yeni biçim) ⏳ Bekliyor
+### B25 — Alert History (B7 final form) ⏳ Bekliyor
 
-**Hedef:** B7 (alert history) DB ile birleşir.
+**Hedef:** Persistent alert log, UI'dan sorgulanabilir.
 
 **Tablolar:**
-- `alerts` — (id, target_id, status, scope, classification, seq, started_at, ended_at, dispatched_to)
-- `alert_events` — state changes, SLO breaches, maintenance start/end, classification changes
+```sql
+CREATE TABLE alerts (
+  id              TEXT PRIMARY KEY,    -- UUID
+  target_id       TEXT NOT NULL,
+  status          TEXT NOT NULL,       -- unreachable|reachable|slo_breached|...
+  scope           TEXT,
+  classification  TEXT,
+  severity        TEXT,                -- B2 entegrasyonu
+  seq             INTEGER NOT NULL,
+  error_code      TEXT,
+  started_at      TEXT NOT NULL,       -- when DOWN started
+  resolved_at     TEXT,                -- when UP came back
+  affected_apps   TEXT,                -- JSON array
+  acked_at        TEXT,                -- B5 ack
+  acked_by        TEXT,
+  muted           INTEGER NOT NULL DEFAULT 0,
+  dispatched_to   TEXT,                -- JSON: ["webhook", "mail"]
+  -- + standard LWW columns (seq, updated_at, updated_by, tombstone)
+);
+
+CREATE TABLE alert_events (
+  id            TEXT PRIMARY KEY,
+  alert_id      TEXT NOT NULL,        -- foreign key to alerts.id
+  event_type    TEXT NOT NULL,        -- state_change, classification_change, slo_breach, ack, mute
+  payload       TEXT NOT NULL,        -- JSON
+  occurred_at   TEXT NOT NULL,
+  -- append-only, no LWW conflicts (UUID-based)
+);
+```
 
 **API:**
-- `GET /alerts?since=&until=&target_id=&severity=` — filter + pagination
-- `POST /alerts/{id}/ack` (B5'in yerini alır)
+- `GET /alerts?since=&until=&target_id=&severity=&acked=&limit=` — filter + pagination
+- `POST /alerts/{id}/ack` — B5
+- `POST /alerts/{id}/mute` — B5
+- `GET /alerts/{id}/events` — timeline
 
-**Persistence:** Per-node yazma + anti-entropy sync. Anti-entropy sırasında duplicate detection (UUID-based).
+**Persistence:** Per-node + anti-entropy. UUID + tombstone-aware dedup.
 
 **Tahmini efor:** 2-3 gün.  
-**Bağımlılık:** B18, B21.
+**Bağımlılık:** B23.
 
-#### B23 — DB Backup/Restore CLI ⏳ Bekliyor
+---
 
-**Hedef:** `netwatch db backup --output=/path/backup.db`, `netwatch db restore --input=...`.
+### B26 — Backup/Restore CLI ⏳ Bekliyor
+
+**Hedef:** Operational tooling for DB backup.
+
+**Komutlar:**
+```bash
+netwatch db backup --output=/path/backup.db
+netwatch db restore --input=/path/backup.db --confirm
+netwatch db vacuum
+netwatch db inspect --table=alerts --limit=100
+```
 
 **Tahmini efor:** 1 gün.  
-**Bağımlılık:** B18.
+**Bağımlılık:** B19.
 
-**Toplam tahmini efor (B18-B23):** ~2-3 hafta.
+---
+
+### B27 — (V2.0, future) RaftStorage implementation 🔮 İleride
+
+**Tetik şartı:** Şu durumlardan biri gerçekleşirse:
+- Multi-admin / RBAC eklendi (user accounts, unique email constraint)
+- Audit compliance requirement
+- Cluster boyutu 20+ node
+- Yazma çakışmaları üretim'de gözlemlendi
+
+**Implementation:**
+- `hashicorp/raft` + `bbolt` veya `rqlite`
+- Aynı `StorageBackend` interface → upper layer aynı kalır
+- Sadece backend swap: `cluster.storage_backend: raft`
+- Migration tool: GossipLWW DB → Raft cluster
+
+**Bu sprint açılmadıkça yapılmayacak.** Tetik şartı olmadan teknik borç yaratmasın.
+
+---
+
+### Toplam Efor (B18-B26)
+
+| Sprint | Gün | Dependency |
+|---|---|---|
+| B18 — Interface + memory impl | 1-2 | — |
+| B19 — SQLite impl | 2-3 | B18 |
+| B20 — JSON migration | 2 | B19 |
+| B21 — Gossip broadcast | 2 | B19 |
+| B22 — IsolatedMode guard | 0.5 | B21 |
+| B23 — Anti-entropy | 3-4 | B21 |
+| B24 — Config → DB | 3-4 | B22, B23 |
+| B25 — Alert history | 2-3 | B23 |
+| B26 — Backup CLI | 1 | B19 |
+| **Toplam** | **~3 hafta** | |
+
+Paralelleşme: B20 (migration) ve B21 (gossip) eş zamanlı yapılabilir.
+
+**Önerilen sıra:**
+1. B17 (1 saat, hemen — UI quick fix)
+2. B18 → B19 → B20 (foundation, 1 hafta)
+3. B21 → B22 (gossip + guard, 3 gün)
+4. B23 (anti-entropy, 4 gün)
+5. B24 → B25 (kullanıcı-visible features, 1 hafta)
+6. B26 (operational, 1 gün)
 
 ---
 

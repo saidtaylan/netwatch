@@ -16,7 +16,112 @@ Bu belge, netwatch projesinin günlük güncellemelerini ve teknik detaylarını
 
 ---
 
-## 2026-05-22 — Mimari Karar: Embedded SQLite + Gossip Replikasyon
+## 2026-05-22 — Mimari Karar Revize Edildi: Interface-First Pragmatic Approach
+
+**Sebep:** Önceki "Embedded SQLite + Gossip Replication (Option A)" önerimde Gemini ikinci görüşten kritik bir eksiklik tespit edildi:
+
+> "Gossip ile SQLite/JSON sync etmek = Last Write Wins. Split-brain'de iki node aynı email'le user eklerse birleşince biri silinir. Lamport clock olayları sıralar ama çakışmayı çözmez — sadece kim 'kazanan' olur deterministically söyler. Veri kaybı potansiyeli var."
+
+**Doğrulanan eksiklik:** Lamport seq + LWW çakışmayı çözer (deterministic) ama **race condition + split-brain'de bir kayıt kaybolabilir**. Raft consensus bu sorunu tamamen ortadan kaldırır ama büyük implementasyon yükü getirir.
+
+### Yeni Karar: Interface-First Pragmatic Approach
+
+netwatch'ın yazma profilini analiz ettik:
+
+| Asset | Yazma sıklığı | Çakışma riski | Strong consistency gerekli? |
+|---|---|---|---|
+| Probe state | Saniyede 100+ | Yok | Hayır — gossip |
+| Maintenance | Haftada 1-2 | Çok düşük (UUID) | Hayır — LWW yeterli |
+| SLO targets | Günde 1-2 | Çok düşük | Hayır — LWW yeterli |
+| Apps / Channels | Aylık | Düşük | Hayır — LWW yeterli |
+| **User accounts** (gelecek) | Düşük | **YÜKSEK** (email unique) | **Evet — Raft** |
+| Audit log | Saniyede 10-100 | Yok (append-only) | Hayır — anti-entropy |
+| Alert history | Saniyede 1-10 | Yok (UUID) | Hayır — anti-entropy |
+
+netwatch'ın **çoğu verisi düşük çakışma riskli**. Tek istisna user accounts — şu an yok ama gelecekte gelirse.
+
+### Hybrid Strateji
+
+**StorageBackend interface** ile abstraction kat:
+
+```
+HTTP Handlers / Engine
+        │
+        ▼
+┌─────────────────────────────────┐
+│  StorageBackend (interface)     │  ← Bu interface kalır
+│  - Upsert / Delete / Get / List │
+│  - Watch (event stream)         │
+└─────────────────────────────────┘
+        │                  │
+        ▼                  ▼
+ GossipLWWStorage     RaftStorage
+ (V1, şimdi)          (V2.0, gelecek)
+```
+
+**V1 (şimdi, B18-B26):**
+- `GossipLWWStorage` implementation
+- SQLite backend (per-node)
+- Gossip broadcast on write
+- LWW conflict resolution (seq + timestamp + node_id)
+- IsolatedMode write guard (split-brain'de yazma reddet)
+- Anti-entropy push-pull (UDP kaybı reconcile)
+
+**V2.0 (B27, ileride):**
+- `RaftStorage` implementation
+- `hashicorp/raft` + `bbolt` (veya `rqlite`)
+- Leader election, strong consistency
+- Aynı interface → upper layer aynı kalır
+- Tetik: user accounts/RBAC eklendiğinde
+
+**Tablo schema pattern** (her domain table için 3 ekstra kolon):
+```sql
+seq         INTEGER NOT NULL,    -- Lamport timestamp
+updated_at  TEXT    NOT NULL,    -- Physical clock
+updated_by  TEXT    NOT NULL,    -- Node name (tiebreaker)
+tombstone   INTEGER NOT NULL DEFAULT 0  -- Soft delete
+```
+
+Conflict resolution: `Compare(a, b)` → `seq` desc > `updated_at` desc > `updated_by` lex asc.
+
+### IsolatedMode Write Guard (Split-Brain Koruması)
+
+Gemini'nin önerisi: Quorum kaybedildiğinde yazma reddet.
+
+```go
+func (s *GossipLWWStorage) Upsert(...) error {
+    if s.cluster.IsolatedMode() {
+        return ErrSplitBrain  // → HTTP 503
+    }
+    // ...
+}
+```
+
+Bu Raft'ın "minority partition read-only" davranışının pragmatik versiyonu. Saniyede 1000 yazma olmadığı için race condition riski kabul edilebilir.
+
+### Sprint Planı
+
+B18-B26 sprintleri sprint.md'ye eklendi:
+- B18: StorageBackend interface + memory impl
+- B19: SQLite implementation
+- B20: JSON → DB migration (geri uyumlu)
+- B21: Gossip broadcast
+- B22: IsolatedMode write guard
+- B23: Anti-entropy push-pull
+- B24: Config → DB (SLO, apps, channels, silences, targets)
+- B25: Alert history (B7 yeni form)
+- B26: Backup/restore CLI
+- B27 (V2.0): RaftStorage — tetik şartı olmadan kapatıldı
+
+**Toplam efor:** ~3 hafta. Detaylı görev kırılımı: `sprint.md`.
+
+### Reddedilen Önceki Plan
+
+Önceki "Option A — Embedded SQLite + Gossip" planı (developments.md 2026-05-22 ilk girdi) bu yeni plan ile **revize edildi**, geçersiz. Sadece tarihi referans olarak kalır.
+
+---
+
+## 2026-05-22 — Mimari Karar: Embedded SQLite + Gossip Replikasyon (REVIZE EDİLDİ ↑)
 
 Kullanıcı tarafından dile getirilen problem: "SLO, alerts, maintenance, real down status gibi knowledge'ı tek bir DB'de tutmalıyız. Şu an config.yaml dosyaları nodelarda farklı olabiliyor. Master yok, sadece eşit node'lar var — DB'yi nereye koyarız?"
 

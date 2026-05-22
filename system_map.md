@@ -83,9 +83,23 @@ backend/
     incidents.json     # SLO incident history — gitignored
     maintenance.json   # ad-hoc maintenance windows — gitignored
 
+  internal/storage/          ← B18+ ile gelecek (planlanan, henüz yok)
+    backend.go             # StorageBackend interface + Version/Record/Filter/Event types
+    memory.go              # MemoryStorage (testler için)
+    sqlite/                # SQLite backend
+      sqlite.go            # connection pool, transactions
+      migrations/          # 001_initial.sql, ...
+      generic.go           # CRUD using table+payload pattern
+    gossip/                # GossipLWWStorage
+      storage.go           # wraps SQLite + broadcasts changes
+      sync.go              # anti-entropy push-pull
+    raft/                  # V2.0 — RaftStorage (henüz yok)
+
   Makefile, Dockerfile, go.mod, go.sum, config.example.yaml
   deploy/netwatch.service, helm/, notifications/
 ```
+
+**KRİTİK KARAR güncellendi (2026-05-22):** Backend artık **üç dizin** üzerine kurulu olacak: `internal/engine/` + `internal/cluster/` + `internal/storage/`. Storage layer interface-based, eklenebilir backend pattern. CLAUDE.md "iki dizin" kuralı bu sprint'le birlikte revize ediliyor.
 
 ### Frontend Dosya Yapısı (`frontend/`) — Sprint 1-4 tamamlandı
 
@@ -201,6 +215,68 @@ frontend/
 | S11 | Temel kapanış: error.vue + NuxtLoadingIndicator + 24 composable testi | ✅ Tamamlandı |
 
 **Frontend sprint'i (S0–S11) kapandı.** Toplam: 202 backend + 99 frontend unit + 29 e2e = **330 test yeşil**.
+
+### Planlanan Mimari: StorageBackend Layer (B18-B27)
+
+**Karar:** Interface-first pragmatic approach. Tüm dinamik veri (SLO, apps, channels, silences, alerts, targets gelecek) `StorageBackend` interface'i üzerinden yönetilir. V1: GossipLWWStorage, V2.0 (ileride): RaftStorage.
+
+```
+┌──────────────────────────────────────────────────────┐
+│  HTTP Handlers / Engine                              │
+│  (e.g. PUT /slo/targets/{id}, GET /apps)             │
+└──────────────────────────────────────────────────────┘
+                       │
+                       ▼
+┌──────────────────────────────────────────────────────┐
+│  StorageBackend interface                            │
+│  - Upsert(table, id, payload, ver)                   │
+│  - Delete(table, id, ver) → soft delete (tombstone) │
+│  - Get / List / Watch                                │
+└──────────────────────────────────────────────────────┘
+        │                              │
+        ▼                              ▼
+┌────────────────────────┐    ┌─────────────────────────┐
+│  GossipLWWStorage      │    │  RaftStorage            │
+│  (V1, B18-B26)         │    │  (V2.0, B27, future)    │
+│                        │    │                         │
+│  ┌──────────────┐      │    │  ┌─────────────────┐    │
+│  │ SQLite       │      │    │  │ hashicorp/raft  │    │
+│  │ (per-node)   │      │    │  │ + bbolt         │    │
+│  └──────────────┘      │    │  └─────────────────┘    │
+│         │              │    │         │               │
+│         ▼              │    │         ▼               │
+│  ┌──────────────┐      │    │  ┌─────────────────┐    │
+│  │ Gossip       │      │    │  │ Raft consensus  │    │
+│  │ broadcast    │      │    │  │ (leader writes) │    │
+│  └──────────────┘      │    │  └─────────────────┘    │
+│         │              │    │                         │
+│         ▼              │    │  Strong consistency,    │
+│  ┌──────────────┐      │    │  no LWW conflicts       │
+│  │ Anti-entropy │      │    │                         │
+│  │ push-pull    │      │    └─────────────────────────┘
+│  └──────────────┘      │
+│                        │    Trigger: multi-user RBAC,
+│  IsolatedMode guard:   │    audit compliance,
+│  split-brain'de        │    20+ nodes, observed
+│  yazma red → 503       │    write conflicts
+└────────────────────────┘
+```
+
+**LWW Conflict Resolution Pattern:** Her domain tablosunda 4 ekstra kolon:
+```sql
+seq         INTEGER NOT NULL          -- Lamport timestamp
+updated_at  TEXT    NOT NULL          -- ISO physical clock
+updated_by  TEXT    NOT NULL          -- node name (tiebreaker)
+tombstone   INTEGER NOT NULL DEFAULT 0 -- soft delete
+```
+
+Compare order: `seq` > `updated_at` > `updated_by`.
+
+**Migration sırası:** state.json → target_states, incidents.json → slo_incidents, maintenance.json → maintenance_windows. JSON dosyaları geriye dönük okunur, sonra `.migrated` arşivlenir.
+
+**Detaylı plan:** `sprint.md` "Storage Layer Sprintleri (B18-B25)".
+
+---
 
 ### Bug Fixes Post-Sprint (2026-05-22)
 

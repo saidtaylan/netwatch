@@ -119,7 +119,14 @@ notifications/            # Alert scriptleri buraya konur (.sh veya .ps1)
 config.yaml               # Canlı config (sample — içinde açıklamalar var)
 ```
 
-**KRİTİK KARAR (backend):** Backend yalnızca **iki dizin** üzerine kurulu: `internal/engine/` + `internal/cluster/`. Hiçbir başka alt-paket oluşturulMAYACAK.
+**KRİTİK KARAR (backend) — 2026-05-22 revize:** Backend artık **üç ana dizin** üzerine kurulu olacak:
+- `internal/engine/` — probe loops, state machine, alarms, notifications
+- `internal/cluster/` — gossip (memberlist), hash ring, quorum, anti-entropy
+- `internal/storage/` — persistent storage (B18+ ile geliyor): SQLite backend + StorageBackend interface + gossip-based replication
+
+Storage layer **interface-based** olacak (`StorageBackend`). V1: `GossipLWWStorage`, V2.0 (gelecek): `RaftStorage`. Upper layer (engine, HTTP handlers) backend swap'inden etkilenmez. Detay: `system_map.md` + `sprint.md` B18-B27.
+
+**Önceki "iki dizin" kuralı bu sprint ile revize edildi.** Sebep: DB entegrasyonu doğru abstraction katmanı gerektiriyor. Sadece storage için 3. dizin açılıyor — daha fazlasına izin verilmiyor.
 
 ---
 
