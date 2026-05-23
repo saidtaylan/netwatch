@@ -341,6 +341,262 @@ func main() {
 		http.Error(w, `{"error":"use PUT or DELETE"}`, http.StatusMethodNotAllowed)
 	})
 
+	// ── Apps CRUD (B24.3) ─────────────────────────────────────────────────────
+	//   GET    /apps          → list all apps from storage-backed registry
+	//   PUT    /apps/{name}   → upsert app (auth required, cluster-replicated)
+	//   DELETE /apps/{name}   → remove app (auth required)
+	mux.HandleFunc("/apps", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet || r.Method == "" {
+			apps := e.Apps()
+			if apps == nil {
+				apps = []engine.App{}
+			}
+			_ = json.NewEncoder(w).Encode(apps)
+			return
+		}
+		http.Error(w, `{"error":"use GET /apps or PUT|DELETE /apps/{name}"}`, http.StatusMethodNotAllowed)
+	})
+	mux.HandleFunc("/apps/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		name := strings.TrimPrefix(r.URL.Path, "/apps/")
+		if name == "" {
+			http.Error(w, `{"error":"app name required"}`, http.StatusBadRequest)
+			return
+		}
+		switch r.Method {
+		case http.MethodDelete:
+			if !checkAdminAuth(e, w, r) {
+				return
+			}
+			deleted, err := e.DeleteApp(name)
+			if err != nil {
+				if errors.Is(err, storage.ErrSplitBrain) {
+					w.Header().Set("Retry-After", "10")
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": "cluster lost quorum; writes paused"})
+					return
+				}
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			if !deleted {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"deleted": name})
+		case http.MethodPut:
+			if !checkAdminAuth(e, w, r) {
+				return
+			}
+			body, err := io.ReadAll(io.LimitReader(r.Body, 8192))
+			if err != nil {
+				http.Error(w, `{"error":"read body"}`, http.StatusBadRequest)
+				return
+			}
+			var a engine.App
+			if err := json.Unmarshal(body, &a); err != nil {
+				http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+				return
+			}
+			// Path name wins over body name (REST convention).
+			a.Name = name
+			if len(a.Uses) == 0 {
+				http.Error(w, `{"error":"uses must reference at least one target"}`, http.StatusBadRequest)
+				return
+			}
+			if err := e.UpsertApp(a); err != nil {
+				if errors.Is(err, storage.ErrSplitBrain) {
+					w.Header().Set("Retry-After", "10")
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": "cluster lost quorum; writes paused"})
+					return
+				}
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(a)
+		default:
+			http.Error(w, `{"error":"use PUT or DELETE"}`, http.StatusMethodNotAllowed)
+		}
+	})
+
+	// ── Notification channels CRUD (B24.4) ────────────────────────────────────
+	//   GET    /channels              → list channel configs from storage
+	//   PUT    /channels/{name}       → upsert channel (auth, cluster-replicated)
+	//   DELETE /channels/{name}       → remove channel (auth)
+	//
+	// Note: Upsert validates the config by instantiating the Alerter before
+	// persisting — invalid configs return 400 and never enter the DB.
+	mux.HandleFunc("/channels", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet || r.Method == "" {
+			_ = json.NewEncoder(w).Encode(e.NotificationChannels())
+			return
+		}
+		http.Error(w, `{"error":"use GET /channels or PUT|DELETE /channels/{name}"}`, http.StatusMethodNotAllowed)
+	})
+	mux.HandleFunc("/channels/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		name := strings.TrimPrefix(r.URL.Path, "/channels/")
+		if name == "" {
+			http.Error(w, `{"error":"channel name required"}`, http.StatusBadRequest)
+			return
+		}
+		switch r.Method {
+		case http.MethodDelete:
+			if !checkAdminAuth(e, w, r) {
+				return
+			}
+			deleted, err := e.DeleteNotificationChannel(name)
+			if err != nil {
+				if errors.Is(err, storage.ErrSplitBrain) {
+					w.Header().Set("Retry-After", "10")
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": "cluster lost quorum; writes paused"})
+					return
+				}
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			if !deleted {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"deleted": name})
+		case http.MethodPut:
+			if !checkAdminAuth(e, w, r) {
+				return
+			}
+			body, err := io.ReadAll(io.LimitReader(r.Body, 8192))
+			if err != nil {
+				http.Error(w, `{"error":"read body"}`, http.StatusBadRequest)
+				return
+			}
+			var c engine.AlertChannelConfig
+			if err := json.Unmarshal(body, &c); err != nil {
+				http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+				return
+			}
+			if c.Type == "" {
+				http.Error(w, `{"error":"type is required (script|mail|webhook)"}`, http.StatusBadRequest)
+				return
+			}
+			if err := e.UpsertNotificationChannel(name, c); err != nil {
+				if errors.Is(err, storage.ErrSplitBrain) {
+					w.Header().Set("Retry-After", "10")
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": "cluster lost quorum; writes paused"})
+					return
+				}
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"name": name, "config": c})
+		default:
+			http.Error(w, `{"error":"use PUT or DELETE"}`, http.StatusMethodNotAllowed)
+		}
+	})
+
+	// ── Targets CRUD (B24.6) ──────────────────────────────────────────────────
+	//   GET    /targets         → list all targets (sorted by key)
+	//   PUT    /targets/{key}   → upsert target (auth, cluster-replicated;
+	//                              triggers full reconciliation: validation,
+	//                              dependency graph, prober recompute, probe
+	//                              goroutine restart)
+	//   DELETE /targets/{key}   → remove target (auth)
+	mux.HandleFunc("/targets", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet || r.Method == "" {
+			targets := e.Targets()
+			if targets == nil {
+				targets = []engine.Target{}
+			}
+			_ = json.NewEncoder(w).Encode(targets)
+			return
+		}
+		http.Error(w, `{"error":"use GET /targets or PUT|DELETE /targets/{key}"}`, http.StatusMethodNotAllowed)
+	})
+	mux.HandleFunc("/targets/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		key := strings.TrimPrefix(r.URL.Path, "/targets/")
+		if key == "" {
+			http.Error(w, `{"error":"target key (ID or Name) required"}`, http.StatusBadRequest)
+			return
+		}
+		switch r.Method {
+		case http.MethodDelete:
+			if !checkAdminAuth(e, w, r) {
+				return
+			}
+			deleted, err := e.DeleteTarget(key)
+			if err != nil {
+				if errors.Is(err, storage.ErrSplitBrain) {
+					w.Header().Set("Retry-After", "10")
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": "cluster lost quorum; writes paused"})
+					return
+				}
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			if !deleted {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"deleted": key})
+		case http.MethodPut:
+			if !checkAdminAuth(e, w, r) {
+				return
+			}
+			body, err := io.ReadAll(io.LimitReader(r.Body, 16384))
+			if err != nil {
+				http.Error(w, `{"error":"read body"}`, http.StatusBadRequest)
+				return
+			}
+			var t engine.Target
+			if err := json.Unmarshal(body, &t); err != nil {
+				http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+				return
+			}
+			// Default the canonical key to the URL parameter when caller
+			// omits both ID and Name in the body.
+			if t.ID == "" && t.Name == "" {
+				t.ID = key
+			}
+			if t.Type == "" {
+				http.Error(w, `{"error":"type is required (tcp|http|ping|dns|sql)"}`, http.StatusBadRequest)
+				return
+			}
+			if t.Target == "" {
+				http.Error(w, `{"error":"target (host:port or url) is required"}`, http.StatusBadRequest)
+				return
+			}
+			if err := e.UpsertTarget(t); err != nil {
+				if errors.Is(err, storage.ErrSplitBrain) {
+					w.Header().Set("Retry-After", "10")
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": "cluster lost quorum; writes paused"})
+					return
+				}
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(t)
+		default:
+			http.Error(w, `{"error":"use PUT or DELETE"}`, http.StatusMethodNotAllowed)
+		}
+	})
+
 	// /geo/latency/{targetID} returns the P1.6 per-node latency view for a
 	// specific target, including region labels and the anomaly flag.
 	mux.HandleFunc("/geo/latency/", func(w http.ResponseWriter, r *http.Request) {
