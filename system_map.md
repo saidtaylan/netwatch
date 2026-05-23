@@ -66,40 +66,51 @@ network cluster/
 ```
 backend/
   internal/engine/
-    engine.go          # Config (recovery_probes eklendi), Engine struct (maintMgr, pendingRecovery)
-    loop.go            # startProbeLoop (stagger offset), processPending (2-phase), runCheck (soft-up)
-    maintenance.go     # MaintenanceWindow, maintenanceManager (RAM + disk), GenerateWindowID  ← F3
-    configpush.go      # SharedConfig (recovery_probes eklendi)
-    join.go            # GenerateKeyringKey, LocalClusterAddr, ClusterPrimaryKey
-    ...diğer mevcut dosyalar...
+    engine.go              # Config, Engine struct (storage, maintMgr, sloMgr, appsMgr, channelsMgr, silencesMgr, targetsMgr)
+    storage.go             # initStorage / closeStorage; SQLite open + JSON migration + gossip wrapper
+    loop.go                # startProbeLoop (stagger offset), processPending (2-phase), runCheck (soft-up)
+    maintenance.go         # MaintenanceWindow, maintenanceManager (storage-backed, B24)
+    apps_manager.go        # appsManager (storage-backed apps registry, B24.3)
+    channels_manager.go    # channelsManager (storage-backed channels, B24.4)
+    silences_manager.go    # silencesManager (NEW B24.5 — matcher-based mutes)
+    targets_manager.go     # targetsManager (storage-backed targets + reconciler, B24.6)
+    slo.go                 # sloManager (storage-backed targets + local-only incidents, B24.2)
+    configpush.go          # SharedConfig (recovery_probes eklendi)
+    join.go                # GenerateKeyringKey, LocalClusterAddr, ClusterPrimaryKey
+    ...diğer mevcut dosyalar (notify, http, tcp, ping, dns, sql, mail, webhook, watchdog, topology, fleet, scope, app, protocol)
 
   internal/cluster/
-    cluster.go         # maintenanceHandler field, NotifyMsg maintenance dispatch
-    maintenance.go     # MaintenanceBroadcast, MaintenanceHandler interface, Broadcast*  ← F3
-    ...diğer mevcut dosyalar...
+    cluster.go             # Manager (storage gossip integration, NotifyMsg dispatch)
+    storage_sync.go        # msgTypeStorageChange + BroadcastStorageChange (gossip.ChangeBroadcaster impl)
+    maintenance.go         # Legacy MaintenanceBroadcast (peer compat, B24 öncesi)
+    ...diğer mevcut dosyalar (probers, views, configsync, geolat, …)
 
-  <state_file_dir>/
-    state.json         # target up/down state (v2) — gitignored
-    incidents.json     # SLO incident history — gitignored
-    maintenance.json   # ad-hoc maintenance windows — gitignored
+  internal/storage/          ← B18+ Tamamlandı
+    backend.go             # StorageBackend interface + Version/Record/Filter/Event + KnownTables
+    memory.go              # MemoryStorage (test backend)
+    version.go             # Version.Compare (LWW: Seq > UpdatedAt > UpdatedBy)
+    record.go              # Record, Filter, Event types
+    sqlite/                # SQLite backend (modernc.org/sqlite — pure Go, CGO-free)
+      storage.go           # Open/Upsert/Delete/Get/List/Watch/Close
+      migrations.go        # embed.FS + schema_migrations tracking
+      migrations/001_initial.sql  # 11 generic-schema tables
+    migrate/               # JSON → DB one-time migration
+      migrate.go           # state.json/incidents.json/maintenance.json → DB
+    gossip/                # GossipLWWStorage (cluster integration)
+      storage.go           # wraps backend + ChangeBroadcaster + IsolatedModeChecker
+                           # Inner() accessor → local-only escape hatch (slo_incidents)
 
-  internal/storage/          ← B18+ ile gelecek (planlanan, henüz yok)
-    backend.go             # StorageBackend interface + Version/Record/Filter/Event types
-    memory.go              # MemoryStorage (testler için)
-    sqlite/                # SQLite backend
-      sqlite.go            # connection pool, transactions
-      migrations/          # 001_initial.sql, ...
-      generic.go           # CRUD using table+payload pattern
-    gossip/                # GossipLWWStorage
-      storage.go           # wraps SQLite + broadcasts changes
-      sync.go              # anti-entropy push-pull
-    raft/                  # V2.0 — RaftStorage (henüz yok)
+  <data_dir>/              # = filepath.Dir(state_file)
+    netwatch.db            # SQLite (WAL) — all dynamic data (B24)
+    state.json.migrated    # archived after one-time migration
+    incidents.json.migrated
+    maintenance.json.migrated
 
   Makefile, Dockerfile, go.mod, go.sum, config.example.yaml
   deploy/netwatch.service, helm/, notifications/
 ```
 
-**KRİTİK KARAR güncellendi (2026-05-22):** Backend artık **üç dizin** üzerine kurulu olacak: `internal/engine/` + `internal/cluster/` + `internal/storage/`. Storage layer interface-based, eklenebilir backend pattern. CLAUDE.md "iki dizin" kuralı bu sprint'le birlikte revize ediliyor.
+**KRİTİK KARAR (2026-05-22 → 2026-05-23):** Backend **üç dizin** üzerine kurulu: `internal/engine/` + `internal/cluster/` + `internal/storage/`. Storage layer interface-based, eklenebilir backend pattern; B18-B24 ile fully populated. CLAUDE.md "iki dizin" kuralı revize edildi.
 
 ### Frontend Dosya Yapısı (`frontend/`) — Sprint 1-4 tamamlandı
 
@@ -340,8 +351,19 @@ netwatch service install|remove   (Windows only)  register/unregister the Window
 | `/cluster/config` | PUT | Shared config fields dağıt (JSON/YAML body) → self apply + gossip TCP ile tüm peer'lara. `admin.token` ayarlıysa auth zorunlu. |
 | `/cluster/config/sync` | POST | Bu node'un shared config'ini peer'lara dağıt. Body yok. `admin.token` ayarlıysa auth zorunlu. |
 | `/geo/latency/{targetID}` *(P1.6)* | GET | Per-node latency view for a target: region labels, last probe latency, anomaly flag (any node >3× min) |
+| `/cluster/maintenance` | GET | Aktif maintenance window listesi (no auth) |
+| `/cluster/maintenance` | PUT | Yeni maintenance window (body: target_ids+duration+reason); gossip-replicated; auth gerekir |
+| `/cluster/maintenance/{id}` | DELETE | Maintenance window iptal; auth gerekir |
+| `/cluster/silences` *(B24.5)* | GET | Aktif silence kuralları listesi (no auth) |
+| `/cluster/silences` *(B24.5)* | PUT | Yeni silence (body: matchers + duration + comment); matcher-based suppression; auth gerekir |
+| `/cluster/silences/{id}` *(B24.5)* | DELETE | Silence iptal; auth gerekir |
+| `/slo/targets` *(B12+B24.2)* | GET/PUT/DELETE | SLO target CRUD, gossip-replicated via storage |
 
 **Default port:** `10240` (config'den override edilebilir)
+
+**Write endpoints + ErrSplitBrain:** Tüm cluster-replicated yazma endpoint'leri
+quorum kaybında `503 Service Unavailable` + `Retry-After: 10` header döner
+(B22 IsolatedMode write guard).
 
 ---
 
@@ -408,9 +430,75 @@ netwatch service install|remove   (Windows only)  register/unregister the Window
 
 ## Data Layer
 
-### state.json (v2)
+### SQLite Storage (B18-B24, 2026-05-22 → 2026-05-23)
 
-Disk üzerinde kalıcı probe durumu. Restart sonrası anti-entropy ve rolling restart alarm storm önleme için kritik.
+**Tüm dinamik config artık SQLite'da.** `<data_dir>/netwatch.db` (WAL mode,
+pure-Go `modernc.org/sqlite`). Cluster-replicated via gossip; LWW conflict
+resolution.
+
+```
+backend/internal/storage/
+  backend.go           # StorageBackend interface + table consts + errors
+  memory.go            # in-memory ref impl (test backend)
+  record.go            # Record, Filter, Event types
+  version.go           # Version{Seq,UpdatedAt,UpdatedBy}.Compare()
+  sqlite/
+    storage.go         # SQLite impl (Open/Upsert/Delete/Get/List/Watch/Close)
+    migrations.go      # embed.FS + schema_migrations tracking
+    migrations/001_initial.sql  # 11 tables, generic schema
+  migrate/
+    migrate.go         # JSON → DB one-time migration (state.json/incidents.json/maintenance.json)
+  gossip/
+    storage.go         # Wraps any backend + ChangeBroadcaster + IsolatedModeChecker
+                       # Exposes Inner() for local-only writes (slo_incidents)
+```
+
+**Tablo şeması (generic):**
+```sql
+CREATE TABLE <entity> (
+  id          TEXT PRIMARY KEY,
+  payload     BLOB    NOT NULL,        -- JSON-encoded domain object
+  seq         INTEGER NOT NULL,        -- Lamport timestamp
+  updated_at  TEXT    NOT NULL,        -- ISO-8601
+  updated_by  TEXT    NOT NULL,        -- node name (LWW tiebreaker)
+  tombstone   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX <entity>_seq ON <entity>(seq);
+```
+
+**11 tablo (`storage.KnownTables`):**
+- Cluster-replicated: `slo_targets`, `apps`, `notification_channels`,
+  `silences`, `maintenance_windows`, `targets`
+- Local-only: `slo_incidents`, `target_states`, `audit_log`
+- Reserve (B25+): `alerts`, `alert_events`
+
+**Gossip storage wrap (`gossip.Storage`):**
+- Upsert/Delete → inner backend → ChangeBroadcaster (UDP best-effort)
+- IsolatedMode → write reddedilir (`ErrSplitBrain` → HTTP 503 + Retry-After)
+- ApplyRemoteChange → peer broadcast'ı inner'a yazar, re-broadcast YOK
+- LWW: `storage.Version.Compare` (Seq > UpdatedAt > UpdatedBy lex)
+- `Inner()` accessor → local-only escape hatch (kullanım: `slo_incidents`)
+
+**Engine integration (B24):**
+
+Engine her domain için bir `xxxManager` tutar (storage-backed):
+
+| Manager | Tablo | Replication | First-boot seed |
+|---|---|---|---|
+| `maintMgr` | `maintenance_windows` | gossip | yok |
+| `silencesMgr` (yeni B24.5) | `silences` | gossip | yok |
+| `sloMgr` | `slo_targets` + `slo_incidents` (local) | mixed | `slo.targets:` |
+| `appsMgr` | `apps` | gossip | `apps:` |
+| `channelsMgr` | `notification_channels` | gossip | `notifications:` |
+| `targetsMgr` | `targets` | gossip | `targets:` |
+
+Her manager aynı pattern: `loadFromStorage` (init) → Watch goroutine
+(peer broadcasts) → publish callback engine'in canlı state'ini günceller.
+Shutdown'da `Close()` çağrısı Watch'u durdurur (cluster leave öncesi).
+
+### state.json (v2) — Legacy + Migrated to `target_states` table
+
+Disk üzerinde kalıcı probe durumu. Restart sonrası anti-entropy ve rolling restart alarm storm önleme için kritik. B24.1 ile `target_states` tablosuna migrate edildi (`state.json.migrated` olarak arşivlendi); engine hâlâ state.json formatını anlıyor (geriye dönük yedek).
 
 ```json
 {
@@ -433,9 +521,29 @@ Disk üzerinde kalıcı probe durumu. Restart sonrası anti-entropy ve rolling r
 - **v1 format** (`map[string]bool`) → otomatik v2'ye migrate edilir
 - Atomik yazma: önce `.tmp`, sonra `os.Rename`
 
-### Config (config.yaml)
+### Config (config.yaml) — Bootstrap + First-Boot Seed Only (B24)
 
 `sigs.k8s.io/yaml` ile parse edilir. `${VAR}` syntax ile `credentials_file`'dan env injection desteklenir. Hot-reload: `reload_interval_sec` saniyede bir SIGHUP olmadan yeniden okunur.
+
+**B24 sonrası rolü:**
+
+Bootstrap zorunlu alanlar (DB açılmadan önce engine'in ihtiyaç duyduğu):
+`port`, `node_alias`, `state_file`, `log_path`, `timeout`, `max_retries`,
+`retry_interval_sec`, `ticker_interval_sec`, `probe_interval_sec`,
+`reload_interval_sec`, `recovery_probes`, `watchdog_threshold_sec`,
+`credentials_file`, `admin.token`, `cluster.*` (node_name, bind_addr, peers,
+keyring, zone, replication_factor), `slo.enabled`/`slo.retention_days`/
+`slo.slo_notify`, `default_notify:`.
+
+First-boot seed-only (DB boş ise migrasyon, sonraki edit'ler ignore):
+- `notifications:` → `notification_channels` tablosu
+- `apps:` → `apps` tablosu
+- `slo.targets:` → `slo_targets` tablosu
+- `targets:` → `targets` tablosu
+
+Hot-reload de bu seed-only field'lardaki değişiklikleri yoksayar — DB
+authoritative. Operatör CRUD'u storage manager API'leri ya da (gelecekte)
+HTTP CRUD endpoint'leri üzerinden yapar.
 
 ### State Machine
 

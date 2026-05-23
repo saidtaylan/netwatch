@@ -16,6 +16,178 @@ Bu belge, netwatch projesinin günlük güncellemelerini ve teknik detaylarını
 
 ---
 
+## 2026-05-23 — B24 Tamamlandı: Tüm Dinamik Config Storage'a Taşındı (B24.2-B24.6)
+
+**Özet:** Maintenance windows + B24.1 plumbing'in üzerine 5 ek migration sprint tamamlandı.
+Artık SLO, Apps, Notification Channels, Targets ve yeni eklenen Silences tamamen SQLite +
+gossip ile cluster-replicated. config.yaml artık sadece bootstrap + seed kaynağı.
+
+### B24.2 — SLO Targets + Incidents → Storage [backend]
+
+- `slo_targets` tablosu cluster-replicated (gossip broadcast)
+- `slo_incidents` tablosu local-only (`gossip.Storage.Inner()` üzerinden bypass —
+  her node kendi gözlemini tutar; cluster-wide aggregation downtime'ı 3× şişirirdi)
+- `internal/storage/gossip/storage.go` → `Inner()` accessor eklendi (local-only escape hatch)
+- `internal/engine/slo.go` → `newSLOManager(ctx, gs, nodeName, seedTargets) (*sloManager, error)`
+  imzasına geçti; `loadIncidents()` + `loadTargets()` + `watchTargetsLoop()` + LWW-aware
+  `persistIncidentLocked()`. RecordStart/RecordEnd/PruneOldIncidents storage'a yazıyor.
+- `internal/engine/engine.go` → SLO Targets/UpsertSLOTarget/DeleteSLOTarget artık
+  storage-backed; in-memory fallback sadece pre-Init için.
+- HTTP handlers (`PUT/DELETE /slo/targets/{id}`) `storage.ErrSplitBrain` → 503 + Retry-After.
+- First-boot seed: storage boşken `config.yaml`'daki `slo.targets:` listesi DB'ye yazılır.
+- Tests: 21 SLO + maintenance birlikte; full suite 293 yeşil (`-race`).
+- Commit: `B24.2 — SLO targets + incidents fully migrated to storage`
+
+### B24.3 — Apps Registry → Storage [backend]
+
+- Yeni dosya: `internal/engine/apps_manager.go` — maintenance pattern'ini birebir takip eder
+  (loadFromStorage, Watch loop, Upsert/Delete, publishIndex)
+- `appsManager.publishIndex()` `AppTargetIndex`'i yeniden inşa eder ve engine'e
+  `e.setAppIndex()` callback'i üzerinden iletir. Hot-path lookup (notify.go, fleet.go)
+  hiç değişmedi.
+- Dangling references (yeni target listesi ile uyumsuz `app.uses` girişleri) **runtime'da
+  sessizce drop edilir**; config-time `validateApps` hâlâ katı.
+- Hot reload (LoadConfig): target seti değişirse `appsMgr.RebuildIndex()` çağrılır.
+- First-boot seed: `cfg.Apps` DB'ye yazılır; sonraki config.yaml düzenlemeleri ignore.
+- `Engine.Apps/UpsertApp/DeleteApp` public API.
+- Shutdown: `appsMgr.Close()` cluster leave'den ÖNCE çağrılır (Watch race önleme).
+- Tests: 6 apps + 299 full suite yeşil.
+- Commit: `B24.3 — Apps registry fully migrated to storage`
+
+### B24.4 — Notification Channels → Storage [backend]
+
+- Yeni dosya: `internal/engine/channels_manager.go`
+- DB'de `AlertChannelConfig` (type + parameters) persist edilir; **runtime'da Alerter
+  instance yeniden inşa edilir** her değişiklikte (`newAlertChannel(name, cfg, runner)`).
+- Platform-bağımlı `AlertRunner` (ShellRunner/PowerShellRunner) DB'de değil engine'de
+  kalır.
+- `channelsManager.Upsert()` storage'a yazmadan ÖNCE config'i `newAlertChannel` ile
+  validate eder — kötü configler peer'lara propagate olmaz.
+- Hot reload: artık target.notify referansları **canlı storage-backed channel set**'e
+  karşı validate edilir (config.yaml'daki notifications: section değil).
+- First-boot seed: `cfg.Notifications` DB'ye yazılır.
+- `Engine.NotificationChannels / UpsertNotificationChannel / DeleteNotificationChannel`.
+- Tests: 6 channels + 305 full suite yeşil.
+- Commit: `B24.4 — Notification channels migrated to storage`
+
+### B24.5 — Silences (Yeni Özellik, Matcher-Based Alert Mute) [backend]
+
+- Yeni özellik — daha önce planlama dışıydı. Maintenance window'ların matcher-tabanlı
+  kardeşi. Aktif incident sırasında "biliyoruz X bozuk, bizi rahatsız etmeyin" için.
+- Yeni dosya: `internal/engine/silences_manager.go`
+- `Silence` struct: `Matchers []SilenceMatcher` (Field=id/name/type, Value, IsRegex),
+  StartedAt, ExpiresAt, Comment, CreatedBy. Matcher'lar **AND** semantiği (tek
+  Silence içinde); çoklu Silence için OR.
+- `compileSilence()` Set time'da validate eder (bilinen field, regex compile,
+  non-empty value) — kötü kurallar DB'ye girmez.
+- `shouldAlert` imzası değişti: `targetID string` → `Target` (hem maintenance hem
+  silences hot-path'i için)
+- HTTP API:
+  - `GET    /cluster/silences` — list (no auth)
+  - `PUT    /cluster/silences` — create (auth; body: matchers + duration + comment)
+  - `DELETE /cluster/silences/{id}` — cancel (auth)
+  - `ErrSplitBrain` → 503 + Retry-After
+- `runSilencesPruner` goroutine (30s) expired silences'ı tombstone'lar.
+- Tests: 17 silences + 322 full suite yeşil.
+- Commit: `B24.5 — Silences (matcher-based alert mutes)`
+
+### B24.6 — Targets Registry → Storage [backend]
+
+- B24 sprint'inin en riskli migration'ı. Targets prober assignment + hash ring +
+  probe goroutine lifecycle + dependency graph + app index'i sürüyor.
+- Yeni dosya: `internal/engine/targets_manager.go`
+- `targetsManager.Targets()` deterministic sıralı (`target.key()` lex sort) döner —
+  cluster prober assignment determinizmi için kritik.
+- **Yeni helper:** `Engine.applyTargetsReconciliation(newTargets) error` — hot-reload
+  ile aynı reconciliation pipeline'ı (validate → channel notify refs → dependency
+  graph → state purge → localProbeIDs → app index rebuild → cluster prober recompute
+  → probe goroutine sync). Hem CRUD hem peer Watch event'leri aynı pipeline'ı kullanır.
+- Standalone mode: yeni `syncStandaloneProbeLoops` probe goroutine'leri başlatır/durdurur
+  (cluster mode'da bu zaten `ProberAssignmentListener` üzerinden hallediliyor).
+- First-boot seed: `cfg.Targets` DB'ye yazılır; storage zaten varsa reconcile bir kez
+  çağrılır (içeriği `sameTargetSet` ile karşılaştırıp aynıysa skip).
+- `Engine.Targets / UpsertTarget / DeleteTarget` public API.
+- Shutdown'da `targetsMgr.Close()` cluster leave'den önce çağrılır.
+- Tests: 11 targets manager + 333 full suite yeşil. Integration: 31/32 (KeyRotation
+  cumulative-timeout flake'i pre-existing, isolated run'da geçiyor).
+- Commit: `B24.6 — Targets registry migrated to storage`
+
+### Workflow Düzeltmeleri (B24 sürecinde)
+
+- [devops] **CI: Node 20 → 22** — pnpm 11.2 Node >=22.13 gerektiriyor,
+  `actions/setup-node@v4` `ERR_UNKNOWN_BUILTIN_MODULE: node:sqlite` ile crash
+  oluyordu. `.github/workflows/ci.yml`'de NODE_VERSION bumped.
+- [devops] **pnpm 11 build allowlist** — `pnpm-workspace.yaml`'de `allowBuilds:
+  '@parcel/watcher': true, esbuild: true` (pnpm 11 default'u ignore + exit 1).
+  Eski `approve-builds=true` (.npmrc) recognised değildi.
+- [frontend] **e2e fleet mock şekli güncellendi** — `tests/e2e/fixtures/api-mocks.ts`'deki
+  FLEET mock eski şekli kullanıyordu (`target_counts` + `targets` as object). Şimdi
+  `summary` + `targets[]` array'i (types/api.ts'in dediği gibi). "shows down targets
+  from fleet" e2e test'i yeniden geçiyor.
+
+### Configde Hangi Field'lar Kaldı
+
+Aşağıdakiler hâlâ config.yaml-driven (bootstrap/runtime tuning):
+
+**Bootstrap zorunlu** (engine DB açılmadan önce ihtiyaç duyar):
+- `port`, `node_alias`, `state_file`, `log_path`
+- `timeout`, `max_retries`, `retry_interval_sec`, `ticker_interval_sec`,
+  `probe_interval_sec`, `reload_interval_sec`, `recovery_probes`, `watchdog_threshold_sec`
+- `credentials_file`
+- `admin.token` (chicken-and-egg — DB'de tutmak için önce auth lazım)
+- `cluster.*` (node_name, bind_addr, peers, keyring, zone, replication_factor)
+- `slo.enabled`, `slo.retention_days`, `slo.slo_notify` (top-level flag'ler;
+  `slo.targets:` storage-backed)
+- `default_notify:` (henüz DB'ye taşınmadı; B-future)
+
+**First-boot seed-only** (DB boşsa migrasyon, sonra ignored):
+- `notifications:` → `notification_channels` tablosu
+- `apps:` → `apps` tablosu
+- `slo.targets:` → `slo_targets` tablosu
+- `targets:` → `targets` tablosu
+
+### Storage Tablo Özeti (B24 sonu)
+
+| Tablo | Replikasyon | Seed | CRUD API |
+|---|---|---|---|
+| `maintenance_windows` | Cluster (gossip) | yok | `/cluster/maintenance` |
+| `silences` | Cluster (gossip) | yok | `/cluster/silences` |
+| `slo_targets` | Cluster (gossip) | `slo.targets:` | `/slo/targets` |
+| `slo_incidents` | Local-only (Inner()) | (runtime) | (yok — auto by engine) |
+| `apps` | Cluster (gossip) | `apps:` | yok (engine API var, HTTP yok) |
+| `notification_channels` | Cluster (gossip) | `notifications:` | yok (engine API var) |
+| `targets` | Cluster (gossip) | `targets:` | yok (engine API var) |
+| `target_states` | Local-only | `state.json` migrate | yok |
+| `alerts`, `alert_events`, `audit_log` | Reserve (B25+) | — | — |
+
+### Smoke Doğrulama (3-node demo)
+
+`/tmp/netwatch-smoke/config.yaml` (apps + channels + slo + 1 target) ile binary
+çalıştırıldı:
+- agent başladı, seed mesajları `apps: seeding from config.yaml count=1`,
+  `channels: seeding from config.yaml count=1`, `slo: seeding targets table from
+  config.yaml count=1` ile logged
+- `PUT /cluster/silences` → 200, DB'de silence yarat
+- `PUT /cluster/maintenance` → 200, DB'de maintenance yarat
+- `GET /slo` → 200, sloMgr.Targets() üzerinden döner
+- `sqlite3 netwatch.db` ile her tabloda count >= 1 doğrulandı
+
+### Rollback Yolu
+
+Her commit bağımsız ve revertable. Sırayla:
+- `feat(backend): maintenance windows fully migrated to SQLite storage`
+- `feat(backend): B24.1 — engine storage plumbing (no behavior change)`
+- `feat(backend): B24.2 — SLO targets + incidents fully migrated to storage`
+- `feat(backend): B24.3 — Apps registry fully migrated to storage`
+- `feat(backend): B24.4 — Notification channels migrated to storage`
+- `feat(backend): B24.5 — Silences (matcher-based alert mutes)`
+- `feat(backend): B24.6 — Targets registry migrated to storage`
+
+`git revert <sha>` ile herhangi bir domain in-memory davranışa geri döner. Schema
+additive — eski binary state.json okur, SQLite dosyasını ignore eder.
+
+---
+
 ## 2026-05-22 — Mimari Karar Revize Edildi: Interface-First Pragmatic Approach
 
 **Sebep:** Önceki "Embedded SQLite + Gossip Replication (Option A)" önerimde Gemini ikinci görüşten kritik bir eksiklik tespit edildi:

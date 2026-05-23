@@ -730,7 +730,90 @@ Safety: `checkpoint-B22-complete` tag + `backup/pre-B23-storage-integration` bra
 
 ---
 
-### 🔄 B24 — Engine ↔ Storage Wiring + Config Migration
+### ✅ B24 — Engine ↔ Storage Wiring + Config Migration — Tamamlandı 2026-05-23
+
+**Tüm dinamik config artık storage-backed:** Maintenance, SLO targets + incidents,
+Apps, Notification channels, Silences (yeni), Targets. config.yaml artık sadece
+bootstrap + first-boot seed.
+
+**Tamamlanan sub-sprintler:**
+- ✅ B24.1 (2026-05-22) — Engine storage plumbing (no behavior change)
+- ✅ Maintenance (2026-05-22) — `maintenance_windows` tablosu, cluster-replicated
+- ✅ B24.2 (2026-05-23) — SLO Targets cluster-replicated + Incidents local-only
+- ✅ B24.3 (2026-05-23) — Apps registry
+- ✅ B24.4 (2026-05-23) — Notification channels
+- ✅ B24.5 (2026-05-23) — Silences (yeni özellik, matcher-based)
+- ✅ B24.6 (2026-05-23) — Targets registry (en riskli — prober assignment paths)
+
+**Final test sonuçları:**
+- Unit tests: 333 (+74 yeni B24.2-B24.6 testleri) — `-race` ile yeşil
+- Integration tests: 31/32 (KeyRotation cumulative-timeout pre-existing, isolated PASS)
+- Backend: 6 paket green; smoke verified (3-node demo, all CRUD + restart persistence)
+
+**Yeni dosyalar (`backend/internal/engine/`):**
+- `apps_manager.go` (+ test)
+- `channels_manager.go` (+ test)
+- `silences_manager.go` (+ test)
+- `targets_manager.go` (+ test)
+- `slo.go` — newSLOManager imzası değişti, storage-backed
+
+**Storage tablo özet (B24 sonu):**
+
+| Tablo | Replikasyon | Seed kaynağı | CRUD API |
+|---|---|---|---|
+| `maintenance_windows` | Cluster | yok | `/cluster/maintenance` |
+| `silences` | Cluster | yok | `/cluster/silences` (yeni) |
+| `slo_targets` | Cluster | `slo.targets:` | `/slo/targets` |
+| `slo_incidents` | **Local-only (Inner())** | runtime | (engine internal) |
+| `apps` | Cluster | `apps:` | (engine API, HTTP TBD) |
+| `notification_channels` | Cluster | `notifications:` | (engine API) |
+| `targets` | Cluster | `targets:` | (engine API) |
+| `target_states` | Local-only | `state.json` migrate | yok |
+| `alerts`, `alert_events`, `audit_log` | (Reserve B25+) | — | — |
+
+**Mimari pattern (tüm sub-sprintler aynı):**
+1. `xxxManager` struct: `storage *gossip.Storage`, in-memory cache map
+2. `loadFromStorage(ctx)` startup'ta cache'i doldurur
+3. `Watch(ctx, table)` goroutine peer broadcast'larını cache'e uygular
+4. `Upsert(x)` → storage.Upsert (gossip broadcast) → cache update → publishCallback
+5. `Delete(id)` → storage.Delete (tombstone) → cache delete → publishCallback
+6. `Close()` Shutdown'da Watch'u durdurur (cluster leave öncesi)
+
+**Targets özel (B24.6):**
+- Yeni helper: `Engine.applyTargetsReconciliation(newTargets)` — hot-reload ile
+  aynı pipeline (validate → channel refs → dependency graph → state purge →
+  localProbeIDs → app index → prober recompute → probe goroutine sync)
+- Standalone mode için yeni: `syncStandaloneProbeLoops()` — cluster yokken
+  probe goroutine lifecycle'ını direkt yönetir
+- `sameTargetSet()` redundant initial reconcile'ı önler
+
+**Configde kalan field'lar:**
+
+Bootstrap zorunlu (DB açılmadan önce): `port`, `node_alias`, `state_file`,
+`log_path`, probe tuning (timeout/retries/intervals), `credentials_file`,
+`admin.token`, `cluster.*` (node_name/peers/keyring/zone), `slo.enabled`/
+`slo.retention_days`/`slo.slo_notify`, `default_notify:`.
+
+First-boot seed-only (DB doluyken ignore): `notifications:`, `apps:`,
+`slo.targets:`, `targets:`.
+
+**Workflow düzeltmeleri (B24 sürecinde):**
+- CI Node 20 → 22 (pnpm 11.2 requirement)
+- `pnpm-workspace.yaml` `allowBuilds` (esbuild, @parcel/watcher)
+- Frontend e2e fleet mock şekli güncellendi (`summary` + `targets[]` array)
+
+**Commit serisi (revertable):**
+- `feat(backend): maintenance windows fully migrated to SQLite storage`
+- `feat(backend): B24.1 — engine storage plumbing (no behavior change)`
+- `feat(backend): B24.2 — SLO targets + incidents fully migrated to storage`
+- `feat(backend): B24.3 — Apps registry fully migrated to storage`
+- `feat(backend): B24.4 — Notification channels migrated to storage`
+- `feat(backend): B24.5 — Silences (matcher-based alert mutes)`
+- `feat(backend): B24.6 — Targets registry migrated to storage`
+
+---
+
+### B24 Eski Plan Notları (referans)
 
 **Part 1 ✅ Tamamlandı (2026-05-22): Engine storage plumbing**
 
