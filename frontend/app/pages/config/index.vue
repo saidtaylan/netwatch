@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import type { PeerConfigInfo } from '~/types/api'
 import { fmtRelative } from '~/utils/format'
 
 const { configSync } = useCluster()
@@ -8,13 +9,25 @@ const syncing = ref(false)
 
 const snap = computed(() => configSync.data.value)
 
-// Derived helpers matching actual backend schema:
-// { self: ConfigNodeInfo, peers: ConfigNodeInfo[], drift_count }
+// drift_count = peers with a KNOWN different hash. Peers without a hash
+// yet (just restarted, haven't broadcast) are excluded by the backend
+// from this count — they count as "Unknown", not "Different".
 const inSync   = computed(() => (snap.value?.drift_count ?? 0) === 0)
 const selfHash = computed(() => snap.value?.self?.config_hash ?? '')
 const selfSize = computed(() => snap.value?.self?.config_size ?? 0)
 const selfLoaded = computed(() => snap.value?.self?.loaded_at ?? '')
 const hashValid  = computed(() => selfHash.value && selfHash.value.length > 4)  // non-empty, non-zero
+
+const unknownCount = computed(() =>
+  (snap.value?.peers ?? []).filter(p => !p.config_hash).length
+)
+
+// Per-peer status. Backend exposes `in_sync` (true when same OR not yet
+// known). Combine with the hash presence to render a proper tri-state.
+function peerStatus(p: PeerConfigInfo): 'same' | 'unknown' | 'different' {
+  if (!p.config_hash) return 'unknown'
+  return p.in_sync ? 'same' : 'different'
+}
 
 async function syncNow() {
   syncing.value = true
@@ -68,7 +81,15 @@ async function syncNow() {
             This Node <span class="text-xs font-normal text-gray-400">{{ snap.self?.node_name }}</span>
           </h3>
           <span :class="['text-xs font-semibold', inSync ? 'text-green-600' : 'text-yellow-600']">
-            {{ inSync ? '✓ In sync with peers' : `⚠ ${snap.drift_count} peer(s) differ` }}
+            <template v-if="inSync && unknownCount > 0">
+              ✓ No drift detected · {{ unknownCount }} peer(s) haven't reported yet
+            </template>
+            <template v-else-if="inSync">
+              ✓ In sync with peers
+            </template>
+            <template v-else>
+              ⚠ {{ snap.drift_count }} peer(s) differ
+            </template>
           </span>
         </div>
         <div class="text-xs space-y-1 text-gray-600 dark:text-gray-400">
@@ -92,15 +113,24 @@ async function syncNow() {
         <h3 class="text-xs font-semibold text-gray-500 uppercase tracking-wide">Peers</h3>
         <div v-for="peer in snap.peers" :key="peer.node_name"
           class="bg-white dark:bg-gray-800 rounded-xl border shadow-sm px-4 py-3"
-          :class="peer.config_hash !== selfHash ? 'border-yellow-200 dark:border-yellow-800' : 'border-gray-100 dark:border-gray-700'"
+          :class="{
+            'border-gray-100 dark:border-gray-700': peerStatus(peer) === 'same',
+            'border-gray-200 dark:border-gray-700 opacity-75': peerStatus(peer) === 'unknown',
+            'border-yellow-200 dark:border-yellow-800': peerStatus(peer) === 'different',
+          }"
         >
           <div class="flex items-center justify-between">
             <span class="text-sm font-medium text-gray-800 dark:text-gray-200">{{ peer.node_name }}</span>
-            <span :class="['text-xs', peer.config_hash === selfHash ? 'text-green-600' : 'text-yellow-600']">
-              {{ peer.config_hash === selfHash ? '✓ Same' : '⚠ Different' }}
+            <span class="text-xs">
+              <span v-if="peerStatus(peer) === 'same'" class="text-green-600">✓ Same</span>
+              <span v-else-if="peerStatus(peer) === 'unknown'" class="text-gray-400">⏳ Not reported yet</span>
+              <span v-else class="text-yellow-600">⚠ Different</span>
             </span>
           </div>
-          <p class="text-xs font-mono text-gray-400 mt-1">{{ peer.config_hash || '(no hash yet)' }}</p>
+          <p class="text-xs font-mono text-gray-400 mt-1">
+            <template v-if="peer.config_hash">{{ peer.config_hash }}</template>
+            <template v-else><em>peer just started; waiting for its first hash broadcast</em></template>
+          </p>
           <p v-if="peer.loaded_at && !peer.loaded_at.startsWith('0001')" class="text-xs text-gray-400 mt-0.5">
             {{ fmtRelative(peer.loaded_at) }}
           </p>

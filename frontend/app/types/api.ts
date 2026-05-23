@@ -183,17 +183,24 @@ export interface SLOTargetConfig {
 // Actual backend: cluster/configsync.go ConfigSyncSnapshot
 
 export interface ConfigSyncSnapshot {
-  self:        ConfigNodeInfo    // this node's config info
-  peers:       ConfigNodeInfo[]  // peer nodes' config info
-  drift_count: number
+  self:        ConfigNodeInfo       // this node's config info (ConfigBroadcast)
+  peers:       PeerConfigInfo[]     // peer nodes' config info (with in_sync flag)
+  drift_count: number               // peers with a KNOWN different hash; excludes peers with no hash yet
 }
 
 export interface ConfigNodeInfo {
   msg_type?:    string
   node_name:    string
-  config_hash:  string  // first 16 hex chars of SHA-256
+  config_hash:  string               // first 16 hex chars of SHA-256
   config_size:  number
-  loaded_at:    string  // ISO timestamp
+  loaded_at:    string               // ISO timestamp
+}
+
+export interface PeerConfigInfo {
+  node_name:   string
+  config_hash: string                // empty when peer hasn't broadcast yet
+  in_sync:     boolean               // backend-authoritative: true when same OR not-yet-known
+  loaded_at:   string
 }
 
 // Computed helpers (derived in component, not from API)
