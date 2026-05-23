@@ -4,30 +4,35 @@
  */
 import type { Page } from '@playwright/test'
 
+// Mock shape must match types/api.ts FleetSnapshot: `summary` (rollup) +
+// `targets` (array, each element carries `id`). The earlier shape used
+// `target_counts` + `targets` as an object map, which doesn't iterate
+// in useFleet's `for (const t of snapshot.targets)` loop and silently
+// rendered an empty Down Targets section in the e2e test.
 const FLEET = {
-  node_name: 'e2e-node', cluster_enabled: false,
-  target_counts: { up: 2, hard_down: 1, soft_down: 0, soft_up: 0, unknown: 0 },
-  down_targets: ['db-primary'],
-  targets: {
-    'api-gateway': {
-      name: 'api-gateway', target: '127.0.0.1:8080', type: 'tcp',
+  node_name: 'e2e-node',
+  cluster_enabled: false,
+  summary: { up: 2, hard_down: 1, soft_down: 0, soft_up: 0, unknown: 0 },
+  targets: [
+    {
+      id: 'api-gateway', name: 'api-gateway', target: '127.0.0.1:8080', type: 'tcp',
       consensus_state: 'up', scope: 'STANDALONE', classification: 'AMBIGUOUS',
       confidence: 1, affected_apps: ['payment-app'],
       by_node: { 'e2e-node': { state: 'up', seq: 3, error_code: '', latency: 0.012 } },
     },
-    'db-primary': {
-      name: 'db-primary', target: '127.0.0.1:5432', type: 'tcp',
+    {
+      id: 'db-primary', name: 'db-primary', target: '127.0.0.1:5432', type: 'tcp',
       consensus_state: 'hard_down', scope: 'STANDALONE', classification: 'REAL_OUTAGE',
       confidence: 1, affected_apps: [],
       by_node: { 'e2e-node': { state: 'hard_down', seq: 7, error_code: 'dial tcp: connection refused', latency: 0 } },
     },
-    'web-server': {
-      name: 'web-server', target: 'https://example.com', type: 'http',
+    {
+      id: 'web-server', name: 'web-server', target: 'https://example.com', type: 'http',
       consensus_state: 'up', scope: 'STANDALONE', classification: 'AMBIGUOUS',
       confidence: 1, affected_apps: [],
       by_node: { 'e2e-node': { state: 'up', seq: 1, error_code: '', latency: 0.055 } },
     },
-  },
+  ],
 }
 
 const MAINTENANCE_WINDOW = {
