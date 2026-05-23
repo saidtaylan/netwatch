@@ -228,17 +228,16 @@ export interface MaintenanceWindow {
 // ── /geo/latency/{targetID} ──────────────────────────────────────────────────
 
 export interface GeoLatencySnapshot {
-  target_id:  string
-  anomaly:    boolean
-  by_node:    GeoNodeLatency[]
+  target_id:   string
+  computed_at: string                 // ISO timestamp
+  anomaly:     boolean                // true when ANY node > 3× min non-zero
+  by_node:     GeoNodeLatency[]
 }
 
 export interface GeoNodeLatency {
-  node:    string
-  region?: string
-  zone?:   string
-  latency: number   // seconds
-  anomaly: boolean
+  node_name:        string
+  region?:          string
+  latency_seconds:  number   // 0 means not yet measured / not applicable
 }
 
 // ── /cluster/keyring/rotate ──────────────────────────────────────────────────

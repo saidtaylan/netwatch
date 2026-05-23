@@ -1082,6 +1082,11 @@ func main() {
 		w.Header().Set("Access-Control-Allow-Origin", corsOrigin)
 		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		// Cache CORS preflights for 24h so the browser stops re-OPTIONS-ing
+		// every request. Without this header the SPA doubles its network
+		// volume during polling (every Authorization-bearing GET fires an
+		// OPTIONS first).
+		w.Header().Set("Access-Control-Max-Age", "86400")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return

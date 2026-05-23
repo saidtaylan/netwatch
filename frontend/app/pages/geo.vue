@@ -1,70 +1,135 @@
 <script setup lang="ts">
+/**
+ * Geo Latency page — per-node probe latency for every target. Fans out
+ * one /geo/latency/{targetID} call per target. We use the canonical
+ * target key (id, fall back to name) so the backend can look up the
+ * latency map; using display name silently returned an empty by_node
+ * list when ID and name differ (e.g. "cf-dns" vs "cloudflare-dns").
+ */
 import type { GeoLatencySnapshot } from '~/types/api'
 import { fmtLatency } from '~/utils/format'
 
 const api = useApi()
 const { targetList } = useFleet()
 
-// Load geo latency for all targets
+// One Promise.allSettled per loadGeo call; results indexed by target.id.
 const geoData = ref<Record<string, GeoLatencySnapshot>>({})
 const loading = ref(false)
+const loaded  = ref(false)   // distinguishes "never loaded" from "loaded but empty"
+
+// Compute min non-zero latency per target so we can highlight outliers
+// in the row. Backend already exposes `anomaly` at the snapshot level,
+// but we want per-row visual cues too.
+function minLatency(g: GeoLatencySnapshot): number {
+  let min = Infinity
+  for (const n of g.by_node) {
+    if (n.latency_seconds > 0 && n.latency_seconds < min) min = n.latency_seconds
+  }
+  return Number.isFinite(min) ? min : 0
+}
+function isOutlier(n: { latency_seconds: number }, min: number): boolean {
+  return min > 0 && n.latency_seconds > 0 && n.latency_seconds > 3 * min
+}
 
 async function loadGeo() {
+  if (targetList.value.length === 0) {
+    geoData.value = {}
+    loaded.value = true
+    return
+  }
   loading.value = true
+  const next: Record<string, GeoLatencySnapshot> = {}
   const results = await Promise.allSettled(
     targetList.value.map(async t => {
-      const id = t.name // or target id
-      const data = await api.get<GeoLatencySnapshot>(`/geo/latency/${encodeURIComponent(id)}`)
-      return { id, data }
+      const key = t.id || t.name
+      try {
+        const data = await api.get<GeoLatencySnapshot>(`/geo/latency/${encodeURIComponent(key)}`)
+        return { key, data }
+      } catch {
+        return null
+      }
     })
   )
   for (const r of results) {
-    if (r.status === 'fulfilled') geoData.value[r.value.id] = r.value.data
+    if (r.status === 'fulfilled' && r.value) next[r.value.key] = r.value.data
   }
+  geoData.value = next
   loading.value = false
+  loaded.value = true
 }
 
-onMounted(loadGeo)
-watch(() => targetList.value.length, loadGeo)
+// Wait for the first non-empty target list before considering ourselves loaded.
+onMounted(() => {
+  if (targetList.value.length) loadGeo()
+})
+watch(() => targetList.value.length, (n) => {
+  if (n > 0) loadGeo()
+})
+
+const entries = computed(() =>
+  Object.entries(geoData.value)
+    .sort(([a], [b]) => a.localeCompare(b))
+)
 </script>
 
 <template>
   <div class="space-y-4">
     <div class="flex items-center justify-between">
       <h2 class="text-xl font-bold text-gray-900 dark:text-white">Geo Latency</h2>
-      <button @click="loadGeo" :disabled="loading" class="text-xs text-blue-500 hover:underline">Refresh</button>
+      <button @click="loadGeo" :disabled="loading"
+        class="text-xs text-blue-500 hover:underline disabled:opacity-50">
+        {{ loading ? 'Refreshing…' : 'Refresh' }}
+      </button>
     </div>
-    <p class="text-sm text-gray-500">Per-node probe latency across regions. Anomaly = any node >3× the minimum.</p>
+    <p class="text-sm text-gray-500">
+      Per-node probe latency for every target. Anomaly = any node > 3× the minimum.
+      Nodes with latency 0 haven't reported yet (e.g. not currently a designated prober for that target).
+    </p>
 
-    <div v-if="Object.keys(geoData).length" class="space-y-3">
-      <div v-for="(geo, id) in geoData" :key="id"
+    <div v-if="entries.length" class="space-y-3">
+      <div v-for="[id, geo] in entries" :key="id"
         class="bg-white dark:bg-gray-800 rounded-xl border shadow-sm overflow-hidden"
         :class="geo.anomaly ? 'border-orange-300 dark:border-orange-700' : 'border-gray-100 dark:border-gray-700'"
       >
         <div class="flex items-center justify-between px-4 py-3 border-b border-gray-100 dark:border-gray-700">
-          <NuxtLink :to="{ name: 'targets-id', params: { id } }" class="text-sm font-semibold text-gray-900 dark:text-white hover:underline">
+          <NuxtLink :to="{ name: 'targets-id', params: { id } }"
+            class="text-sm font-semibold text-gray-900 dark:text-white hover:underline">
             {{ id }}
           </NuxtLink>
-          <span v-if="geo.anomaly" class="text-xs text-orange-600 bg-orange-50 dark:bg-orange-900/20 rounded-full px-2 py-0.5">⚠ Latency anomaly</span>
+          <span v-if="geo.anomaly"
+            class="text-xs text-orange-600 bg-orange-50 dark:bg-orange-900/20 rounded-full px-2 py-0.5">
+            ⚠ Latency anomaly
+          </span>
         </div>
         <div class="divide-y divide-gray-100 dark:divide-gray-700">
-          <div v-for="n in geo.by_node" :key="n.node"
+          <div v-for="n in geo.by_node" :key="n.node_name"
             class="flex items-center gap-3 px-4 py-2.5 text-sm"
-            :class="n.anomaly ? 'bg-orange-50/50 dark:bg-orange-900/10' : ''"
+            :class="isOutlier(n, minLatency(geo)) ? 'bg-orange-50/50 dark:bg-orange-900/10' : ''"
           >
-            <span class="font-medium text-gray-700 dark:text-gray-300 w-32 truncate">{{ n.node }}</span>
-            <span v-if="n.region" class="text-xs text-gray-400 w-20 truncate">{{ n.region }}</span>
-            <span v-if="n.zone"   class="text-xs text-gray-400 w-20 truncate">{{ n.zone }}</span>
-            <span :class="['ml-auto font-mono text-sm', n.anomaly ? 'text-orange-600 font-bold' : 'text-gray-700 dark:text-gray-300']">
-              {{ fmtLatency(n.latency) }}
+            <span class="font-medium text-gray-700 dark:text-gray-300 w-32 truncate">{{ n.node_name }}</span>
+            <span v-if="n.region" class="text-xs text-gray-400 w-24 truncate">{{ n.region }}</span>
+            <span :class="['ml-auto font-mono text-sm',
+              n.latency_seconds === 0
+                ? 'text-gray-400 italic'
+                : (isOutlier(n, minLatency(geo)) ? 'text-orange-600 font-bold' : 'text-gray-700 dark:text-gray-300')]">
+              {{ n.latency_seconds === 0 ? '— not probing' : fmtLatency(n.latency_seconds) }}
             </span>
-            <span v-if="n.anomaly" class="text-xs text-orange-500">⚠</span>
+            <span v-if="isOutlier(n, minLatency(geo))" class="text-xs text-orange-500">⚠</span>
           </div>
         </div>
       </div>
     </div>
 
-    <div v-else-if="loading" class="text-center py-12 text-gray-400 animate-pulse text-sm">Loading geo data…</div>
-    <EmptyState v-else title="No geo data" description="Requires cluster mode with multiple nodes in different regions." icon="🌍" />
+    <div v-else-if="loading && !loaded" class="text-center py-12 text-gray-400 animate-pulse text-sm">
+      Loading geo data…
+    </div>
+    <EmptyState
+      v-else
+      title="No geo data yet"
+      :description="targetList.length === 0
+        ? 'Waiting for targets to load…'
+        : 'All targets returned empty latency maps. This usually means cluster.zone is unset on most nodes, or no probes have completed yet — wait a probe interval and refresh.'"
+      icon="🌍"
+    />
   </div>
 </template>
