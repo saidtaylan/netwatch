@@ -925,6 +925,12 @@ func (m *Manager) Members() []MemberInfo {
 			Region: region,
 		})
 	}
+	// Sort deterministically by name. memberlist returns members in an
+	// internal map-iteration order that changes on every gossip round; the
+	// UI re-renders look like flicker because each poll arrives with a
+	// different ordering. Sorting here is the single source of truth so
+	// frontends don't have to re-sort.
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 

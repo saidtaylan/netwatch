@@ -1,8 +1,81 @@
 <script setup lang="ts">
-import type { FleetTarget, TargetState, TargetType } from '~/types/api'
+import type { FleetTarget, TargetType } from '~/types/api'
 import { isDown } from '~/utils/classifyState'
 
-const { fleet, targetList, counts } = useFleet()
+const api  = useApi()
+const ui   = useUIStore()
+const auth = useAuthStore()
+const { fleet, targetList } = useFleet()
+
+// ── CRUD state ──────────────────────────────────────────────────────────
+const modal = reactive({
+  open: false,
+  mode: 'create' as 'create' | 'edit',
+  title: '',
+  initialJson: '',
+  editingKey: '' as string,
+})
+
+function openCreate() {
+  modal.mode = 'create'
+  modal.title = 'New Target'
+  modal.editingKey = ''
+  modal.initialJson = JSON.stringify({
+    id: 'my-new-target',
+    type: 'tcp',
+    target: 'host:port',
+    name: 'display-name',
+  }, null, 2)
+  modal.open = true
+}
+
+function openEdit(t: FleetTarget) {
+  modal.mode = 'edit'
+  modal.title = `Edit ${t.id}`
+  modal.editingKey = t.id
+  // Hydrate from current backend snapshot — we don't fetch /targets/{id}
+  // (no GET-by-id endpoint), the FleetTarget already carries the fields
+  // operators care about. Caller can refine the JSON before saving.
+  modal.initialJson = JSON.stringify({
+    id: t.id,
+    type: t.type,
+    target: t.target,
+    name: t.name,
+  }, null, 2)
+  modal.open = true
+}
+
+async function onSubmit(json: string) {
+  try {
+    const body = JSON.parse(json)
+    const key = modal.mode === 'edit' ? modal.editingKey : (body.id || body.name)
+    if (!key) {
+      ui.addToast('error', 'Target must have an id or name')
+      modal.open = false
+      return
+    }
+    await api.put(`/targets/${encodeURIComponent(key)}`, body)
+    ui.addToast('success', modal.mode === 'create' ? `Target ${key} created` : `Target ${key} updated`)
+    modal.open = false
+    await fleet.refresh()
+  } catch (err: any) {
+    const msg = err?.data?.error ?? err?.message ?? 'Save failed'
+    ui.addToast('error', `Save failed: ${msg}`)
+    modal.open = false
+  }
+}
+
+async function onDelete(t: FleetTarget) {
+  if (!confirm(`Delete target "${t.id}"? Probe loop will stop on all nodes.`)) return
+  try {
+    await api.del(`/targets/${encodeURIComponent(t.id)}`)
+    ui.addToast('success', `Target ${t.id} deleted`)
+    await fleet.refresh()
+  } catch (err: any) {
+    const msg = err?.data?.error ?? err?.message ?? 'Delete failed'
+    ui.addToast('error', `Delete failed: ${msg}`)
+  }
+}
 
 // ── Filters ────────────────────────────────────────────────────────────────
 const search    = ref('')
@@ -15,7 +88,6 @@ const availableTypes = computed<string[]>(() => {
   return ['all', ...Array.from(types).sort()]
 })
 
-// targets is now an array — filter directly
 const filtered = computed<FleetTarget[]>(() => {
   return targetList.value.filter(t => {
     const id = t.id
@@ -33,6 +105,7 @@ const localCounts = computed(() => ({
   total: targetList.value.length,
   up:    targetList.value.filter(t => t.consensus_state === 'up').length,
   down:  targetList.value.filter(t => isDown(t.consensus_state)).length,
+  unknown: targetList.value.filter(t => t.consensus_state === 'unknown').length,
 }))
 </script>
 
@@ -44,8 +117,14 @@ const localCounts = computed(() => ({
         <h2 class="text-xl font-bold text-gray-900 dark:text-white">Targets</h2>
         <p class="text-sm text-gray-500 dark:text-gray-400 mt-0.5">
           {{ localCounts.total }} total · {{ localCounts.up }} up · {{ localCounts.down }} down
+          <span v-if="localCounts.unknown">· {{ localCounts.unknown }} unknown</span>
         </p>
       </div>
+      <button
+        v-if="auth.token"
+        @click="openCreate"
+        class="text-sm px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium transition"
+      >+ New Target</button>
     </div>
 
     <!-- Filter bar -->
@@ -85,26 +164,28 @@ const localCounts = computed(() => ({
 
     <!-- Table -->
     <div class="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-100 dark:border-gray-700 overflow-hidden">
-      <!-- Table header -->
-      <div class="hidden sm:grid grid-cols-[1fr_auto_auto_auto_auto] gap-4 px-4 py-2 border-b border-gray-100 dark:border-gray-700 text-xs font-semibold text-gray-500 uppercase tracking-wide">
-        <span>Target</span>
-        <span>Type</span>
-        <span>Status</span>
-        <span>Scope</span>
-        <span></span>
-      </div>
-
-      <!-- Skeleton while loading -->
       <SkeletonRow v-if="fleet.loading.value && targetList.length === 0" :rows="6" :cols="4" />
 
-      <!-- Rows -->
       <ul v-else class="divide-y divide-gray-100 dark:divide-gray-700">
-        <li v-for="t in filtered" :key="t.id">
-          <TargetRow :target="t" :id="t.id" />
+        <li v-for="t in filtered" :key="t.id" class="flex items-stretch">
+          <div class="flex-1">
+            <TargetRow :target="t" :id="t.id" />
+          </div>
+          <div v-if="auth.token" class="flex items-center gap-1 px-3 border-l border-gray-100 dark:border-gray-700">
+            <button
+              @click.stop="openEdit(t)"
+              class="text-xs text-blue-600 hover:underline px-1.5 py-1"
+              title="Edit"
+            >Edit</button>
+            <button
+              @click.stop="onDelete(t)"
+              class="text-xs text-red-600 hover:underline px-1.5 py-1"
+              title="Delete"
+            >Delete</button>
+          </div>
         </li>
       </ul>
 
-      <!-- Empty states -->
       <EmptyState
         v-if="!fleet.loading.value && filtered.length === 0 && targetList.length > 0"
         title="No matching targets"
@@ -113,19 +194,24 @@ const localCounts = computed(() => ({
       />
       <EmptyState
         v-if="!fleet.loading.value && targetList.length === 0"
-        title="No targets found"
-        description="No targets in the backend fleet yet."
+        title="No targets configured"
+        description="Click + New Target to add your first probe."
         icon="📡"
       />
-      <div v-if="fleet.loading.value && targetList.length === 0"
-        class="py-12 text-center text-sm text-gray-400 animate-pulse">
-        Loading targets…
-      </div>
     </div>
 
-    <!-- Result count -->
     <p v-if="filtered.length && targetList.length !== filtered.length" class="text-xs text-gray-400">
       Showing {{ filtered.length }} of {{ targetList.length }} targets
     </p>
+
+    <CrudJsonModal
+      :open="modal.open"
+      :title="modal.title"
+      :initialJson="modal.initialJson"
+      :submitLabel="modal.mode === 'create' ? 'Create' : 'Save'"
+      hint="Fields: id, type (tcp|http|ping|dns|sql), target (host:port), name, notify[], depends_on[], options{}"
+      @submit="onSubmit"
+      @cancel="modal.open = false"
+    />
   </div>
 </template>

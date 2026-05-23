@@ -35,7 +35,8 @@ const sections: { title?: string; items: NavItem[] }[] = [
     title: 'Operations',
     items: [
       { label: 'Maintenance', icon: '🔧', to: { name: 'maintenance' } },
-      { label: 'Silences',    icon: '🔕', to: { name: 'silences' },   soon: true },
+      { label: 'Silences',    icon: '🔕', to: { name: 'silences' } },
+      { label: 'Channels',    icon: '📣', to: { name: 'channels' } },
     ],
   },
   {

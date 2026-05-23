@@ -14,9 +14,22 @@ onMounted(async () => {
 const { fleet, quorumHealthy, isolated, counts, downTargetIds } = useFleet()
 // cluster/state.members includes all peers + self → total node count
 const memberCount = computed(() => clusterState.data.value?.members?.length ?? fleet.data.value?.cluster?.alive_count ?? 0)
+// Sort members deterministically (by name) so the list does not flicker
+// every poll. Backend started sorting in B24+, but older nodes or
+// alternate sources may return shuffled order; this is the defensive copy.
+const members = computed(() =>
+  [...(clusterState.data.value?.members ?? [])].sort((a, b) => a.name.localeCompare(b.name))
+)
 const quorum      = quorumHealthy
 const drift       = computed(() => configSync.data.value?.drift_count ?? 0)
 const downTargets = downTargetIds
+const totalTargets = computed(() =>
+  (counts.value.up ?? 0) +
+  (counts.value.hard_down ?? 0) +
+  (counts.value.soft_down ?? 0) +
+  ((counts.value as { soft_up?: number }).soft_up ?? 0) +
+  (counts.value.unknown ?? 0)
+)
 </script>
 
 <template>
@@ -53,6 +66,7 @@ const downTargets = downTargetIds
           <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Targets Up</p>
           <p class="text-2xl font-bold text-green-600">{{ counts.up }}</p>
           <p v-if="counts.soft_up" class="text-xs text-lime-500 mt-1">+{{ counts.soft_up }} recovering</p>
+          <p class="text-xs text-gray-400 mt-1">of {{ totalTargets }} total</p>
         </div>
 
         <!-- Targets Down -->
@@ -60,6 +74,7 @@ const downTargets = downTargetIds
           <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Targets Down</p>
           <p :class="['text-2xl font-bold', counts.hard_down ? 'text-red-600' : 'text-gray-400']">{{ counts.hard_down }}</p>
           <p v-if="counts.soft_down" class="text-xs text-orange-500 mt-1">+{{ counts.soft_down }} soft down</p>
+          <p v-if="counts.unknown" class="text-xs text-gray-400 mt-1">{{ counts.unknown }} unknown (no probe yet)</p>
         </div>
 
         <!-- Config drift -->
@@ -96,13 +111,13 @@ const downTargets = downTargetIds
     </div>
 
     <!-- Cluster member list -->
-    <div v-if="clusterState.data.value?.members?.length" class="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-100 dark:border-gray-700">
+    <div v-if="members.length" class="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-100 dark:border-gray-700">
       <div class="px-4 py-3 border-b border-gray-100 dark:border-gray-700">
         <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300">Cluster Members</h3>
       </div>
       <ul class="divide-y divide-gray-100 dark:divide-gray-700">
         <li
-          v-for="m in clusterState.data.value.members"
+          v-for="m in members"
           :key="m.name"
           class="flex items-center gap-3 px-4 py-2.5 text-sm"
         >
