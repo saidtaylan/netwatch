@@ -732,6 +732,14 @@ type Engine struct {
 	// match operator-defined silence rules.
 	silencesMgr *silencesManager
 
+	// targetsMgr is the storage-backed target registry (B24.6).
+	// When non-nil, it owns the canonical target list — the engine's
+	// cfg.Targets becomes a seed-only field read once at boot. CRUD
+	// flows through Engine.UpsertTarget / DeleteTarget which call into
+	// this manager; peer changes arrive via the Watch loop and trigger
+	// applyTargetsReconciliation.
+	targetsMgr *targetsManager
+
 	// orphanedSet tracks which local targets currently have no cluster prober
 	// assigned, so updateClusterMetrics can log only on transitions (edge-
 	// triggered) instead of every 5 s. Guarded by orphanedMu.
@@ -878,6 +886,180 @@ func (e *Engine) NodeAlias() string {
 	return e.cfg.NodeAlias
 }
 
+// applyTargetsReconciliation applies a new target set to the running
+// engine. Invoked by:
+//   - targetsMgr Watch loop when a peer broadcasts a change
+//   - targetsMgr Upsert/Delete after persisting
+//   - LoadConfig hot-reload, before targetsMgr exists (Init not done yet)
+//
+// The pipeline mirrors what LoadConfig does for the targets section so
+// the storage path produces the same observable state as the legacy
+// config-driven path:
+//   1. Validate targets (cycles, dependency refs)
+//   2. Validate notify channel references against live channels
+//   3. Build dependency graph
+//   4. Purge state for removed/disabled targets
+//   5. Rebuild localProbeIDs
+//   6. Swap into e.cfg.Targets, e.topoGraph, e.localProbeIDs
+//   7. Rebuild app index (apps may reference new/removed targets)
+//   8. Recompute cluster prober assignments
+//   9. Restart probe goroutines for added/removed targets
+//
+// Errors abort the swap — the previous target set stays live.
+func (e *Engine) applyTargetsReconciliation(newTargets []Target) error {
+	if err := e.validateTargets(newTargets); err != nil {
+		return fmt.Errorf("target validation: %w", err)
+	}
+
+	// Validate notify channel references against the live channel set.
+	e.mu.RLock()
+	channels := e.channels
+	e.mu.RUnlock()
+	for _, t := range newTargets {
+		if !t.active() {
+			continue
+		}
+		for _, n := range t.Notify {
+			if _, ok := channels[n]; !ok {
+				return fmt.Errorf("target %q: notify %q is not defined", t.key(), n)
+			}
+		}
+	}
+
+	topo, topoErr := buildDependencyGraph(newTargets)
+	if topoErr != nil {
+		return fmt.Errorf("dependency graph: %w", topoErr)
+	}
+
+	// Purge stale state for removed/disabled targets.
+	activeKeys := make(map[string]bool, len(newTargets))
+	activePending := make(map[string]bool, len(newTargets))
+	for _, t := range newTargets {
+		if t.active() {
+			activeKeys[t.key()] = true
+			activePending[t.typeKey()] = true
+		}
+	}
+
+	e.stateMu.Lock()
+	changed := false
+	for k := range e.pending {
+		if !activePending[k] {
+			delete(e.pending, k)
+		}
+	}
+	for k := range e.lastKnown {
+		if !activeKeys[k] {
+			delete(e.lastKnown, k)
+			changed = true
+		}
+	}
+	e.stateMu.Unlock()
+	if changed {
+		e.persistState()
+	}
+
+	newProbeIDs := make(map[string]bool, len(newTargets))
+	for _, t := range newTargets {
+		if t.active() {
+			newProbeIDs[t.key()] = true
+		}
+	}
+
+	e.mu.Lock()
+	e.cfg.Targets = newTargets
+	e.topoGraph = topo
+	e.localProbeIDs = newProbeIDs
+	e.mu.Unlock()
+
+	// Rebuild app index now that target keys may have changed.
+	if e.appsMgr != nil {
+		e.appsMgr.RebuildIndex()
+	}
+
+	// Cluster: prober recompute + presence broadcast so peers learn we
+	// own (or no longer own) this target.
+	if e.clusterMgr != nil {
+		initial := make(map[string]bool, len(newTargets))
+		for _, t := range newTargets {
+			if t.active() {
+				initial[t.key()] = e.clusterMgr.IsLocalProber(t.key())
+			}
+		}
+		e.clusterMgr.SeedProberAssignments(initial)
+		e.clusterMgr.TriggerProberRecompute()
+		e.bootstrapInventoryBroadcast()
+	} else {
+		// Standalone mode: start probe goroutines for new targets and stop
+		// them for removed ones. In cluster mode this is handled via the
+		// ProberAssignmentListener (StartProbing/StopProbing) which the
+		// recompute above triggers.
+		e.syncStandaloneProbeLoops(newTargets)
+	}
+
+	slog.Info("targets: reconciled", "count", len(newTargets))
+	return nil
+}
+
+// syncStandaloneProbeLoops starts/stops probe goroutines so the live set
+// matches newTargets exactly. Used only in standalone (no-cluster) mode
+// where there is no prober-assignment recompute to drive lifecycle.
+func (e *Engine) syncStandaloneProbeLoops(newTargets []Target) {
+	wanted := make(map[string]Target, len(newTargets))
+	for _, t := range newTargets {
+		if t.active() {
+			wanted[t.key()] = t
+		}
+	}
+
+	e.probesMu.Lock()
+	// Stop goroutines for targets that no longer exist or were disabled.
+	for k, cancel := range e.probeCancel {
+		if _, keep := wanted[k]; !keep {
+			cancel()
+			delete(e.probeCancel, k)
+			delete(e.probeFastCheck, k)
+		}
+	}
+	// Start goroutines for newly-added targets.
+	toStart := make([]Target, 0)
+	for k, t := range wanted {
+		if _, running := e.probeCancel[k]; !running {
+			toStart = append(toStart, t)
+		}
+	}
+	e.probesMu.Unlock()
+
+	for _, t := range toStart {
+		e.StartProbing(t.key())
+	}
+}
+
+// sameTargetSet reports whether two target slices contain the same keys
+// with identical payloads. Used to skip a redundant reconcile when the
+// seed matches what was already in storage.
+func sameTargetSet(a, b []Target) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	aMap := make(map[string]Target, len(a))
+	for _, t := range a {
+		aMap[t.key()] = t
+	}
+	for _, t := range b {
+		other, ok := aMap[t.key()]
+		if !ok {
+			return false
+		}
+		ja, _ := json.Marshal(t)
+		jb, _ := json.Marshal(other)
+		if string(ja) != string(jb) {
+			return false
+		}
+	}
+	return true
+}
+
 // activeTargetKeys returns the set of currently-active target keys
 // (Target.key()). Used by the apps manager to drop dangling Uses
 // references at runtime.
@@ -949,6 +1131,9 @@ func (e *Engine) Shutdown() {
 
 		// Stop storage Watch goroutines BEFORE leaving the cluster so the
 		// final flurry of peer events doesn't race against the DB close.
+		if e.targetsMgr != nil {
+			e.targetsMgr.Close()
+		}
 		if e.appsMgr != nil {
 			e.appsMgr.Close()
 		}
@@ -1113,6 +1298,61 @@ func (e *Engine) ApplyMaintenanceCancel(id string) error {
 		return nil
 	}
 	return e.maintMgr.Cancel(id)
+}
+
+// ── Targets registry public API (B24.6) ───────────────────────────────────────
+
+// Targets returns the current target list from the storage-backed
+// registry. Falls back to the in-memory config snapshot when the
+// targets manager has not yet been initialized.
+func (e *Engine) Targets() []Target {
+	if e.targetsMgr != nil {
+		return e.targetsMgr.Targets()
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return append([]Target(nil), e.cfg.Targets...)
+}
+
+// UpsertTarget adds or replaces a target in the registry. Cluster-
+// replicated via gossip. After persisting, triggers the full target
+// reconciliation pipeline (validation, dependency graph, prober
+// recompute, probe goroutine lifecycle).
+//
+// Returns ErrSplitBrain when the cluster has lost quorum, or a
+// validation error when the new target set is invalid.
+func (e *Engine) UpsertTarget(t Target) error {
+	if e.targetsMgr == nil {
+		// Pre-Init fallback: write to in-memory cfg only.
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		for i, ex := range e.cfg.Targets {
+			if ex.key() == t.key() {
+				e.cfg.Targets[i] = t
+				return nil
+			}
+		}
+		e.cfg.Targets = append(e.cfg.Targets, t)
+		return nil
+	}
+	return e.targetsMgr.Upsert(t)
+}
+
+// DeleteTarget removes a target by key (ID or Name). Returns true when
+// the target existed. Cluster-replicated; triggers reconciliation.
+func (e *Engine) DeleteTarget(key string) (bool, error) {
+	if e.targetsMgr == nil {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		for i, ex := range e.cfg.Targets {
+			if ex.key() == key {
+				e.cfg.Targets = append(e.cfg.Targets[:i], e.cfg.Targets[i+1:]...)
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	return e.targetsMgr.Delete(key)
 }
 
 // ── Notification channels public API (B24.4) ──────────────────────────────────
@@ -1756,6 +1996,30 @@ func (e *Engine) Init() error {
 	}
 	e.silencesMgr = silMgr
 	go e.runSilencesPruner(rootCtx)
+
+	// Targets registry — storage-backed (B24.6). After Init() finishes,
+	// DB is authoritative for the target list; cfg.Targets becomes a
+	// seed-only field. Peer broadcasts arrive via the manager's Watch
+	// loop and trigger applyTargetsReconciliation, which is the same
+	// pipeline used by config.yaml hot-reload (validate → state purge
+	// → dependency graph → probe goroutine sync).
+	seedTargets := append([]Target(nil), e.cfg.Targets...)
+	tm, tmErr := newTargetsManager(rootCtx, e.storage, e.clusterNodeName(),
+		seedTargets, e.applyTargetsReconciliation)
+	if tmErr != nil {
+		return fmt.Errorf("targets manager: %w", tmErr)
+	}
+	e.targetsMgr = tm
+	// If DB had targets at startup (not just the seed we just wrote),
+	// the loaded set may differ from cfg.Targets. Reconcile once so the
+	// runtime matches the DB exactly. This is a no-op when storage was
+	// empty and we just seeded from cfg.Targets.
+	if dbTargets := tm.Targets(); len(dbTargets) > 0 && !sameTargetSet(dbTargets, e.cfg.Targets) {
+		if err := e.applyTargetsReconciliation(dbTargets); err != nil {
+			slog.Warn("targets: initial DB reconcile failed, falling back to cfg.Targets",
+				"err", err)
+		}
+	}
 
 	// SLO tracker: persists incident history (local, per-node) and SLO
 	// target definitions (cluster-replicated via gossip). Disabled when
