@@ -46,6 +46,20 @@ async function syncNow() {
     </div>
 
     <div v-if="snap" class="space-y-4">
+      <!-- B24 banner — explain that most drift is now expected -->
+      <div class="bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-700 rounded-xl p-3 text-xs text-blue-700 dark:text-blue-300">
+        <strong>About this page:</strong> Shows the SHA-256 hash of each
+        node's <code>config.yaml</code> file. After B24, the dynamic data
+        (apps, channels, targets, silences, SLO targets, maintenance) is
+        stored in SQLite and replicated via gossip — drift in those is
+        impossible. Hash differences here are normal in a typical multi-node
+        cluster, because each node has its own <code>node_name</code>,
+        <code>bind_port</code>, <code>state_file</code>, and ports. Use
+        <strong>Sync to peers</strong> only when you want to push the
+        <em>shared</em> config fields (timeouts, retries, etc.) from this
+        node out — per-node bootstrap fields stay untouched.
+      </div>
+
       <!-- This node -->
       <div class="bg-white dark:bg-gray-800 rounded-xl border shadow-sm p-4"
         :class="inSync ? 'border-gray-100 dark:border-gray-700' : 'border-yellow-300 dark:border-yellow-700'">
