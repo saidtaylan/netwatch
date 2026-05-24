@@ -137,8 +137,20 @@ func (m *Manager) GeoLatencyForTarget(targetID string) GeoLatencySnapshot {
 	}
 }
 
-// detectLatencyAnomaly returns true when the latency values contain at least
-// two non-zero entries and the maximum is more than 3× the minimum.
+// anomalyMinimumLatencySec is the absolute floor below which we don't flag
+// 3× variance as an anomaly. Sub-5ms measurements are dominated by system
+// jitter (scheduler, kernel buffer cycles) — a 3× ratio on values < 5ms
+// is normal noise, not a real network problem.
+const anomalyMinimumLatencySec = 0.005 // 5 ms
+
+// detectLatencyAnomaly returns true when:
+//   - at least two nodes have reported non-zero latencies,
+//   - the minimum non-zero latency is >= 5 ms (below that, jitter dominates), AND
+//   - the maximum exceeds 3× the minimum.
+//
+// The 5 ms floor prevents false positives on localhost or same-rack probes
+// where 0.2 ms vs 0.6 ms looks like a "3× anomaly" but is in fact normal
+// measurement noise at sub-millisecond scale.
 func detectLatencyAnomaly(entries []GeoLatencyEntry) bool {
 	var nonZero []float64
 	for _, e := range entries {
@@ -157,6 +169,10 @@ func detectLatencyAnomaly(entries []GeoLatencyEntry) bool {
 		if v > max {
 			max = v
 		}
+	}
+	if min < anomalyMinimumLatencySec {
+		// Sub-5ms — variance dominated by jitter, not a real anomaly.
+		return false
 	}
 	return max > 3*min
 }

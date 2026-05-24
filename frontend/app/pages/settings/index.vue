@@ -21,7 +21,7 @@ const pollingOptions = [
     <!-- Polling interval -->
     <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-100 dark:border-gray-700 shadow-sm p-5">
       <h3 class="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-3">Polling Interval</h3>
-      <p class="text-xs text-gray-500 mb-3">How often the UI refreshes data from the backend.</p>
+      <p class="text-xs text-gray-500 mb-3">How often this browser tab refreshes data from the active backend node.</p>
       <div class="flex flex-wrap gap-2">
         <button
           v-for="opt in pollingOptions"
@@ -32,6 +32,12 @@ const pollingOptions = [
           @click="ui.setPollingInterval(opt.ms)"
         >{{ opt.label }}</button>
       </div>
+      <p class="text-xs text-gray-400 mt-3 leading-relaxed">
+        <strong>Scope:</strong> only this browser. Stored in
+        <code>localStorage</code>; other browsers, other users, and the
+        backend nodes are unaffected. Lower values mean faster UI updates
+        but more network requests per second to the active node.
+      </p>
     </div>
 
     <!-- Theme -->

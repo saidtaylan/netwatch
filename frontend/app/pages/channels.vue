@@ -113,6 +113,44 @@ function badgeColor(type: string): string {
   if (type === 'mail')    return 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300'
   return 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300'
 }
+
+// ── View script source ────────────────────────────────────────────────
+// Script channels point at a .sh/.ps1 file on disk (DB stores only the
+// channel definition, not the source). Resolves via the server-side
+// GET /channels/{name}/script endpoint so the user can audit what code
+// will actually run when this alert fires.
+interface ScriptSource {
+  name:    string
+  path:    string
+  content: string
+  size:    number
+}
+const scriptModal = reactive({
+  open: false,
+  loading: false,
+  data: null as ScriptSource | null,
+  error: '' as string,
+  channel: '' as string,
+})
+
+async function openScript(name: string) {
+  scriptModal.open = true
+  scriptModal.loading = true
+  scriptModal.error = ''
+  scriptModal.data = null
+  scriptModal.channel = name
+  try {
+    scriptModal.data = await api.get<ScriptSource>(`/channels/${encodeURIComponent(name)}/script`)
+  } catch (err: any) {
+    scriptModal.error = err?.data?.hint ?? err?.data?.error ?? err?.message ?? 'Failed to load script'
+  } finally {
+    scriptModal.loading = false
+  }
+}
+
+function closeScript() {
+  scriptModal.open = false
+}
 </script>
 
 <template>
@@ -141,9 +179,13 @@ function badgeColor(type: string): string {
             <p class="font-medium text-gray-900 dark:text-white">{{ c.name }}</p>
             <p class="text-xs text-gray-500 dark:text-gray-400 truncate">{{ paramSummary(c.cfg) }}</p>
           </div>
-          <div v-if="auth.token" class="flex gap-2">
-            <button @click="openEdit(c.name, c.cfg)" class="text-xs text-blue-600 hover:underline">Edit</button>
-            <button @click="onDelete(c.name)" class="text-xs text-red-600 hover:underline">Delete</button>
+          <div class="flex gap-2">
+            <button v-if="c.cfg.type === 'script'" @click="openScript(c.name)"
+              class="text-xs text-gray-600 dark:text-gray-300 hover:underline">View script</button>
+            <template v-if="auth.token">
+              <button @click="openEdit(c.name, c.cfg)" class="text-xs text-blue-600 hover:underline">Edit</button>
+              <button @click="onDelete(c.name)" class="text-xs text-red-600 hover:underline">Delete</button>
+            </template>
           </div>
         </li>
       </ul>
@@ -165,5 +207,54 @@ function badgeColor(type: string): string {
       @submit="onSubmit"
       @cancel="modal.open = false"
     />
+
+    <!-- View script source modal — read-only audit view -->
+    <Teleport to="body">
+      <Transition name="fade">
+        <div v-if="scriptModal.open" class="fixed inset-0 z-50 flex items-center justify-center">
+          <div class="absolute inset-0 bg-black/40" @click="closeScript" />
+          <div class="relative z-10 bg-white dark:bg-gray-800 rounded-xl shadow-2xl p-6 w-full max-w-3xl mx-4">
+            <div class="flex items-start justify-between mb-3">
+              <div>
+                <h3 class="text-lg font-semibold text-gray-900 dark:text-white">
+                  Script for <code>{{ scriptModal.channel }}</code>
+                </h3>
+                <p v-if="scriptModal.data" class="text-xs text-gray-500 mt-1 font-mono">
+                  {{ scriptModal.data.path }} · {{ scriptModal.data.size }} bytes
+                </p>
+              </div>
+              <button @click="closeScript" class="text-gray-400 hover:text-gray-600 text-xl leading-none">×</button>
+            </div>
+
+            <div v-if="scriptModal.loading" class="py-12 text-center text-sm text-gray-400 animate-pulse">
+              Loading script…
+            </div>
+
+            <div v-else-if="scriptModal.error" class="bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-300 dark:border-yellow-700 rounded-lg p-3 text-sm text-yellow-700 dark:text-yellow-300">
+              {{ scriptModal.error }}
+            </div>
+
+            <div v-else-if="scriptModal.data">
+              <pre class="font-mono text-xs bg-gray-900 text-gray-100 rounded-lg p-4 overflow-x-auto max-h-96 whitespace-pre">{{ scriptModal.data.content }}</pre>
+              <p class="mt-3 text-xs text-gray-500">
+                <strong>How scripts work:</strong> netwatch reads the channel
+                definition from the DB to learn the script <em>name</em>,
+                then looks for <code>name.sh</code> (or <code>name.ps1</code>
+                on Windows) on disk in this node's
+                <code>notifications/</code> directory. The DB does not store
+                the file content — edit the file on disk to change behavior.
+              </p>
+            </div>
+
+            <div class="mt-5 flex justify-end">
+              <button @click="closeScript"
+                class="px-4 py-2 text-sm rounded-lg bg-gray-100 hover:bg-gray-200 dark:bg-gray-700 dark:hover:bg-gray-600 transition">
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
   </div>
 </template>

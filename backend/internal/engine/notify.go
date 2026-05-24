@@ -247,6 +247,12 @@ func mergeVars(base, override map[string]string) map[string]string {
 	return out
 }
 
+// AlertScriptsDir returns the absolute path to the notifications/ script
+// directory — the on-disk location where channel-type=script .sh / .ps1
+// files live. Exposed so HTTP handlers (e.g. GET /channels/{name}/script)
+// can locate the file matching a stored channel definition.
+func AlertScriptsDir() string { return alertScriptsDir() }
+
 // alertScriptsDir returns the absolute path to the notifications/ script directory.
 func alertScriptsDir() string {
 	if exe, err := os.Executable(); err == nil {

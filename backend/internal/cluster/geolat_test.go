@@ -63,6 +63,36 @@ func TestDetectLatencyAnomaly_OneZeroOneNonZero(t *testing.T) {
 	}
 }
 
+func TestDetectLatencyAnomaly_SubMillisecondJitterIgnored(t *testing.T) {
+	// 0.171ms vs 0.563ms is a 3.29× ratio — would trigger the bare 3× rule.
+	// But min < 5ms (anomalyMinimumLatencySec) — system jitter at sub-ms
+	// scale dominates real network signal, so we must NOT flag this.
+	// Real example from the 5-node localhost demo cluster.
+	entries := []GeoLatencyEntry{
+		{NodeName: "n1", Latency: 0.000171},
+		{NodeName: "n2", Latency: 0.000245},
+		{NodeName: "n3", Latency: 0.000215},
+		{NodeName: "n4", Latency: 0.000563},
+		{NodeName: "n5", Latency: 0.000253},
+	}
+	if detectLatencyAnomaly(entries) {
+		t.Error("sub-ms jitter on localhost-like probes should NOT trigger anomaly")
+	}
+}
+
+func TestDetectLatencyAnomaly_SignificantNetworkJump(t *testing.T) {
+	// 10ms (one region) vs 35ms (another region) — both above the 5ms
+	// floor, and 35/10 = 3.5× → real anomaly, must fire.
+	entries := []GeoLatencyEntry{
+		{NodeName: "n1", Latency: 0.010},
+		{NodeName: "n2", Latency: 0.012},
+		{NodeName: "n3", Latency: 0.035},
+	}
+	if !detectLatencyAnomaly(entries) {
+		t.Error("3.5× ratio above the 5ms floor SHOULD trigger anomaly")
+	}
+}
+
 // ── regionOf ─────────────────────────────────────────────────────────────────
 
 func TestRegionOf_TestOverride(t *testing.T) {

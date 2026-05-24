@@ -441,11 +441,73 @@ func main() {
 	})
 	mux.HandleFunc("/channels/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		name := strings.TrimPrefix(r.URL.Path, "/channels/")
-		if name == "" {
+		path := strings.TrimPrefix(r.URL.Path, "/channels/")
+		if path == "" {
 			http.Error(w, `{"error":"channel name required"}`, http.StatusBadRequest)
 			return
 		}
+
+		// Read-only inspection: GET /channels/{name}/script returns the
+		// .sh / .ps1 file content for script-type channels. Useful so the
+		// UI can show operators what code will actually run when this
+		// alert fires — channel definitions in the DB only carry the
+		// script *name*, not the source.
+		if strings.HasSuffix(path, "/script") && r.Method == http.MethodGet {
+			name := strings.TrimSuffix(path, "/script")
+			if name == "" {
+				http.Error(w, `{"error":"channel name required"}`, http.StatusBadRequest)
+				return
+			}
+			cfg, ok := e.NotificationChannels()[name]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "channel not found"})
+				return
+			}
+			if cfg.Type != "script" {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "channel is not script type"})
+				return
+			}
+			scriptName := name
+			if p, ok := cfg.Parameters["script"]; ok && p != "" {
+				scriptName = strings.TrimSuffix(strings.TrimSuffix(p, ".sh"), ".ps1")
+			}
+			// Try .sh first, then .ps1.
+			base := filepath.Join(engine.AlertScriptsDir(), scriptName)
+			var foundPath, content string
+			var foundErr error
+			for _, ext := range []string{".sh", ".ps1"} {
+				p := base + ext
+				b, err := os.ReadFile(p)
+				if err == nil {
+					foundPath, content = p, string(b)
+					break
+				}
+				if !os.IsNotExist(err) {
+					foundErr = err
+				}
+			}
+			if foundPath == "" {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"error":         "script file not found on disk",
+					"expected_base": base,
+					"hint":          "create " + base + ".sh (or .ps1 on Windows) and ensure the directory is readable by the netwatch process",
+					"io_error":      foundErrString(foundErr),
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name":    name,
+				"path":    foundPath,
+				"content": content,
+				"size":    len(content),
+			})
+			return
+		}
+
+		name := path
 		switch r.Method {
 		case http.MethodDelete:
 			if !checkAdminAuth(e, w, r) {
@@ -1877,6 +1939,16 @@ func maskKeyring(s string) string {
 		return "****"
 	}
 	return "****" + s[len(s)-6:]
+}
+
+// foundErrString safely converts an optional error to its message, returning
+// the empty string for nil. Used in HTTP error responses where the field is
+// best-effort context (script-not-found path).
+func foundErrString(e error) string {
+	if e == nil {
+		return ""
+	}
+	return e.Error()
 }
 
 // netInterfaceAddrs returns non-loopback IPv4 addresses on this host.
