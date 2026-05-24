@@ -1,48 +1,56 @@
 <script setup lang="ts">
 /**
- * Cluster Sync — at-a-glance view of cluster consistency.
+ * Cluster Sync — field-level effective-config diff across the cluster.
  *
- * After B24, the dynamic data (apps, channels, targets, silences, SLO,
- * maintenance) lives in SQLite and replicates automatically via gossip,
- * so the operator's only sync concern is:
- *   1. How many of each domain does THIS node hold? (audit visibility)
- *   2. Does config.yaml's static-bootstrap section match across nodes?
- *      (warns about peers running with different timeouts/notifications)
+ * Replaces the previous SHA-256 hash drift view. Hash compares are useless
+ * here because each node legitimately has different node_name, bind_port,
+ * state_file, log_path values — those are bootstrap fields, not drift.
  *
- * The page used to be a maze of three different states per peer; now it's
- * one row per domain (counted live) and one collapsed card for config-yaml
- * hash. Sync button does the right thing for both: pushes shared config
- * fields out and re-broadcasts the hash so peers update their drift view.
+ * Approach:
+ *   /cluster/sync/aggregate (this node) fans out to each peer's
+ *   /cluster/sync/effective in parallel and returns one row per node
+ *   with its SHARED-only effective config (timeouts/retries/notifications/
+ *   keyring/peers/replication_factor). The page picks the local node as
+ *   the baseline, then walks every other node and renders only the
+ *   fields whose values differ — never the noise. Nodes that match the
+ *   baseline collapse to a one-line "Same" row.
  */
 import { fmtRelative } from '~/utils/format'
 
-interface DomainSummary {
-  label:   string
-  count:   number | null
-  fetch:   () => Promise<unknown[] | Record<string, unknown>>
+interface NodeAggregate {
+  node_name:         string
+  http_addr?:        string
+  is_self:           boolean
+  reachable:         boolean
+  error?:            string
+  effective_config?: Record<string, unknown>
+}
+interface AggregateSnapshot {
+  local_node: string
+  nodes:      NodeAggregate[]
 }
 
-const { configSync } = useCluster()
 const api = useApi()
 const ui  = useUIStore()
+
+const agg = usePolling<AggregateSnapshot>(
+  () => api.get<AggregateSnapshot>('/cluster/sync/aggregate'),
+  { intervalMs: 10000 }
+)
 const syncing = ref(false)
 
-const snap = computed(() => configSync.data.value)
-
-// ── Live DB counts for cluster-replicated domains ─────────────────────────
+// Local DB counts (cluster-replicated domains — always identical across
+// the cluster, so we count just this node).
 const counts = reactive<Record<string, number | null>>({
   apps: null, channels: null, targets: null, silences: null, slo: null, maintenance: null,
 })
 
 async function refreshCounts() {
-  // Fire all 6 reads in parallel; tolerate any single failure.
   const wrap = async <T,>(key: string, fn: () => Promise<T>) => {
     try {
       const v = await fn()
       counts[key] = Array.isArray(v) ? v.length : Object.keys(v as object).length
-    } catch {
-      counts[key] = null
-    }
+    } catch { counts[key] = null }
   }
   await Promise.all([
     wrap('apps',         () => api.get<unknown[]>('/apps')),
@@ -53,34 +61,102 @@ async function refreshCounts() {
     wrap('maintenance',  () => api.get<unknown[]>('/cluster/maintenance')),
   ])
 }
-
 onMounted(refreshCounts)
 
-// ── config.yaml hash sync section ────────────────────────────────────────
-const selfHash   = computed(() => snap.value?.self?.config_hash ?? '')
-const selfSize   = computed(() => snap.value?.self?.config_size ?? 0)
-const selfLoaded = computed(() => snap.value?.self?.loaded_at ?? '')
-const peers      = computed(() => snap.value?.peers ?? [])
-const driftCount = computed(() => snap.value?.drift_count ?? 0)
-const knownPeers = computed(() => peers.value.filter(p => !!p.config_hash))
-const allKnownInSync = computed(() => driftCount.value === 0 && knownPeers.value.length === peers.value.length)
+// ── Field-level diff against the local baseline ────────────────────────
+//
+// Baseline = the local node's effective config. For every peer, walk both
+// trees recursively and collect the (path, baseline, peer) entries that
+// differ. Equality uses JSON serialization — fine for the bounded set of
+// fields in SharedConfig.
+const baseline = computed<Record<string, unknown>>(() => {
+  const self = agg.data.value?.nodes.find(n => n.is_self)
+  return self?.effective_config ?? {}
+})
 
-function peerLabel(hash: string): { label: string; cls: string } {
-  if (!hash) return { label: 'Not reported yet', cls: 'text-gray-400' }
-  if (hash === selfHash.value) return { label: 'Same', cls: 'text-green-600' }
-  return { label: 'Different', cls: 'text-yellow-600' }
+interface FieldDiff { path: string; baseline: unknown; peer: unknown }
+
+function diffAgainstBaseline(peer: Record<string, unknown> | undefined): FieldDiff[] {
+  if (!peer) return []
+  const out: FieldDiff[] = []
+  walk('', baseline.value, peer, out)
+  return out
 }
+
+function walk(prefix: string, a: unknown, b: unknown, out: FieldDiff[]) {
+  if (JSON.stringify(a) === JSON.stringify(b)) return
+  // If both sides are plain objects, recurse to surface the diff inside
+  // rather than dumping the whole subtree.
+  if (isPlainObject(a) && isPlainObject(b)) {
+    const keys = new Set([...Object.keys(a as object), ...Object.keys(b as object)])
+    for (const k of keys) {
+      walk(prefix ? `${prefix}.${k}` : k, (a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k], out)
+    }
+    return
+  }
+  out.push({ path: prefix || '(root)', baseline: a, peer: b })
+}
+
+function isPlainObject(v: unknown): boolean {
+  return typeof v === 'object' && v !== null && !Array.isArray(v)
+}
+
+function fmtValue(v: unknown): string {
+  if (v === undefined) return '— (unset)'
+  if (v === null) return 'null'
+  if (typeof v === 'string') return v
+  return JSON.stringify(v)
+}
+
+// ── Per-node UI state: which nodes are expanded ───────────────────────
+const expanded = ref<Set<string>>(new Set())
+function toggle(name: string) {
+  if (expanded.value.has(name)) expanded.value.delete(name)
+  else expanded.value.add(name)
+  // Force reactivity on Set mutation
+  expanded.value = new Set(expanded.value)
+}
+
+interface PeerRow {
+  node: NodeAggregate
+  status: 'self' | 'same' | 'different' | 'unreachable'
+  diffCount: number
+  diffs: FieldDiff[]
+}
+
+const rows = computed<PeerRow[]>(() => {
+  const nodes = agg.data.value?.nodes ?? []
+  return [...nodes]
+    .sort((a, b) => a.node_name.localeCompare(b.node_name))
+    .map(n => {
+      if (n.is_self) return { node: n, status: 'self', diffCount: 0, diffs: [] }
+      if (!n.reachable) return { node: n, status: 'unreachable', diffCount: 0, diffs: [] }
+      const diffs = diffAgainstBaseline(n.effective_config)
+      return {
+        node: n,
+        status: diffs.length === 0 ? 'same' : 'different',
+        diffCount: diffs.length,
+        diffs,
+      }
+    })
+})
+
+const differCount = computed(() => rows.value.filter(r => r.status === 'different').length)
+const unreachableCount = computed(() => rows.value.filter(r => r.status === 'unreachable').length)
+
+// ── Pagination ─────────────────────────────────────────────────────────
+const pageSize = 10
+const page = ref(1)
+const totalPages = computed(() => Math.max(1, Math.ceil(rows.value.length / pageSize)))
+const pagedRows = computed(() => rows.value.slice((page.value - 1) * pageSize, page.value * pageSize))
+watch(() => rows.value.length, () => { if (page.value > totalPages.value) page.value = totalPages.value })
 
 async function syncNow() {
   syncing.value = true
   try {
-    // 1. Push this node's shared config to peers (in-memory apply on each).
-    // 2. configSync refresh will re-pull /cluster/config so the hash table
-    //    reflects the post-sync state.
     await api.post('/cluster/config/sync')
     ui.addToast('success', 'Shared config pushed to peers')
-    await configSync.refresh()
-    await refreshCounts()
+    await Promise.all([agg.refresh(), refreshCounts()])
   } catch (e: unknown) {
     const err = e as { message?: string }
     ui.addToast('error', `Sync failed: ${err?.message ?? e}`)
@@ -103,7 +179,7 @@ async function syncNow() {
       </button>
     </div>
 
-    <!-- Domain counts: what this node currently holds in DB -->
+    <!-- Replicated data counts: domains that auto-sync via gossip -->
     <section class="bg-white dark:bg-gray-800 rounded-xl border border-gray-100 dark:border-gray-700 shadow-sm">
       <header class="px-4 py-3 border-b border-gray-100 dark:border-gray-700 flex items-center justify-between">
         <div>
@@ -133,70 +209,96 @@ async function syncNow() {
       </ul>
     </section>
 
-    <!-- config.yaml hash drift (compact) -->
+    <!-- Effective shared-config diff per node -->
     <section class="bg-white dark:bg-gray-800 rounded-xl border shadow-sm"
-      :class="allKnownInSync ? 'border-gray-100 dark:border-gray-700' : 'border-yellow-300 dark:border-yellow-700'"
+      :class="differCount > 0 ? 'border-yellow-300 dark:border-yellow-700' : 'border-gray-100 dark:border-gray-700'"
     >
       <header class="px-4 py-3 border-b border-gray-100 dark:border-gray-700 flex items-start justify-between gap-3">
         <div>
-          <h3 class="text-sm font-semibold text-gray-800 dark:text-gray-200">
-            config.yaml hash
-            <span class="text-xs font-normal text-gray-400">on disk, per node</span>
-          </h3>
+          <h3 class="text-sm font-semibold text-gray-800 dark:text-gray-200">Effective Shared Config</h3>
           <p class="text-xs text-gray-500 mt-0.5">
-            Multi-node clusters normally differ here (each node has its own
-            <code>node_name</code>, <code>bind_port</code>, <code>state_file</code>).
-            "Sync shared config" pushes the common fields (timeouts, retries,
-            notifications) in-memory only — disk files stay as-is.
+            Field-by-field comparison. Per-node fields (<code>node_name</code>,
+            <code>bind_port</code>, <code>state_file</code>, ports) are
+            excluded — they are bootstrap data, not drift. Baseline is this
+            node ({{ agg.data.value?.local_node ?? '—' }}).
           </p>
         </div>
         <span class="text-xs whitespace-nowrap"
-          :class="allKnownInSync ? 'text-green-600' : 'text-yellow-600'"
+          :class="differCount > 0 ? 'text-yellow-600' : 'text-green-600'"
         >
-          {{ allKnownInSync ? '✓ All same' : `⚠ ${driftCount} differ` }}
+          {{ differCount > 0 ? `⚠ ${differCount} differ` : '✓ All same' }}
+          <span v-if="unreachableCount > 0" class="text-gray-400 ml-2">· {{ unreachableCount }} unreachable</span>
         </span>
       </header>
 
-      <div v-if="snap" class="px-4 py-3 space-y-3">
-        <!-- This node -->
-        <div class="flex items-center justify-between text-sm">
-          <div>
-            <span class="font-medium text-gray-900 dark:text-white">{{ snap.self?.node_name }}</span>
-            <span class="text-xs text-gray-400 ml-2">(this node)</span>
-          </div>
-          <span class="font-mono text-xs text-gray-500 dark:text-gray-400">
-            {{ selfHash || '—' }}
-          </span>
-        </div>
-        <p class="text-xs text-gray-400">
-          {{ selfSize > 0 ? `${selfSize} bytes` : '' }}
-          <span v-if="selfLoaded && !selfLoaded.startsWith('0001')">
-            · loaded {{ fmtRelative(selfLoaded) }}
-          </span>
-        </p>
+      <ErrorBanner v-if="agg.error.value" :error="agg.error.value" title="Failed to aggregate cluster config" @retry="agg.refresh()" />
 
-        <!-- Peers — compact rows -->
-        <div v-if="peers.length" class="border-t border-gray-100 dark:border-gray-700 pt-3 space-y-1.5">
-          <div v-for="peer in peers" :key="peer.node_name"
-            class="flex items-center justify-between text-sm"
+      <ul v-if="rows.length" class="divide-y divide-gray-100 dark:divide-gray-700">
+        <li v-for="row in pagedRows" :key="row.node.node_name">
+          <!-- Row header — always shown -->
+          <div
+            :class="['flex items-center gap-3 px-4 py-2.5 text-sm',
+              row.status === 'different' ? 'cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700/30' : '']"
+            @click="row.status === 'different' && toggle(row.node.node_name)"
           >
-            <span class="text-gray-700 dark:text-gray-300">{{ peer.node_name }}</span>
-            <div class="flex items-center gap-3">
-              <span class="font-mono text-xs text-gray-400">{{ peer.config_hash || '—' }}</span>
-              <span :class="['text-xs', peerLabel(peer.config_hash).cls]">
-                {{ peerLabel(peer.config_hash).label }}
-              </span>
-            </div>
+            <span class="font-medium text-gray-900 dark:text-white">{{ row.node.node_name }}</span>
+            <span v-if="row.status === 'self'" class="text-xs text-gray-400">(this node · baseline)</span>
+            <span v-if="row.node.http_addr" class="font-mono text-xs text-gray-400">{{ row.node.http_addr }}</span>
+            <span class="ml-auto text-xs">
+              <template v-if="row.status === 'self'"><span class="text-blue-600">Baseline</span></template>
+              <template v-else-if="row.status === 'same'"><span class="text-green-600">✓ Same</span></template>
+              <template v-else-if="row.status === 'unreachable'">
+                <span class="text-gray-400">unreachable</span>
+              </template>
+              <template v-else>
+                <span class="text-yellow-600">⚠ {{ row.diffCount }} field(s) differ</span>
+                <span class="ml-2 text-gray-400">{{ expanded.has(row.node.node_name) ? '▾' : '▸' }}</span>
+              </template>
+            </span>
           </div>
+
+          <!-- Diff body — only when expanded -->
+          <div v-if="row.status === 'different' && expanded.has(row.node.node_name)"
+            class="px-4 pb-3 -mt-1 text-xs"
+          >
+            <table class="w-full bg-gray-50 dark:bg-gray-900 rounded-lg">
+              <thead>
+                <tr class="text-left text-gray-500 dark:text-gray-400">
+                  <th class="px-3 py-1.5 font-semibold">Field</th>
+                  <th class="px-3 py-1.5 font-semibold">Baseline ({{ agg.data.value?.local_node }})</th>
+                  <th class="px-3 py-1.5 font-semibold">{{ row.node.node_name }}</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-gray-200 dark:divide-gray-700">
+                <tr v-for="d in row.diffs" :key="d.path">
+                  <td class="px-3 py-1.5 font-mono text-gray-700 dark:text-gray-300">{{ d.path }}</td>
+                  <td class="px-3 py-1.5 font-mono text-gray-600 dark:text-gray-400">{{ fmtValue(d.baseline) }}</td>
+                  <td class="px-3 py-1.5 font-mono text-yellow-600 dark:text-yellow-400">{{ fmtValue(d.peer) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <!-- Unreachable detail (compact) -->
+          <div v-if="row.status === 'unreachable' && row.node.error"
+            class="px-4 pb-2 text-xs text-gray-500"
+          >{{ row.node.error }}</div>
+        </li>
+      </ul>
+
+      <!-- Pagination -->
+      <div v-if="totalPages > 1" class="px-4 py-2.5 border-t border-gray-100 dark:border-gray-700 flex items-center justify-between text-xs">
+        <span class="text-gray-500">Page {{ page }} / {{ totalPages }}</span>
+        <div class="flex gap-1">
+          <button :disabled="page === 1" @click="page--"
+            class="px-2 py-1 rounded bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-200 disabled:opacity-40">‹</button>
+          <button :disabled="page === totalPages" @click="page++"
+            class="px-2 py-1 rounded bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-200 disabled:opacity-40">›</button>
         </div>
       </div>
 
-      <div v-else-if="configSync.error.value?.message?.includes('503')"
-        class="px-4 py-3 text-xs text-gray-500">
-        Cluster not enabled — config sync requires <code>cluster.enabled: true</code>.
-      </div>
-      <div v-else-if="configSync.loading.value" class="px-4 py-6 text-center text-xs text-gray-400 animate-pulse">
-        Loading…
+      <div v-else-if="agg.loading.value && !rows.length" class="px-4 py-6 text-center text-xs text-gray-400 animate-pulse">
+        Loading cluster state…
       </div>
     </section>
 

@@ -90,6 +90,13 @@ type Config struct {
 	// Propagated to peers via memberlist NodeMeta alongside Zone.
 	Region string `json:"region,omitempty"`
 
+	// HTTPPort is the HTTP port this node serves admin endpoints on (the
+	// `port:` field at the top of config.yaml). Propagated to peers via
+	// NodeMeta so any node can build a URL for any other node — required
+	// for cross-node aggregation endpoints like /cluster/sync/aggregate
+	// (effective-config diff across the cluster).
+	HTTPPort string `json:"-"`
+
 	// ProbeReplicationFactor caps the number of nodes that probe any single
 	// target. Even if N nodes have the target in their config, only this many
 	// (selected deterministically via the hash ring with zone-aware spread)
@@ -213,13 +220,14 @@ type GossipPayload struct {
 // member has not declared one. Region (P1.6) is the geographic label used for
 // latency grouping; also from NodeMeta.
 type MemberInfo struct {
-	Name   string `json:"name"`
-	Addr   string `json:"addr"`
-	Port   uint16 `json:"port"`
-	Status string `json:"status"` // alive | suspect | dead | left
-	Self   bool   `json:"self"`
-	Zone   string `json:"zone,omitempty"`
-	Region string `json:"region,omitempty"` // P1.6 geo latency grouping
+	Name     string `json:"name"`
+	Addr     string `json:"addr"`
+	Port     uint16 `json:"port"`
+	Status   string `json:"status"` // alive | suspect | dead | left
+	Self     bool   `json:"self"`
+	Zone     string `json:"zone,omitempty"`
+	Region   string `json:"region,omitempty"`   // P1.6 geo latency grouping
+	HTTPPort string `json:"http_port,omitempty"` // for cross-node aggregation URLs
 }
 
 // ── ClusterStateSnapshot ──────────────────────────────────────────────────────
@@ -278,24 +286,35 @@ type gossipDelegate struct {
 //   - Zone   — optional zone label for Phase 13 prober selection (failure domain).
 //   - Region — optional geographic label for P1.6 geo latency grouping.
 type nodeMeta struct {
-	Node   string `json:"node"`
-	Zone   string `json:"zone,omitempty"`
-	Region string `json:"region,omitempty"` // P1.6: geographic region label
+	Node     string `json:"node"`
+	Zone     string `json:"zone,omitempty"`
+	Region   string `json:"region,omitempty"` // P1.6: geographic region label
+	HTTPPort string `json:"http_port,omitempty"`
 }
 
 func (d *gossipDelegate) NodeMeta(limit int) []byte {
-	data, _ := json.Marshal(nodeMeta{
-		Node:   d.mgr.cfg.NodeName,
-		Zone:   d.mgr.cfg.Zone,
-		Region: d.mgr.cfg.Region,
-	})
+	full := nodeMeta{
+		Node:     d.mgr.cfg.NodeName,
+		Zone:     d.mgr.cfg.Zone,
+		Region:   d.mgr.cfg.Region,
+		HTTPPort: d.mgr.cfg.HTTPPort,
+	}
+	data, _ := json.Marshal(full)
 	if len(data) > limit {
-		// Try without Region first, then without both Zone and Region.
-		data, _ = json.Marshal(nodeMeta{Node: d.mgr.cfg.NodeName, Zone: d.mgr.cfg.Zone})
+		// 512 byte limit — drop optional fields in priority order: Region,
+		// then HTTPPort (cross-node aggregation degrades to "node-only" view),
+		// then Zone (prober spread loses the failure-domain hint).
+		full.Region = ""
+		data, _ = json.Marshal(full)
 		if len(data) > limit {
-			data, _ = json.Marshal(nodeMeta{Node: d.mgr.cfg.NodeName})
+			full.HTTPPort = ""
+			data, _ = json.Marshal(full)
 			if len(data) > limit {
-				return nil
+				full.Zone = ""
+				data, _ = json.Marshal(full)
+				if len(data) > limit {
+					return nil
+				}
 			}
 		}
 	}
@@ -899,12 +918,13 @@ func (m *Manager) Members() []MemberInfo {
 	members := m.list.Members()
 	out := make([]MemberInfo, 0, len(members))
 	for _, mem := range members {
-		var zone, region string
+		var zone, region, httpPort string
 		if len(mem.Meta) > 0 {
 			var meta nodeMeta
 			if json.Unmarshal(mem.Meta, &meta) == nil {
 				zone = meta.Zone
 				region = meta.Region
+				httpPort = meta.HTTPPort
 			}
 		}
 		if mem.Name == local.Name {
@@ -914,15 +934,19 @@ func (m *Manager) Members() []MemberInfo {
 			if region == "" {
 				region = m.cfg.Region
 			}
+			if httpPort == "" {
+				httpPort = m.cfg.HTTPPort
+			}
 		}
 		out = append(out, MemberInfo{
-			Name:   mem.Name,
-			Addr:   mem.Addr.String(),
-			Port:   mem.Port,
-			Status: nodeStateStr(mem.State),
-			Self:   mem.Name == local.Name,
-			Zone:   zone,
-			Region: region,
+			Name:     mem.Name,
+			Addr:     mem.Addr.String(),
+			Port:     mem.Port,
+			Status:   nodeStateStr(mem.State),
+			Self:     mem.Name == local.Name,
+			Zone:     zone,
+			Region:   region,
+			HTTPPort: httpPort,
 		})
 	}
 	// Sort deterministically by name. memberlist returns members in an

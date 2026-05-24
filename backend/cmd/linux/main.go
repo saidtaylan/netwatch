@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"text/template"
 	"time"
@@ -1116,6 +1118,148 @@ func main() {
 			FailedNodes:    failedNodes,
 			FieldsApplied:  engine.AppliedFields(sc),
 			PushedAt:       time.Now(),
+		})
+	})
+
+	// GET /cluster/sync/effective — returns this node's *effective* shared
+	// configuration (the fields that should be identical across all nodes:
+	// timeouts, retries, notifications, default_notify, keyring, peers,
+	// replication settings). Excludes per-node bootstrap fields like
+	// node_name, bind_port, port, state_file, log_path that NATURALLY
+	// differ between nodes and are not a meaningful drift signal.
+	//
+	// Used by the Cluster Sync page (and by /cluster/sync/aggregate on
+	// peer nodes) for field-level diff rendering instead of opaque SHA-256
+	// comparison.
+	mux.HandleFunc("/cluster/sync/effective", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodGet && r.Method != "" {
+			http.Error(w, `{"error":"use GET"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		sc, err := e.ExtractSharedConfig()
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"node_name":        e.NodeAlias(),
+			"effective_config": sc,
+		})
+	})
+
+	// GET /cluster/sync/aggregate — fans out to every peer's
+	// /cluster/sync/effective in parallel, returns one row per node with
+	// its effective config. Frontend uses this to compute field-level
+	// drift instead of comparing config.yaml SHA-256 hashes (which differ
+	// by design — each node has unique node_name, bind_port, etc).
+	//
+	// Per-node timeout: 3s. Unreachable peers come back as {error: "..."}
+	// so the UI can show partial-failure state instead of hanging.
+	mux.HandleFunc("/cluster/sync/aggregate", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodGet && r.Method != "" {
+			http.Error(w, `{"error":"use GET"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		mgr := e.ClusterManager()
+		if mgr == nil {
+			// Standalone — only this node exists. Just return the local view.
+			sc, err := e.ExtractSharedConfig()
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"local_node": e.NodeAlias(),
+				"nodes": []map[string]any{{
+					"node_name":        e.NodeAlias(),
+					"reachable":        true,
+					"is_self":          true,
+					"effective_config": sc,
+				}},
+			})
+			return
+		}
+
+		members := mgr.Members()
+		type nodeResult struct {
+			NodeName        string        `json:"node_name"`
+			HTTPAddr        string        `json:"http_addr,omitempty"`
+			IsSelf          bool          `json:"is_self"`
+			Reachable       bool          `json:"reachable"`
+			Error           string        `json:"error,omitempty"`
+			EffectiveConfig any           `json:"effective_config,omitempty"`
+		}
+
+		results := make([]nodeResult, len(members))
+		var wg sync.WaitGroup
+		for i, mem := range members {
+			i, mem := i, mem
+			if mem.Self {
+				// Local read — skip the HTTP round-trip.
+				sc, scErr := e.ExtractSharedConfig()
+				results[i] = nodeResult{
+					NodeName:        mem.Name,
+					IsSelf:          true,
+					Reachable:       scErr == nil,
+					EffectiveConfig: sc,
+				}
+				if scErr != nil {
+					results[i].Error = scErr.Error()
+				}
+				continue
+			}
+			if mem.HTTPPort == "" {
+				results[i] = nodeResult{
+					NodeName:  mem.Name,
+					Reachable: false,
+					Error:     "peer hasn't gossiped its http_port yet (NodeMeta still warming up)",
+				}
+				continue
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				addr := net.JoinHostPort(mem.Addr, mem.HTTPPort)
+				url := "http://" + addr + "/cluster/sync/effective"
+				ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+				defer cancel()
+				req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					results[i] = nodeResult{NodeName: mem.Name, HTTPAddr: addr, Reachable: false, Error: err.Error()}
+					return
+				}
+				defer resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+					results[i] = nodeResult{NodeName: mem.Name, HTTPAddr: addr, Reachable: false,
+						Error: fmt.Sprintf("http %d: %s", resp.StatusCode, string(body))}
+					return
+				}
+				var parsed struct {
+					NodeName        string `json:"node_name"`
+					EffectiveConfig any    `json:"effective_config"`
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+					results[i] = nodeResult{NodeName: mem.Name, HTTPAddr: addr, Reachable: false, Error: "parse: " + err.Error()}
+					return
+				}
+				results[i] = nodeResult{
+					NodeName:        parsed.NodeName,
+					HTTPAddr:        addr,
+					Reachable:       true,
+					EffectiveConfig: parsed.EffectiveConfig,
+				}
+			}()
+		}
+		wg.Wait()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"local_node": e.NodeAlias(),
+			"nodes":      results,
 		})
 	})
 
