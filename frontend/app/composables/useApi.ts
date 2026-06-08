@@ -49,10 +49,11 @@ export const useApi = () => {
         timeout: 10000,
       })
     } catch (err: any) {
-      // 401 → logout
+      // 401 = missing / expired / invalid token → force logout
+      // 403 = valid token but insufficient role → caller handles
       if (err?.response?.status === 401) {
         auth.logout()
-        await navigateTo({ name: 'setup' })
+        await navigateTo({ name: 'connect' })
         throw err
       }
       // Network error → try failover once

@@ -1,0 +1,2 @@
+# Place the pre-built netwatch binary (GOOS=linux GOARCH=amd64) here.
+# See README.md for build instructions.

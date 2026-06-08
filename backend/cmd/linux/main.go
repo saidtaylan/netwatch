@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	crypto_rand "crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -130,25 +132,496 @@ func main() {
 		})
 	})
 
-	// /auth/whoami — token validation for the UI setup/login flow.
-	// Returns {"role":"admin"} when the token is valid, {"role":"anonymous"} when
-	// no auth is configured, or 401 when the token is wrong.
-	mux.HandleFunc("/auth/whoami", func(w http.ResponseWriter, r *http.Request) {
+	// ── Auth endpoints (B28) ─────────────────────────────────────────────────
+
+	// GET /auth/status — public, no auth. Returns whether initial setup has
+	// been completed (at least one user exists in the DB).
+	mux.HandleFunc("/auth/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		adminToken := e.AdminToken()
-		if adminToken == "" {
-			// Auth not configured — everyone is allowed.
-			_ = json.NewEncoder(w).Encode(map[string]string{"role": "anonymous"})
+		userCount := 0
+		if e.UsersMgr() != nil {
+			userCount = e.UsersMgr().UserCount()
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"setup_completed": userCount > 0,
+			"user_count":      userCount,
+		})
+	})
+
+	// POST /auth/setup — creates the first admin user. Requires the setup
+	// token from config.yaml. Can only be called when no users exist.
+	// Returns the created user + JWT so the frontend can immediately proceed.
+	mux.HandleFunc("/auth/setup", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "use POST"})
 			return
 		}
-		const prefix = "Bearer "
-		auth := r.Header.Get("Authorization")
-		if len(auth) > len(prefix) && auth[:len(prefix)] == prefix && auth[len(prefix):] == adminToken {
-			_ = json.NewEncoder(w).Encode(map[string]string{"role": "admin"})
+
+		// Verify setup token
+		setupToken := e.SetupToken()
+		if setupToken == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "admin.setup_token not configured in config.yaml",
+			})
 			return
 		}
-		w.WriteHeader(http.StatusUnauthorized)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid token"})
+
+		var req struct {
+			SetupToken  string   `json:"setup_token"`
+			Username    string   `json:"username"`
+			Password    string   `json:"password"`
+			DisplayName string   `json:"display_name,omitempty"`
+			NodeURLs    []string `json:"node_urls,omitempty"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON: " + err.Error()})
+			return
+		}
+
+		if req.SetupToken != setupToken {
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid setup token"})
+			return
+		}
+
+		// Only allow setup when no users exist
+		if e.SetupCompleted() {
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "setup already completed — use POST /auth/login instead",
+			})
+			return
+		}
+
+		if req.Username == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "username is required"})
+			return
+		}
+
+		hash, err := engine.HashPassword(req.Password)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		userID := generateUUID()
+		now := time.Now().UTC().Format(time.RFC3339)
+		user := engine.User{
+			ID:           userID,
+			Username:     req.Username,
+			PasswordHash: hash,
+			Role:         "admin",
+			DisplayName:  req.DisplayName,
+			CreatedAt:    now,
+			CreatedBy:    "setup",
+			LastLoginAt:  now,
+		}
+
+		if err := e.UsersMgr().CreateUser(user); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		// Store cluster node URLs if provided
+		if len(req.NodeURLs) > 0 {
+			if err := e.SetClusterNodes(r.Context(), req.NodeURLs); err != nil {
+				slog.Warn("[AUTH] failed to store cluster nodes", "err", err)
+			}
+		}
+
+		// Generate JWT
+		token, err := engine.NewJWTForUser(user, setupToken)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "jwt: " + err.Error()})
+			return
+		}
+
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"token": token,
+			"user":  user.Public(),
+		})
+	})
+
+	// POST /auth/login — authenticate with username + password. Returns JWT.
+	mux.HandleFunc("/auth/login", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "use POST"})
+			return
+		}
+
+		var req struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 2048)).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON"})
+			return
+		}
+
+		if e.UsersMgr() == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "user system not initialized"})
+			return
+		}
+
+		user, found := e.UsersMgr().GetByUsername(req.Username)
+		if !found || !engine.CheckPassword(user.PasswordHash, req.Password) {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid username or password"})
+			return
+		}
+
+		if user.Disabled {
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "account is disabled"})
+			return
+		}
+
+		// Update last login
+		go e.UsersMgr().UpdateLastLogin(user.ID)
+
+		setupToken := e.SetupToken()
+		token, err := engine.NewJWTForUser(user, setupToken)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "jwt: " + err.Error()})
+			return
+		}
+
+		// Fetch stored cluster nodes to return in login response
+		clusterNodes, _ := e.GetClusterNodes(r.Context())
+
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"token":         token,
+			"user":          user.Public(),
+			"cluster_nodes": clusterNodes,
+		})
+	})
+
+	// GET /auth/me — returns the current user from the JWT.
+	mux.HandleFunc("/auth/me", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		claims := checkJWTAuth(e, w, r)
+		if claims == nil {
+			return
+		}
+		if e.UsersMgr() != nil {
+			if user, found := e.UsersMgr().GetByID(claims.Sub); found {
+				_ = json.NewEncoder(w).Encode(user.Public())
+				return
+			}
+		}
+		// Fallback for anonymous/setup_token access
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"username": claims.Username,
+			"role":     claims.Role,
+		})
+	})
+
+	// PUT /auth/password — change own password (any authenticated user).
+	mux.HandleFunc("/auth/password", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPut {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "use PUT"})
+			return
+		}
+		claims := checkJWTAuth(e, w, r)
+		if claims == nil {
+			return
+		}
+		var req struct {
+			CurrentPassword string `json:"current_password"`
+			NewPassword     string `json:"new_password"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 2048)).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON"})
+			return
+		}
+		user, found := e.UsersMgr().GetByID(claims.Sub)
+		if !found {
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "user not found"})
+			return
+		}
+		if !engine.CheckPassword(user.PasswordHash, req.CurrentPassword) {
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "current password is incorrect"})
+			return
+		}
+		hash, err := engine.HashPassword(req.NewPassword)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		user.PasswordHash = hash
+		if err := e.UsersMgr().UpdateUser(user); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "password changed"})
+	})
+
+	// POST /auth/reset-password — reset a user's password using the setup_token.
+	// Allows password recovery without knowing the current password.
+	// Body: { "username": "...", "setup_token": "...", "new_password": "..." }
+	mux.HandleFunc("/auth/reset-password", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "use POST"})
+			return
+		}
+		setupToken := e.SetupToken()
+		if setupToken == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "no setup_token configured"})
+			return
+		}
+		var req struct {
+			Username    string `json:"username"`
+			SetupToken  string `json:"setup_token"`
+			NewPassword string `json:"new_password"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 2048)).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON"})
+			return
+		}
+		if req.Username == "" || req.SetupToken == "" || req.NewPassword == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "username, setup_token and new_password are required"})
+			return
+		}
+		if req.SetupToken != setupToken {
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid setup_token"})
+			return
+		}
+		user, found := e.UsersMgr().GetByUsername(req.Username)
+		if !found {
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "user not found"})
+			return
+		}
+		hash, err := engine.HashPassword(req.NewPassword)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		user.PasswordHash = hash
+		if err := e.UsersMgr().UpdateUser(user); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "password reset successful"})
+	})
+
+	// GET/PUT /auth/cluster-nodes — read/update stored cluster node URLs.
+	mux.HandleFunc("/auth/cluster-nodes", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodGet, "":
+			claims := checkJWTAuth(e, w, r)
+			if claims == nil {
+				return
+			}
+			nodes, err := e.GetClusterNodes(r.Context())
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"urls": nodes})
+		case http.MethodPut:
+			if !checkAdminAuth(e, w, r) {
+				return
+			}
+			var req struct {
+				URLs []string `json:"urls"`
+			}
+			if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON"})
+				return
+			}
+			if err := e.SetClusterNodes(r.Context(), req.URLs); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "use GET or PUT"})
+		}
+	})
+
+	// ── Users CRUD (B28) ──────────────────────────────────────────────────────
+	// GET    /users          → list all users (admin only)
+	// PUT    /users/{id}     → create/update user (admin only)
+	// DELETE /users/{id}     → delete user (admin only)
+	mux.HandleFunc("/users", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet || r.Method == "" {
+			if !checkAdminAuth(e, w, r) {
+				return
+			}
+			users := e.UsersMgr().List()
+			if users == nil {
+				users = []engine.UserPublic{}
+			}
+			_ = json.NewEncoder(w).Encode(users)
+			return
+		}
+		http.Error(w, `{"error":"use GET /users or PUT|DELETE /users/{id}"}`, http.StatusMethodNotAllowed)
+	})
+	mux.HandleFunc("/users/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id := strings.TrimPrefix(r.URL.Path, "/users/")
+		if id == "" {
+			http.Error(w, `{"error":"user id required"}`, http.StatusBadRequest)
+			return
+		}
+		switch r.Method {
+		case http.MethodPut:
+			if !checkAdminAuth(e, w, r) {
+				return
+			}
+			var req struct {
+				Username    string `json:"username"`
+				Password    string `json:"password,omitempty"`
+				Role        string `json:"role"`
+				DisplayName string `json:"display_name,omitempty"`
+				Disabled    bool   `json:"disabled,omitempty"`
+			}
+			if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON"})
+				return
+			}
+			if req.Username == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "username required"})
+				return
+			}
+			if req.Role == "" {
+				req.Role = "viewer"
+			}
+
+			// Check if this is an update or create
+			existing, isUpdate := e.UsersMgr().GetByID(id)
+			if isUpdate {
+				// Update existing user
+				existing.Username = req.Username
+				existing.Role = req.Role
+				existing.DisplayName = req.DisplayName
+				existing.Disabled = req.Disabled
+				if req.Password != "" {
+					hash, err := engine.HashPassword(req.Password)
+					if err != nil {
+						w.WriteHeader(http.StatusBadRequest)
+						_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+						return
+					}
+					existing.PasswordHash = hash
+				}
+				if err := e.UsersMgr().UpdateUser(existing); err != nil {
+					if errors.Is(err, storage.ErrSplitBrain) {
+						w.Header().Set("Retry-After", "10")
+						w.WriteHeader(http.StatusServiceUnavailable)
+						_ = json.NewEncoder(w).Encode(map[string]string{"error": "cluster lost quorum; writes paused"})
+						return
+					}
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+					return
+				}
+				_ = json.NewEncoder(w).Encode(existing.Public())
+			} else {
+				// Create new user
+				if req.Password == "" {
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": "password required for new user"})
+					return
+				}
+				hash, err := engine.HashPassword(req.Password)
+				if err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+					return
+				}
+				// Extract admin username from JWT for created_by
+				createdBy := "admin"
+				if claims := checkJWTAuth(e, w, r); claims != nil {
+					createdBy = claims.Username
+				}
+				user := engine.User{
+					ID:           id,
+					Username:     req.Username,
+					PasswordHash: hash,
+					Role:         req.Role,
+					DisplayName:  req.DisplayName,
+					CreatedAt:    time.Now().UTC().Format(time.RFC3339),
+					CreatedBy:    createdBy,
+					Disabled:     req.Disabled,
+				}
+				if err := e.UsersMgr().CreateUser(user); err != nil {
+					if errors.Is(err, storage.ErrSplitBrain) {
+						w.Header().Set("Retry-After", "10")
+						w.WriteHeader(http.StatusServiceUnavailable)
+						_ = json.NewEncoder(w).Encode(map[string]string{"error": "cluster lost quorum; writes paused"})
+						return
+					}
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+					return
+				}
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(user.Public())
+			}
+		case http.MethodDelete:
+			if !checkAdminAuth(e, w, r) {
+				return
+			}
+			deleted, err := e.UsersMgr().DeleteUser(id)
+			if err != nil {
+				if errors.Is(err, storage.ErrSplitBrain) {
+					w.Header().Set("Retry-After", "10")
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": "cluster lost quorum; writes paused"})
+					return
+				}
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			if !deleted {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"deleted": id})
+		default:
+			http.Error(w, `{"error":"use PUT or DELETE"}`, http.StatusMethodNotAllowed)
+		}
 	})
 
 	mux.HandleFunc("/status", func(w http.ResponseWriter, _ *http.Request) {
@@ -454,10 +927,60 @@ func main() {
 		// UI can show operators what code will actually run when this
 		// alert fires — channel definitions in the DB only carry the
 		// script *name*, not the source.
-		if strings.HasSuffix(path, "/script") && r.Method == http.MethodGet {
+		if strings.HasSuffix(path, "/script") {
 			name := strings.TrimSuffix(path, "/script")
 			if name == "" {
 				http.Error(w, `{"error":"channel name required"}`, http.StatusBadRequest)
+				return
+			}
+
+			// PUT /channels/{name}/script — upload script content; stored in DB as
+			// parameters["script_body"] and gossip-replicated to all nodes.
+			if r.Method == http.MethodPut {
+				if !checkAdminAuth(e, w, r) {
+					return
+				}
+				body, err := io.ReadAll(io.LimitReader(r.Body, 512*1024))
+				if err != nil {
+					http.Error(w, `{"error":"read body"}`, http.StatusBadRequest)
+					return
+				}
+				channels := e.NotificationChannels()
+				cfg, ok := channels[name]
+				if !ok {
+					// Create a new script channel with this content.
+					cfg = engine.AlertChannelConfig{
+						Type:       "script",
+						Parameters: map[string]string{},
+					}
+				}
+				if cfg.Parameters == nil {
+					cfg.Parameters = map[string]string{}
+				}
+				cfg.Parameters["script_body"] = string(body)
+				if err := e.UpsertNotificationChannel(name, cfg); err != nil {
+					if errors.Is(err, storage.ErrSplitBrain) {
+						w.Header().Set("Retry-After", "10")
+						w.WriteHeader(http.StatusServiceUnavailable)
+						_ = json.NewEncoder(w).Encode(map[string]string{"error": "cluster lost quorum; writes paused"})
+						return
+					}
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"name":   name,
+					"stored": "db",
+					"size":   len(body),
+				})
+				return
+			}
+
+			// GET /channels/{name}/script — return script content.
+			// Prefers DB-stored script_body over on-disk file.
+			if r.Method != http.MethodGet && r.Method != "" {
+				http.Error(w, `{"error":"use GET or PUT"}`, http.StatusMethodNotAllowed)
 				return
 			}
 			cfg, ok := e.NotificationChannels()[name]
@@ -471,11 +994,21 @@ func main() {
 				_ = json.NewEncoder(w).Encode(map[string]string{"error": "channel is not script type"})
 				return
 			}
+			// Prefer inline DB content.
+			if body, ok := cfg.Parameters["script_body"]; ok && body != "" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"name":    name,
+					"source":  "db",
+					"content": body,
+					"size":    len(body),
+				})
+				return
+			}
+			// Fall back to on-disk file.
 			scriptName := name
 			if p, ok := cfg.Parameters["script"]; ok && p != "" {
 				scriptName = strings.TrimSuffix(strings.TrimSuffix(p, ".sh"), ".ps1")
 			}
-			// Try .sh first, then .ps1.
 			base := filepath.Join(engine.AlertScriptsDir(), scriptName)
 			var foundPath, content string
 			var foundErr error
@@ -493,15 +1026,16 @@ func main() {
 			if foundPath == "" {
 				w.WriteHeader(http.StatusNotFound)
 				_ = json.NewEncoder(w).Encode(map[string]any{
-					"error":         "script file not found on disk",
+					"error":         "script not found: no db content and no file on disk",
 					"expected_base": base,
-					"hint":          "create " + base + ".sh (or .ps1 on Windows) and ensure the directory is readable by the netwatch process",
+					"hint":          "upload via PUT /channels/" + name + "/script or create " + base + ".sh",
 					"io_error":      foundErrString(foundErr),
 				})
 				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"name":    name,
+				"source":  "disk",
 				"path":    foundPath,
 				"content": content,
 				"size":    len(content),
@@ -537,7 +1071,7 @@ func main() {
 			if !checkAdminAuth(e, w, r) {
 				return
 			}
-			body, err := io.ReadAll(io.LimitReader(r.Body, 8192))
+			body, err := io.ReadAll(io.LimitReader(r.Body, 512*1024))
 			if err != nil {
 				http.Error(w, `{"error":"read body"}`, http.StatusBadRequest)
 				return
@@ -990,7 +1524,7 @@ func main() {
 	// PUT  /cluster/config — distribute a partial SharedConfig to all nodes.
 	// PUT body: JSON or YAML (Content-Type: application/json or application/x-yaml).
 	// Only shared fields are applied; node-specific fields are always ignored.
-	// PUT requires admin.token auth if configured.
+	// PUT requires admin.setup_token auth if configured.
 	mux.HandleFunc("/cluster/config", func(w http.ResponseWriter, r *http.Request) {
 		mgr := e.ClusterManager()
 		// GET: drift snapshot (open for read).
@@ -1069,7 +1603,7 @@ func main() {
 	})
 
 	// POST /cluster/config/sync — take this node's shared fields and push to peers.
-	// No body required. Requires admin.token auth if configured.
+	// No body required. Requires admin.setup_token auth if configured.
 	mux.HandleFunc("/cluster/config/sync", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, `{"error":"use POST"}`, http.StatusMethodNotAllowed)
@@ -1186,12 +1720,12 @@ func main() {
 
 		members := mgr.Members()
 		type nodeResult struct {
-			NodeName        string        `json:"node_name"`
-			HTTPAddr        string        `json:"http_addr,omitempty"`
-			IsSelf          bool          `json:"is_self"`
-			Reachable       bool          `json:"reachable"`
-			Error           string        `json:"error,omitempty"`
-			EffectiveConfig any           `json:"effective_config,omitempty"`
+			NodeName        string `json:"node_name"`
+			HTTPAddr        string `json:"http_addr,omitempty"`
+			IsSelf          bool   `json:"is_self"`
+			Reachable       bool   `json:"reachable"`
+			Error           string `json:"error,omitempty"`
+			EffectiveConfig any    `json:"effective_config,omitempty"`
 		}
 
 		results := make([]nodeResult, len(members))
@@ -1261,6 +1795,201 @@ func main() {
 			"local_node": e.NodeAlias(),
 			"nodes":      results,
 		})
+	})
+
+	// GET /logs — return parsed JSON log lines with optional filters.
+	// Query params: level (debug|info|warn|error), since (RFC3339), limit (int, default 500), search (substring)
+	mux.HandleFunc("/logs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodGet && r.Method != "" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "use GET"})
+			return
+		}
+		if !checkAdminAuth(e, w, r) {
+			return
+		}
+		logPath := e.LogPath()
+		if logPath == "" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"lines": []any{}, "note": "log_path not configured"})
+			return
+		}
+
+		q := r.URL.Query()
+		levelFilter := strings.ToUpper(q.Get("level"))
+		searchFilter := strings.ToLower(q.Get("search"))
+		sinceStr := q.Get("since")
+		limitStr := q.Get("limit")
+		limit := 500
+		if n, err := strconv.Atoi(limitStr); err == nil && n > 0 && n <= 5000 {
+			limit = n
+		}
+		var sinceTime time.Time
+		if sinceStr != "" {
+			if t, err := time.Parse(time.RFC3339Nano, sinceStr); err == nil {
+				sinceTime = t
+			}
+		}
+
+		f, err := os.Open(logPath)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "cannot open log file: " + err.Error()})
+			return
+		}
+		defer f.Close()
+
+		type LogLine struct {
+			Time   string         `json:"time"`
+			Level  string         `json:"level"`
+			Msg    string         `json:"msg"`
+			Fields map[string]any `json:"fields,omitempty"`
+		}
+
+		var lines []LogLine
+		scanner := bufio.NewScanner(f)
+		scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+		for scanner.Scan() {
+			raw := scanner.Text()
+			if raw == "" {
+				continue
+			}
+			var obj map[string]any
+			if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+				continue
+			}
+			ts, _ := obj["time"].(string)
+			level, _ := obj["level"].(string)
+			msg, _ := obj["msg"].(string)
+
+			// Level filter
+			if levelFilter != "" && !strings.EqualFold(level, levelFilter) {
+				// also support "warn" matching "WARNING" etc
+				if !strings.HasPrefix(strings.ToUpper(level), levelFilter) {
+					continue
+				}
+			}
+			// Time filter
+			if !sinceTime.IsZero() && ts != "" {
+				if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+					if !t.After(sinceTime) {
+						continue
+					}
+				}
+			}
+			// Search filter
+			if searchFilter != "" {
+				combined := strings.ToLower(raw)
+				if !strings.Contains(combined, searchFilter) {
+					continue
+				}
+			}
+			// Collect extra fields
+			fields := make(map[string]any)
+			for k, v := range obj {
+				if k != "time" && k != "level" && k != "msg" {
+					fields[k] = v
+				}
+			}
+			lines = append(lines, LogLine{Time: ts, Level: level, Msg: msg, Fields: fields})
+		}
+
+		// Return last `limit` lines
+		if len(lines) > limit {
+			lines = lines[len(lines)-limit:]
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"node":  e.NodeAlias(),
+			"path":  logPath,
+			"lines": lines,
+			"total": len(lines),
+		})
+	})
+
+	// GET /logs/stream — SSE tail of the log file. Streams new JSON log lines as they appear.
+	// Query params: level (filter), search (substring filter)
+	mux.HandleFunc("/logs/stream", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != "" {
+			http.Error(w, `{"error":"use GET"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAdminAuth(e, w, r) {
+			return
+		}
+		logPath := e.LogPath()
+		if logPath == "" {
+			http.Error(w, "data: {\"error\":\"log_path not configured\"}\n\n", http.StatusOK)
+			return
+		}
+
+		q := r.URL.Query()
+		levelFilter := strings.ToUpper(q.Get("level"))
+		searchFilter := strings.ToLower(q.Get("search"))
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Accel-Buffering", "no")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming not supported", http.StatusInternalServerError)
+			return
+		}
+
+		f, err := os.Open(logPath)
+		if err != nil {
+			fmt.Fprintf(w, "data: {\"error\":\"cannot open log file\"}\n\n")
+			flusher.Flush()
+			return
+		}
+		defer f.Close()
+
+		// Seek to end — only stream new lines
+		if _, err := f.Seek(0, io.SeekEnd); err != nil {
+			fmt.Fprintf(w, "data: {\"error\":\"seek failed\"}\n\n")
+			flusher.Flush()
+			return
+		}
+
+		// Send a keepalive comment immediately
+		fmt.Fprintf(w, ": connected to %s\n\n", e.NodeAlias())
+		flusher.Flush()
+
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		keepalive := time.NewTicker(15 * time.Second)
+		defer keepalive.Stop()
+
+		scanner := bufio.NewScanner(f)
+		scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-keepalive.C:
+				fmt.Fprintf(w, ": keepalive\n\n")
+				flusher.Flush()
+			case <-ticker.C:
+				for scanner.Scan() {
+					raw := scanner.Text()
+					if raw == "" {
+						continue
+					}
+					var obj map[string]any
+					if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+						continue
+					}
+					level, _ := obj["level"].(string)
+					if levelFilter != "" && !strings.HasPrefix(strings.ToUpper(level), levelFilter) {
+						continue
+					}
+					if searchFilter != "" && !strings.Contains(strings.ToLower(raw), searchFilter) {
+						continue
+					}
+					fmt.Fprintf(w, "data: %s\n\n", raw)
+				}
+				flusher.Flush()
+			}
+		}
 	})
 
 	port := e.Port()
@@ -1844,15 +2573,16 @@ func formatBudget(sec int64) string {
 
 // ── Admin auth ────────────────────────────────────────────────────────────────
 
-// checkAdminAuth validates the Authorization: Bearer <token> header against
-// the configured admin.token. Returns true when the request is authorised.
-// When admin.token is empty, all requests are allowed (no auth required).
+// checkAdminAuth validates the Authorization: Bearer <token> header.
+// Authentication flow (B28):
+//  1. If setup_token is empty → unrestricted (no auth)
+//  2. Try to parse Bearer token as JWT → verify signature + expiry + admin role
+//  3. Fall back: compare raw token to setup_token (for setup flow)
 //
-// Future extension: replace this function with a middleware chain that checks
-// a user/role map once user management is added to AdminConfig.
+// Returns true when the request is authorised as admin.
 func checkAdminAuth(e *engine.Engine, w http.ResponseWriter, r *http.Request) bool {
-	token := e.AdminToken()
-	if token == "" {
+	setupToken := e.SetupToken()
+	if setupToken == "" {
 		return true // no token configured → unrestricted
 	}
 	auth := r.Header.Get("Authorization")
@@ -1866,13 +2596,57 @@ func checkAdminAuth(e *engine.Engine, w http.ResponseWriter, r *http.Request) bo
 		})
 		return false
 	}
-	if auth[len(prefix):] != token {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusForbidden)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid token"})
-		return false
+	bearerToken := auth[len(prefix):]
+
+	// Try JWT verification first
+	claims, err := engine.VerifyJWT(bearerToken, setupToken)
+	if err == nil {
+		// Valid JWT — check admin role
+		if claims.Role != "admin" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "admin role required"})
+			return false
+		}
+		return true
 	}
-	return true
+
+	// Fallback: raw setup_token match (used during /auth/setup flow)
+	if bearerToken == setupToken {
+		return true
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusForbidden)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid or expired token"})
+	return false
+}
+
+// checkJWTAuth validates a JWT token from the Authorization header.
+// Returns the claims if valid (any role), or writes a 401 and returns nil.
+func checkJWTAuth(e *engine.Engine, w http.ResponseWriter, r *http.Request) *engine.JWTClaims {
+	setupToken := e.SetupToken()
+	if setupToken == "" {
+		// No auth configured — return a synthetic admin claim
+		return &engine.JWTClaims{Role: "admin", Username: "anonymous"}
+	}
+	auth := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if len(auth) <= len(prefix) || auth[:len(prefix)] != prefix {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="netwatch"`)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Authorization: Bearer <jwt> header required"})
+		return nil
+	}
+	claims, err := engine.VerifyJWT(auth[len(prefix):], setupToken)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return nil
+	}
+	return claims
 }
 
 // parseSharedConfigBody parses a JSON or YAML body into a json.RawMessage
@@ -1982,18 +2756,18 @@ func cmdJoin(args []string) {
 		// agent could start. Operators can add `credentials_file:` to the
 		// config later if they need ${VAR} substitution.
 		m = map[string]interface{}{
-			"port":              "10240",
-			"state_file":        filepath.Join(filepath.Dir(path), "state.json"),
-			"log_path":          filepath.Join(filepath.Dir(path), "agent.log"),
-			"timeout":           5,
-			"max_retries":       2,
-			"retry_interval_sec": 30,
-			"probe_interval_sec": 60,
+			"port":                "10240",
+			"state_file":          filepath.Join(filepath.Dir(path), "state.json"),
+			"log_path":            filepath.Join(filepath.Dir(path), "agent.log"),
+			"timeout":             5,
+			"max_retries":         2,
+			"retry_interval_sec":  30,
+			"probe_interval_sec":  60,
 			"ticker_interval_sec": 5,
 			"reload_interval_sec": 30,
-			"notifications":      map[string]interface{}{},
-			"default_notify":     []string{},
-			"targets":            []interface{}{},
+			"notifications":       map[string]interface{}{},
+			"default_notify":      []string{},
+			"targets":             []interface{}{},
 		}
 	}
 
@@ -2217,4 +2991,13 @@ cluster:
 		KeyringKey: keyringKey,
 	})
 	return sb.String()
+}
+
+// generateUUID creates a UUID v4 string.
+func generateUUID() string {
+	b := make([]byte, 16)
+	_, _ = crypto_rand.Read(b)
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }

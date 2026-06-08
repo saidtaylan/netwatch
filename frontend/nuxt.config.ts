@@ -4,6 +4,18 @@ export default defineNuxtConfig({
   ssr: false,
   devtools: { enabled: true },
 
+  // Logs — requires direct HTTP to every node (firewall blocked in prod)
+  // Audit Log — not yet implemented
+  // Pages kept on disk for future use; excluded from routing here.
+  hooks: {
+    'pages:extend'(pages) {
+      const exclude = ['/logs', '/audit']
+      for (let i = pages.length - 1; i >= 0; i--) {
+        if (exclude.includes(pages[i].path ?? '')) pages.splice(i, 1)
+      }
+    },
+  },
+
   modules: [
     '@nuxtjs/tailwindcss',
     '@nuxtjs/color-mode',

@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/saidtaylan/netwatch/internal/cluster"
 	"sigs.k8s.io/yaml"
 )
 
@@ -122,6 +123,14 @@ func extractSharedMap(m map[string]interface{}) map[string]interface{} {
 	}
 	for _, k := range topLevelShared {
 		if v, ok := m[k]; ok {
+			// Strip node-specific `script` parameter from notification channels.
+			// The `script` field is a local filesystem path and legitimately
+			// differs between nodes. `script_body` (inline, DB-replicated) should
+			// remain. Without this, every cluster using file-based scripts would
+			// show permanent false drift.
+			if k == "notifications" {
+				v = stripScriptFileParams(v)
+			}
 			out[k] = v
 		}
 	}
@@ -144,6 +153,58 @@ func extractSharedMap(m map[string]interface{}) map[string]interface{} {
 		}
 	}
 	return out
+}
+
+// stripScriptFileParams removes the `script` key from every notification
+// channel's `parameters` map. The `script` value is a local filesystem path
+// and therefore legitimately differs between nodes; including it in the drift
+// hash would produce false positives. `script_body` (inline, DB-replicated)
+// is left intact.
+func stripScriptFileParams(notifRaw interface{}) interface{} {
+	notifMap, ok := notifRaw.(map[string]interface{})
+	if !ok {
+		return notifRaw
+	}
+	out := make(map[string]interface{}, len(notifMap))
+	for name, chanRaw := range notifMap {
+		chanMap, ok := chanRaw.(map[string]interface{})
+		if !ok {
+			out[name] = chanRaw
+			continue
+		}
+		chanCopy := make(map[string]interface{}, len(chanMap))
+		for k, v := range chanMap {
+			chanCopy[k] = v
+		}
+		if params, ok := chanCopy["parameters"].(map[string]interface{}); ok {
+			paramsCopy := make(map[string]interface{}, len(params))
+			for k, v := range params {
+				if k != "script" { // `script` is a local path → exclude from drift hash
+					paramsCopy[k] = v
+				}
+			}
+			chanCopy["parameters"] = paramsCopy
+		}
+		out[name] = chanCopy
+	}
+	return out
+}
+
+// SharedConfigHash returns a stable 16-hex-char hash of the node's shared
+// (cluster-wide) configuration. Unlike ConfigHashOf(rawYAML), this hash
+// excludes node-specific fields (port, node_alias, log_path, etc.) and
+// node-local notification script paths, so all nodes with identical cluster
+// config will produce the same hash.
+func (e *Engine) SharedConfigHash() string {
+	sc, err := e.ExtractSharedConfig()
+	if err != nil {
+		return ""
+	}
+	data, err := json.Marshal(sc)
+	if err != nil {
+		return ""
+	}
+	return cluster.ConfigHashOf(data)
 }
 
 // ── Apply: SharedConfig → this node's config.yaml ────────────────────────────
@@ -226,7 +287,7 @@ func mergeSharedMap(dst, src map[string]interface{}) {
 		"ticker_interval_sec": true, "probe_interval_sec": true,
 		"reload_interval_sec": true, "watchdog_threshold_sec": true,
 		"recovery_probes": true,
-		"notifications": true, "default_notify": true,
+		"notifications":   true, "default_notify": true,
 	}
 	clusterShared := map[string]bool{
 		"keyring": true, "peers": true, "expected_node_count": true,

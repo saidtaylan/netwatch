@@ -69,13 +69,13 @@ node_alias: "my-prober-node"
 	}
 }
 
-// TestConfig_AdminToken verifies admin.token field is recognized.
-func TestConfig_AdminToken(t *testing.T) {
+// TestConfig_SetupToken verifies admin.setup_token field is recognized.
+func TestConfig_SetupToken(t *testing.T) {
 	p := writeConfig(t, `
 port: "19004"
 timeout: 5
 admin:
-  token: "secret-token-abc"
+  setup_token: "secret-token-abc"
 `)
 	cfg, err := engine.ValidateConfigFile(p)
 	if err != nil {
@@ -84,18 +84,18 @@ admin:
 	if cfg.Admin == nil {
 		t.Fatal("expected Admin to be non-nil")
 	}
-	if cfg.Admin.Token != "secret-token-abc" {
-		t.Errorf("Admin.Token: want secret-token-abc, got %q", cfg.Admin.Token)
+	if cfg.Admin.SetupToken != "secret-token-abc" {
+		t.Errorf("Admin.SetupToken: want secret-token-abc, got %q", cfg.Admin.SetupToken)
 	}
 }
 
-// TestConfig_AdminTokenEmpty verifies admin section works when token is empty.
-func TestConfig_AdminTokenEmpty(t *testing.T) {
+// TestConfig_SetupTokenEmpty verifies admin section works when setup_token is empty.
+func TestConfig_SetupTokenEmpty(t *testing.T) {
 	p := writeConfig(t, `
 port: "19005"
 timeout: 5
 admin:
-  token: ""
+  setup_token: ""
 `)
 	cfg, err := engine.ValidateConfigFile(p)
 	if err != nil {
@@ -104,8 +104,8 @@ admin:
 	if cfg.Admin == nil {
 		t.Fatal("expected Admin section to be parsed")
 	}
-	if cfg.Admin.Token != "" {
-		t.Errorf("expected empty token, got %q", cfg.Admin.Token)
+	if cfg.Admin.SetupToken != "" {
+		t.Errorf("expected empty setup_token, got %q", cfg.Admin.SetupToken)
 	}
 }
 

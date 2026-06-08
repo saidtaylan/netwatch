@@ -129,11 +129,32 @@ func NewStorage(inner storage.StorageBackend, isolated IsolatedModeChecker, broa
 	if broadcaster == nil {
 		broadcaster = NoopBroadcaster{}
 	}
-	return &Storage{
+	s := &Storage{
 		inner:       inner,
 		isolated:    isolated,
 		broadcaster: broadcaster,
 		nodeName:    nodeName,
+	}
+	// Pre-seed seqCounter so NextVersion() always produces a Seq higher
+	// than any record already in the DB. Without this, a fresh restart
+	// would start at seq=1 and fail with ErrStaleWrite on any write to
+	// a table that contains records with seq > 1.
+	s.seedSeqFromStorage(inner)
+	return s
+}
+
+// seedSeqFromStorage scans all known tables and advances seqCounter past
+// the highest seq found in any record (including tombstones).
+func (s *Storage) seedSeqFromStorage(inner storage.StorageBackend) {
+	ctx := context.Background()
+	for _, table := range storage.KnownTables() {
+		recs, err := inner.List(ctx, table, storage.Filter{IncludeTombstones: true})
+		if err != nil {
+			continue // table may not exist yet (first boot) — skip
+		}
+		for _, rec := range recs {
+			s.observeSeq(rec.Version.Seq)
+		}
 	}
 }
 

@@ -1,0 +1,81 @@
+---
+# ──────────────────────────────────────────────────────────────────────────────
+# Role: netwatch-backend — tasks/main.yml
+# ──────────────────────────────────────────────────────────────────────────────
+
+- name: Create netwatch system group
+  ansible.builtin.group:
+    name: "{{ netwatch_group }}"
+    system: true
+    state: present
+
+- name: Create netwatch system user
+  ansible.builtin.user:
+    name: "{{ netwatch_user }}"
+    group: "{{ netwatch_group }}"
+    system: true
+    shell: /usr/sbin/nologin
+    create_home: false
+    state: present
+
+- name: Create netwatch config directory
+  ansible.builtin.file:
+    path: "{{ netwatch_config_dir }}"
+    state: directory
+    owner: "{{ netwatch_user }}"
+    group: "{{ netwatch_group }}"
+    mode: "0750"
+
+- name: Create netwatch state directory
+  ansible.builtin.file:
+    path: "{{ netwatch_state_dir }}"
+    state: directory
+    owner: "{{ netwatch_user }}"
+    group: "{{ netwatch_group }}"
+    mode: "0750"
+
+- name: Copy netwatch binary
+  ansible.builtin.copy:
+    src: "{{ netwatch_binary_src }}"
+    dest: "{{ netwatch_binary_dest }}"
+    owner: root
+    group: root
+    mode: "0755"
+  notify: restart netwatch-backend
+
+- name: Template netwatch config.yaml
+  ansible.builtin.template:
+    src: config.yaml.j2
+    dest: "{{ netwatch_config_dir }}/config.yaml"
+    owner: "{{ netwatch_user }}"
+    group: "{{ netwatch_group }}"
+    mode: "0640"
+  notify: restart netwatch-backend
+
+- name: Template netwatch-backend systemd unit
+  ansible.builtin.template:
+    src: netwatch-backend.service.j2
+    dest: /etc/systemd/system/netwatch-backend.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - reload systemd
+    - restart netwatch-backend
+
+- name: Enable and start netwatch-backend service
+  ansible.builtin.systemd:
+    name: netwatch-backend
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Wait for netwatch-backend health endpoint
+  ansible.builtin.uri:
+    url: "http://localhost:{{ netwatch_http_port }}/health"
+    method: GET
+    status_code: 200
+  register: health_check
+  retries: 10
+  delay: 3
+  until: health_check.status == 200

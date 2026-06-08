@@ -36,17 +36,19 @@ import (
 // corresponding CREATE TABLE in migrations/. Anything outside this set
 // is rejected with ErrTableNotKnown so typos can't silently break.
 var allowedTables = map[string]bool{
-	storage.TableSLOTargets:    true,
-	storage.TableApps:          true,
-	storage.TableNotifChannels: true,
-	storage.TableSilences:      true,
-	storage.TableMaintenance:   true,
-	storage.TableTargets:       true,
-	storage.TableAlerts:        true,
-	storage.TableAlertEvents:   true,
-	storage.TableSLOIncidents:  true,
-	storage.TableTargetStates:  true,
-	storage.TableAuditLog:      true,
+	storage.TableSLOTargets:      true,
+	storage.TableApps:            true,
+	storage.TableNotifChannels:   true,
+	storage.TableSilences:        true,
+	storage.TableMaintenance:     true,
+	storage.TableTargets:         true,
+	storage.TableAlerts:          true,
+	storage.TableAlertEvents:     true,
+	storage.TableSLOIncidents:    true,
+	storage.TableTargetStates:    true,
+	storage.TableAuditLog:        true,
+	storage.TableUsers:           true, // B28
+	storage.TableFrontendSettings: true, // B28
 }
 
 // Storage is the SQLite-backed implementation of storage.StorageBackend.
@@ -247,12 +249,15 @@ func (s *Storage) Delete(ctx context.Context, table, id string, ver storage.Vers
 		}
 	}
 
+	// Use 'null' (valid JSON) instead of '' so expression-based indexes like
+	// users_username (json_extract(payload,'$.username')) don't throw
+	// "malformed JSON" when SQLite evaluates the index for tombstone rows.
 	_, err = tx.ExecContext(ctx,
 		fmt.Sprintf(`
 			INSERT INTO %s (id, payload, seq, updated_at, updated_by, tombstone)
-			VALUES (?, '', ?, ?, ?, 1)
+			VALUES (?, 'null', ?, ?, ?, 1)
 			ON CONFLICT(id) DO UPDATE SET
-				payload = '',
+				payload = 'null',
 				seq = excluded.seq,
 				updated_at = excluded.updated_at,
 				updated_by = excluded.updated_by,

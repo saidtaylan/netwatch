@@ -21,10 +21,36 @@ export interface VersionResponse {
   build_time: string
 }
 
-// ── /auth/whoami ─────────────────────────────────────────────────────────────
+// ── Auth (B28) ──────────────────────────────────────────────────────────────
 
-export interface WhoAmIResponse {
-  role: 'admin' | 'anonymous'
+export interface AuthStatusResponse {
+  setup_completed: boolean
+  user_count: number
+}
+
+export interface AuthSetupRequest {
+  setup_token: string
+  username: string
+  password: string
+  display_name?: string
+  node_urls?: string[]
+}
+
+export interface AuthLoginResponse {
+  token: string
+  user: UserPublic
+  cluster_nodes?: string[]
+}
+
+export interface UserPublic {
+  id: string
+  username: string
+  role: 'admin' | 'operator' | 'viewer'
+  display_name?: string
+  created_at: string
+  created_by?: string
+  last_login_at?: string
+  disabled?: boolean
 }
 
 // ── /status ─────────────────────────────────────────────────────────────────

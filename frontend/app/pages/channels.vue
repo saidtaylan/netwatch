@@ -49,7 +49,7 @@ function templateFor(type: 'script' | 'mail' | 'webhook'): ChannelConfig {
   }
   return {
     type: 'script',
-    parameters: { script: 'channel-name' },
+    parameters: { script_body: '#!/bin/bash\n# Available env vars: NAME TARGET HOST PORT STATUS TYPE SEQ\necho "Alert: $NAME is $STATUS"' },
   }
 }
 
@@ -114,37 +114,56 @@ function badgeColor(type: string): string {
   return 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300'
 }
 
-// ── View script source ────────────────────────────────────────────────
-// Script channels point at a .sh/.ps1 file on disk (DB stores only the
-// channel definition, not the source). Resolves via the server-side
-// GET /channels/{name}/script endpoint so the user can audit what code
-// will actually run when this alert fires.
+// ── Script editor modal ───────────────────────────────────────────────
 interface ScriptSource {
   name:    string
-  path:    string
+  source:  'db' | 'disk'
+  path?:   string
   content: string
   size:    number
 }
 const scriptModal = reactive({
-  open: false,
+  open:    false,
   loading: false,
-  data: null as ScriptSource | null,
-  error: '' as string,
+  saving:  false,
+  data:    null as ScriptSource | null,
+  error:   '' as string,
   channel: '' as string,
+  draft:   '' as string,  // editable copy of content
 })
 
 async function openScript(name: string) {
-  scriptModal.open = true
+  scriptModal.open    = true
   scriptModal.loading = true
-  scriptModal.error = ''
-  scriptModal.data = null
+  scriptModal.error   = ''
+  scriptModal.data    = null
+  scriptModal.draft   = ''
   scriptModal.channel = name
   try {
-    scriptModal.data = await api.get<ScriptSource>(`/channels/${encodeURIComponent(name)}/script`)
+    scriptModal.data  = await api.get<ScriptSource>(`/channels/${encodeURIComponent(name)}/script`)
+    scriptModal.draft = scriptModal.data.content
   } catch (err: any) {
-    scriptModal.error = err?.data?.hint ?? err?.data?.error ?? err?.message ?? 'Failed to load script'
+    // No script yet — open empty editor so user can write one
+    scriptModal.draft = '#!/bin/bash\n# Available env vars: NAME TARGET HOST PORT STATUS TYPE SEQ\necho "Alert: $NAME is $STATUS"\n'
+    scriptModal.error = ''
   } finally {
     scriptModal.loading = false
+  }
+}
+
+async function saveScript() {
+  scriptModal.saving = true
+  try {
+    await api.put(`/channels/${encodeURIComponent(scriptModal.channel)}/script`, scriptModal.draft, {
+      headers: { 'Content-Type': 'text/plain' },
+    })
+    ui.addToast('success', `Script saved — synced to all nodes`)
+    scriptModal.open = false
+    await raw.refresh()
+  } catch (err: any) {
+    ui.addToast('error', `Save failed: ${err?.data?.error ?? err?.message ?? err}`)
+  } finally {
+    scriptModal.saving = false
   }
 }
 
@@ -181,7 +200,7 @@ function closeScript() {
           </div>
           <div class="flex gap-2">
             <button v-if="c.cfg.type === 'script'" @click="openScript(c.name)"
-              class="text-xs text-gray-600 dark:text-gray-300 hover:underline">View script</button>
+              class="text-xs text-blue-600 dark:text-blue-400 hover:underline font-medium">Edit Script</button>
             <template v-if="auth.token">
               <button @click="openEdit(c.name, c.cfg)" class="text-xs text-blue-600 hover:underline">Edit</button>
               <button @click="onDelete(c.name)" class="text-xs text-red-600 hover:underline">Delete</button>
@@ -203,55 +222,81 @@ function closeScript() {
       :title="modal.title"
       :initialJson="modal.initialJson"
       :submitLabel="modal.mode === 'create' ? 'Create' : 'Save'"
-      hint="type: script|mail|webhook. parameters keys are type-specific (script: script; webhook: url/format/timeout_sec; mail: smtp_host/port/from/to/tls_mode)."
+      hint="type: script|mail|webhook. For script type use 'Edit Script' button after creation to write the script in a dedicated editor (stored in DB, synced to all nodes). webhook: url/format/timeout_sec · mail: smtp_host/port/from/to/tls_mode."
       @submit="onSubmit"
       @cancel="modal.open = false"
     />
 
-    <!-- View script source modal — read-only audit view -->
+    <!-- Script editor modal — view + edit, stored in DB, gossip-replicated -->
     <Teleport to="body">
       <Transition name="fade">
         <div v-if="scriptModal.open" class="fixed inset-0 z-50 flex items-center justify-center">
           <div class="absolute inset-0 bg-black/40" @click="closeScript" />
-          <div class="relative z-10 bg-white dark:bg-gray-800 rounded-xl shadow-2xl p-6 w-full max-w-3xl mx-4">
-            <div class="flex items-start justify-between mb-3">
+          <div class="relative z-10 bg-white dark:bg-gray-800 rounded-xl shadow-2xl p-6 w-full max-w-3xl mx-4 flex flex-col gap-4">
+
+            <!-- Header -->
+            <div class="flex items-start justify-between">
               <div>
                 <h3 class="text-lg font-semibold text-gray-900 dark:text-white">
-                  Script for <code>{{ scriptModal.channel }}</code>
+                  Script — <code class="text-blue-600 dark:text-blue-400">{{ scriptModal.channel }}</code>
                 </h3>
-                <p v-if="scriptModal.data" class="text-xs text-gray-500 mt-1 font-mono">
-                  {{ scriptModal.data.path }} · {{ scriptModal.data.size }} bytes
-                </p>
+                <div class="flex items-center gap-2 mt-1">
+                  <span v-if="scriptModal.data?.source === 'db'"
+                    class="text-xs px-2 py-0.5 rounded-full bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300 font-medium">
+                    ✓ Stored in DB · synced to all nodes
+                  </span>
+                  <span v-else-if="scriptModal.data?.source === 'disk'"
+                    class="text-xs px-2 py-0.5 rounded-full bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-300 font-medium">
+                    ⚠ On disk only · save to sync across nodes
+                  </span>
+                  <span v-else-if="!scriptModal.loading"
+                    class="text-xs px-2 py-0.5 rounded-full bg-gray-100 dark:bg-gray-700 text-gray-500 font-medium">
+                    No script yet — write one below
+                  </span>
+                  <span v-if="scriptModal.data?.size" class="text-xs text-gray-400">
+                    {{ scriptModal.data.size }} bytes
+                  </span>
+                </div>
               </div>
               <button @click="closeScript" class="text-gray-400 hover:text-gray-600 text-xl leading-none">×</button>
             </div>
 
+            <!-- Loading -->
             <div v-if="scriptModal.loading" class="py-12 text-center text-sm text-gray-400 animate-pulse">
-              Loading script…
+              Loading…
             </div>
 
-            <div v-else-if="scriptModal.error" class="bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-300 dark:border-yellow-700 rounded-lg p-3 text-sm text-yellow-700 dark:text-yellow-300">
-              {{ scriptModal.error }}
-            </div>
-
-            <div v-else-if="scriptModal.data">
-              <pre class="font-mono text-xs bg-gray-900 text-gray-100 rounded-lg p-4 overflow-x-auto max-h-96 whitespace-pre">{{ scriptModal.data.content }}</pre>
-              <p class="mt-3 text-xs text-gray-500">
-                <strong>How scripts work:</strong> netwatch reads the channel
-                definition from the DB to learn the script <em>name</em>,
-                then looks for <code>name.sh</code> (or <code>name.ps1</code>
-                on Windows) on disk in this node's
-                <code>notifications/</code> directory. The DB does not store
-                the file content — edit the file on disk to change behavior.
+            <!-- Editor -->
+            <div v-else class="flex flex-col gap-2">
+              <textarea
+                v-model="scriptModal.draft"
+                rows="16"
+                spellcheck="false"
+                class="w-full font-mono text-xs bg-gray-900 text-gray-100 rounded-lg p-4 resize-y focus:outline-none focus:ring-2 focus:ring-blue-500 leading-relaxed"
+                placeholder="#!/bin/bash&#10;echo &quot;Alert: $NAME is $STATUS&quot;"
+              />
+              <p class="text-xs text-gray-500 dark:text-gray-400">
+                Available env vars: <code>NAME TARGET HOST PORT STATUS TYPE SEQ NODE_ALIAS SCOPE</code>
+                · Saved content is stored in the DB and gossip-replicated to all nodes within seconds.
               </p>
             </div>
 
-            <div class="mt-5 flex justify-end">
+            <!-- Footer -->
+            <div class="flex justify-end gap-2">
               <button @click="closeScript"
                 class="px-4 py-2 text-sm rounded-lg bg-gray-100 hover:bg-gray-200 dark:bg-gray-700 dark:hover:bg-gray-600 transition">
-                Close
+                Cancel
+              </button>
+              <button
+                v-if="!scriptModal.loading"
+                @click="saveScript"
+                :disabled="scriptModal.saving || !scriptModal.draft.trim()"
+                class="px-4 py-2 text-sm rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium transition disabled:opacity-50"
+              >
+                {{ scriptModal.saving ? 'Saving…' : 'Save & Sync to All Nodes' }}
               </button>
             </div>
+
           </div>
         </div>
       </Transition>

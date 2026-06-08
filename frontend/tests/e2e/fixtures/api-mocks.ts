@@ -47,7 +47,31 @@ export async function mockAllRoutes(page: Page) {
 
   await page.route(`${base}/health`,       r => r.fulfill({ json: { status: 'ok' } }))
   await page.route(`${base}/version`,      r => r.fulfill({ json: { version: 'e2e', build_time: '' } }))
+  // Legacy whoami (still mocked for older specs)
   await page.route(`${base}/auth/whoami`,  r => r.fulfill({ json: { role: 'admin' } }))
+
+  // ── B28 JWT auth endpoints ────────────────────────────────────────────────
+  const adminUser = {
+    id: 'u-e2e-1', username: 'admin', role: 'admin', display_name: 'E2E Admin',
+    created_at: new Date().toISOString(),
+  }
+  // setup_completed starts false; flipped after successful /auth/setup
+  let setupCompleted = false
+  await page.route(`${base}/auth/status`, r => r.fulfill({
+    json: { setup_completed: setupCompleted, user_count: setupCompleted ? 1 : 0 },
+  }))
+  await page.route(`${base}/auth/setup`, async r => {
+    if (r.request().method() !== 'POST') return r.continue()
+    setupCompleted = true
+    r.fulfill({ json: { token: 'jwt-e2e', user: adminUser, cluster_nodes: [base] } })
+  })
+  await page.route(`${base}/auth/login`, async r => {
+    if (r.request().method() !== 'POST') return r.continue()
+    r.fulfill({ json: { token: 'jwt-e2e', user: adminUser, cluster_nodes: [base] } })
+  })
+  await page.route(`${base}/auth/me`, r => r.fulfill({ json: adminUser }))
+  await page.route(`${base}/auth/cluster-nodes`, r => r.fulfill({ json: { urls: [base] } }))
+  await page.route(`${base}/users`, r => r.fulfill({ json: [adminUser] }))
   await page.route(`${base}/fleet/status`, r => r.fulfill({ json: FLEET }))
   await page.route(`${base}/topology`,     r => r.fulfill({ json: { targets: {} } }))
   await page.route(`${base}/slo`,          r => r.fulfill({ status: 503, json: { error: 'disabled' } }))

@@ -1,7 +1,7 @@
 # netwatch — Kullanıcı Rehberi
 
 Bu rehber netwatch'ı hiç görmemiş birisinin uygulamayı anlayıp kurabilmesi için yazılmıştır.
-Teknik ayrıntılar için `README.md`, geliştirici notları için `CLAUDE.md`.
+Teknik ayrıntılar için `README.md` ve `backend/README.md`.
 
 ---
 

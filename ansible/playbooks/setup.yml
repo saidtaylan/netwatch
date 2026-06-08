@@ -1,0 +1,25 @@
+---
+# ──────────────────────────────────────────────────────────────────────────────
+# netwatch — main deployment playbook
+#
+# Usage:
+#   ansible-playbook playbooks/setup.yml -i inventory/hosts.ini
+#
+# Run tags individually:
+#   --tags backend    Deploy / update backend nodes only
+#   --tags frontend   Deploy / update frontend only
+# ──────────────────────────────────────────────────────────────────────────────
+
+- name: Deploy netwatch backend nodes
+  hosts: netwatch_nodes
+  become: true
+  tags: backend
+  roles:
+    - role: ../roles/netwatch-backend
+
+- name: Deploy netwatch frontend
+  hosts: netwatch_frontend
+  become: true
+  tags: frontend
+  roles:
+    - role: ../roles/netwatch-frontend

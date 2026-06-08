@@ -1,0 +1,9 @@
+---
+# ──────────────────────────────────────────────────────────────────────────────
+# Role: netwatch-frontend — handlers/main.yml
+# ──────────────────────────────────────────────────────────────────────────────
+
+- name: reload nginx
+  ansible.builtin.systemd:
+    name: nginx
+    state: reloaded

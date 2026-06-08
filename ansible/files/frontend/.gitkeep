@@ -1,0 +1,3 @@
+# Place the pre-built Nuxt SPA static files here.
+# Copy from frontend/.output/public/ after running `pnpm build`.
+# See README.md for instructions.

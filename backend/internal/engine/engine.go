@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/saidtaylan/netwatch/internal/cluster"
+	"github.com/saidtaylan/netwatch/internal/storage"
 	gossipstore "github.com/saidtaylan/netwatch/internal/storage/gossip"
 	"sigs.k8s.io/yaml"
 )
@@ -184,7 +186,7 @@ func (t Target) typeKey() string { return t.Type + "|" + t.key() }
 
 // Config is the top-level configuration structure.
 type Config struct {
-	Port      string `json:"port"`
+	Port string `json:"port"`
 	// NodeAlias is an optional human-readable label for this agent instance.
 	// Appears in Prometheus metric labels (label name "app_name") and alert env vars
 	// (NODE_ALIAS). Omitting it is fine — metrics and alerts still work without it.
@@ -251,11 +253,12 @@ type Config struct {
 // If Token is empty (default), write endpoints are unrestricted — appropriate
 // for deployments where network-level access controls are sufficient.
 type AdminConfig struct {
-	// Token is the required Bearer token for write-capable admin endpoints
-	// (PUT /cluster/config, POST /cluster/config/sync, POST /cluster/keyring/rotate,
-	// POST /cluster/leave). Supports ${VAR} substitution from credentials_file.
+	// SetupToken is the setup token for initial admin user creation and JWT signing.
+	// Required for write-capable admin endpoints (PUT /cluster/config,
+	// POST /cluster/config/sync, POST /cluster/keyring/rotate, POST /cluster/leave).
+	// Supports ${VAR} substitution from credentials_file.
 	// When empty, those endpoints accept any request without authentication.
-	Token string `json:"token,omitempty"`
+	SetupToken string `json:"setup_token,omitempty"`
 
 	// CORSOrigin is the value for the Access-Control-Allow-Origin header.
 	// When empty, the server defaults to "*" (permissive).
@@ -263,14 +266,22 @@ type AdminConfig struct {
 	CORSOrigin string `json:"cors_origin,omitempty"`
 }
 
-// AdminToken returns the configured admin token (empty = no auth required).
-func (e *Engine) AdminToken() string {
+// LogPath returns the absolute path of the structured JSON log file.
+// Returns an empty string if log_path is not configured (stdout-only mode).
+func (e *Engine) LogPath() string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.cfg.LogPath
+}
+
+// SetupToken returns the configured setup token (empty = no auth required).
+func (e *Engine) SetupToken() string {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	if e.cfg.Admin == nil {
 		return ""
 	}
-	return e.cfg.Admin.Token
+	return e.cfg.Admin.SetupToken
 }
 
 // CORSOrigin returns the configured CORS origin (empty = use "*").
@@ -656,9 +667,9 @@ type Engine struct {
 	pending   map[string]PendingEntry   // soft-down queue; RAM only; key = target.typeKey()
 
 	// Per-target probe goroutine management.
-	probesMu      sync.Mutex
-	probeCancel   map[string]context.CancelFunc // key = target.key()
-	probeFastCheck map[string]chan struct{}       // key = target.key(); co-prober soft-down trigger
+	probesMu       sync.Mutex
+	probeCancel    map[string]context.CancelFunc // key = target.key()
+	probeFastCheck map[string]chan struct{}      // key = target.key(); co-prober soft-down trigger
 
 	// pendingRecovery tracks targets in SOFT_UP state — i.e. hard_down targets
 	// that have seen at least one successful probe but haven't yet reached the
@@ -731,6 +742,11 @@ type Engine struct {
 	// Consulted by shouldAlert via IsSilenced to suppress alerts that
 	// match operator-defined silence rules.
 	silencesMgr *silencesManager
+
+	// usersMgr is the storage-backed user account manager (B28).
+	// Manages username/password auth, roles, and JWT-based sessions.
+	// nil before Init() completes.
+	usersMgr *usersManager
 
 	// targetsMgr is the storage-backed target registry (B24.6).
 	// When non-nil, it owns the canonical target list — the engine's
@@ -859,9 +875,9 @@ func New(hostname string, runner AlertRunner, configPath string) *Engine {
 	}
 
 	e := &Engine{
-		hostname:    hostname,
-		alertRunner: runner,
-		configPath:  configPath,
+		hostname:        hostname,
+		alertRunner:     runner,
+		configPath:      configPath,
 		lastKnown:       make(map[string]PersistedState),
 		pending:         make(map[string]PendingEntry),
 		pendingRecovery: make(map[string]int),
@@ -895,15 +911,15 @@ func (e *Engine) NodeAlias() string {
 // The pipeline mirrors what LoadConfig does for the targets section so
 // the storage path produces the same observable state as the legacy
 // config-driven path:
-//   1. Validate targets (cycles, dependency refs)
-//   2. Validate notify channel references against live channels
-//   3. Build dependency graph
-//   4. Purge state for removed/disabled targets
-//   5. Rebuild localProbeIDs
-//   6. Swap into e.cfg.Targets, e.topoGraph, e.localProbeIDs
-//   7. Rebuild app index (apps may reference new/removed targets)
-//   8. Recompute cluster prober assignments
-//   9. Restart probe goroutines for added/removed targets
+//  1. Validate targets (cycles, dependency refs)
+//  2. Validate notify channel references against live channels
+//  3. Build dependency graph
+//  4. Purge state for removed/disabled targets
+//  5. Rebuild localProbeIDs
+//  6. Swap into e.cfg.Targets, e.topoGraph, e.localProbeIDs
+//  7. Rebuild app index (apps may reference new/removed targets)
+//  8. Recompute cluster prober assignments
+//  9. Restart probe goroutines for added/removed targets
 //
 // Errors abort the swap — the previous target set stays live.
 func (e *Engine) applyTargetsReconciliation(newTargets []Target) error {
@@ -1146,6 +1162,9 @@ func (e *Engine) Shutdown() {
 		if e.silencesMgr != nil {
 			e.silencesMgr.Close()
 		}
+		if e.usersMgr != nil {
+			e.usersMgr.Close()
+		}
 		if e.sloMgr != nil {
 			e.sloMgr.Close()
 		}
@@ -1298,6 +1317,55 @@ func (e *Engine) ApplyMaintenanceCancel(id string) error {
 		return nil
 	}
 	return e.maintMgr.Cancel(id)
+}
+
+// ── Users management public API (B28) ─────────────────────────────────────────
+
+// UsersMgr returns the storage-backed user manager. Returns nil if Init()
+// has not yet run.
+func (e *Engine) UsersMgr() *usersManager {
+	return e.usersMgr
+}
+
+// SetupCompleted returns true when at least one user exists in the DB.
+func (e *Engine) SetupCompleted() bool {
+	if e.usersMgr == nil {
+		return false
+	}
+	return e.usersMgr.SetupCompleted()
+}
+
+// GetClusterNodes returns the stored cluster node URLs from frontend_settings.
+func (e *Engine) GetClusterNodes(ctx context.Context) ([]string, error) {
+	if e.storage == nil {
+		return nil, nil
+	}
+	rec, err := e.storage.Get(ctx, storage.TableFrontendSettings, "cluster_nodes")
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var fs FrontendSettings
+	if err := json.Unmarshal(rec.Payload, &fs); err != nil {
+		return nil, err
+	}
+	return fs.URLs, nil
+}
+
+// SetClusterNodes stores the cluster node URLs in frontend_settings.
+func (e *Engine) SetClusterNodes(ctx context.Context, urls []string) error {
+	if e.storage == nil {
+		return fmt.Errorf("storage not initialized")
+	}
+	fs := FrontendSettings{ID: "cluster_nodes", URLs: urls}
+	payload, err := json.Marshal(fs)
+	if err != nil {
+		return err
+	}
+	ver := e.storage.NextVersion()
+	return e.storage.Upsert(ctx, storage.TableFrontendSettings, "cluster_nodes", payload, ver)
 }
 
 // ── Targets registry public API (B24.6) ───────────────────────────────────────
@@ -1702,7 +1770,6 @@ func (e *Engine) LoadConfig() error {
 	}
 	e.stateMu.Unlock()
 
-
 	if changed {
 		e.persistState()
 	}
@@ -1745,7 +1812,7 @@ func (e *Engine) LoadConfig() error {
 	// P1.5: inform the cluster manager of this node's config fingerprint so it
 	// can broadcast and detect drift against peers.
 	if e.clusterMgr != nil {
-		hash := cluster.ConfigHashOf(raw)
+		hash := e.SharedConfigHash()
 		e.clusterMgr.SetLocalConfigInfo(hash, int64(len(raw)), time.Now())
 	}
 
@@ -1835,8 +1902,13 @@ func (e *Engine) Init() error {
 	// from the first state transition. Skipped when cluster.enabled=false.
 	e.mu.RLock()
 	clusterCfg := e.cfg.Cluster
+	httpPort := e.cfg.Port
 	e.mu.RUnlock()
 	if clusterCfg.Enabled {
+		// Stamp the HTTP port into the cluster config so it gets gossiped via
+		// NodeMeta. Peers need this to build URLs back to us for cross-node
+		// aggregation (Cluster Sync diff endpoint).
+		clusterCfg.HTTPPort = httpPort
 		mgr, err := cluster.New(clusterCfg)
 		if err != nil {
 			return fmt.Errorf("cluster: %w", err)
@@ -1849,7 +1921,7 @@ func (e *Engine) Init() error {
 		raw := e.rawConfigBytes
 		e.mu.RUnlock()
 		if len(raw) > 0 {
-			hash := cluster.ConfigHashOf(raw)
+			hash := e.SharedConfigHash()
 			e.clusterMgr.SetLocalConfigInfo(hash, int64(len(raw)), time.Now())
 		}
 
@@ -1997,6 +2069,15 @@ func (e *Engine) Init() error {
 	e.silencesMgr = silMgr
 	go e.runSilencesPruner(rootCtx)
 
+	// Users manager — storage-backed (B28). Manages user accounts for
+	// JWT-based authentication. No seed from config.yaml; first admin
+	// user is created via POST /auth/setup.
+	usersMgr, usersErr := newUsersManager(rootCtx, e.storage)
+	if usersErr != nil {
+		return fmt.Errorf("users manager: %w", usersErr)
+	}
+	e.usersMgr = usersMgr
+
 	// Targets registry — storage-backed (B24.6). After Init() finishes,
 	// DB is authoritative for the target list; cfg.Targets becomes a
 	// seed-only field. Peer broadcasts arrive via the manager's Watch
@@ -2039,7 +2120,7 @@ func (e *Engine) Init() error {
 		go e.runSLOChecker(rootCtx)
 	}
 	_ = stateFilePath // (unused now that maintenance + SLO use storage; kept while
-	                  // state.json is still loaded by loadPersistedState above)
+	// state.json is still loaded by loadPersistedState above)
 
 	// Phase 13: pre-seed the cluster's proberAssignments map so the first
 	// reactive recompute does not see "all assignments new" and needlessly

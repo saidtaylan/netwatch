@@ -1,49 +1,87 @@
 /**
- * useAuth tests — single-admin-token flow.
+ * useAuth tests — JWT-based multi-user auth (B28/B31).
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { setActivePinia, createPinia } from 'pinia'
 import { useAuthStore } from '~/stores/auth'
 import { useNodesStore } from '~/stores/nodes'
 
-describe('useAuth.checkToken', () => {
+const adminUser = { id: 'u1', username: 'admin', role: 'admin' as const, display_name: 'Admin' }
+
+function seedActiveNode() {
+  const nodes = useNodesStore()
+  nodes.addNode('http://localhost:10240')
+  nodes.setActive('http://localhost:10240')
+  nodes.markHealthy('http://localhost:10240')
+}
+
+describe('useAuth.checkStatus', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
     vi.mocked($fetch).mockReset()
   })
 
-  it('returns role from /auth/whoami', async () => {
-    vi.mocked($fetch).mockResolvedValueOnce({ role: 'admin' })
+  it('returns setup_completed flag from /auth/status', async () => {
+    vi.mocked($fetch).mockResolvedValueOnce({ setup_completed: false, user_count: 0 })
     const { useAuth } = await import('~/composables/useAuth')
-    const { checkToken } = useAuth()
-    const role = await checkToken('http://localhost:10240', 'admin-token')
-    expect(role).toBe('admin')
+    const { checkStatus } = useAuth()
+    const status = await checkStatus('http://localhost:10240')
+    expect(status.setup_completed).toBe(false)
+    expect(status.user_count).toBe(0)
   })
 
-  it('returns anonymous when no token configured', async () => {
-    vi.mocked($fetch).mockResolvedValueOnce({ role: 'anonymous' })
+  it('hits /auth/status on the provided baseUrl', async () => {
+    vi.mocked($fetch).mockResolvedValueOnce({ setup_completed: true, user_count: 1 })
     const { useAuth } = await import('~/composables/useAuth')
-    const { checkToken } = useAuth()
-    const role = await checkToken('http://localhost:10240', '')
-    expect(role).toBe('anonymous')
+    const { checkStatus } = useAuth()
+    await checkStatus('http://localhost:10240')
+    expect(vi.mocked($fetch).mock.calls[0][0]).toBe('http://localhost:10240/auth/status')
+  })
+})
+
+describe('useAuth.setup', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.mocked($fetch).mockReset()
   })
 
-  it('omits Authorization header when token is empty', async () => {
-    vi.mocked($fetch).mockResolvedValueOnce({ role: 'anonymous' })
+  it('POSTs setup payload and stores returned JWT + user', async () => {
+    seedActiveNode()
+    vi.mocked($fetch).mockResolvedValueOnce({ token: 'jwt.x', user: adminUser })
+
     const { useAuth } = await import('~/composables/useAuth')
-    const { checkToken } = useAuth()
-    await checkToken('http://localhost:10240', '')
-    const callArgs = vi.mocked($fetch).mock.calls[0]
-    expect(callArgs[1]?.headers).toEqual({})
+    const { setup } = useAuth()
+    const resp = await setup('setup-token-abc', 'admin', 'pw12345678', 'Admin')
+
+    expect(resp.token).toBe('jwt.x')
+    const auth = useAuthStore()
+    expect(auth.token).toBe('jwt.x')
+    expect(auth.user).toEqual(adminUser)
+    expect(auth.isAdmin).toBe(true)
+
+    const [url, opts] = vi.mocked($fetch).mock.calls[0]
+    expect(url).toBe('http://localhost:10240/auth/setup')
+    expect(opts?.method).toBe('POST')
+    expect((opts?.body as any).setup_token).toBe('setup-token-abc')
+    expect((opts?.body as any).username).toBe('admin')
+    expect((opts?.body as any).password).toBe('pw12345678')
+    expect((opts?.body as any).node_urls).toEqual(['http://localhost:10240'])
   })
 
-  it('sends Bearer header when token provided', async () => {
-    vi.mocked($fetch).mockResolvedValueOnce({ role: 'admin' })
+  it('throws when no backend node available', async () => {
     const { useAuth } = await import('~/composables/useAuth')
-    const { checkToken } = useAuth()
-    await checkToken('http://localhost:10240', 'secret')
-    const callArgs = vi.mocked($fetch).mock.calls[0]
-    expect((callArgs[1]?.headers as any)?.Authorization).toBe('Bearer secret')
+    const { setup } = useAuth()
+    await expect(setup('t', 'u', 'p')).rejects.toThrow(/No backend node reachable/)
+  })
+
+  it('propagates backend error and does NOT mark as authenticated', async () => {
+    seedActiveNode()
+    vi.mocked($fetch).mockRejectedValueOnce(new Error('400'))
+
+    const { useAuth } = await import('~/composables/useAuth')
+    const { setup } = useAuth()
+    await expect(setup('bad', 'u', 'p')).rejects.toThrow()
+    expect(useAuthStore().isAuthenticated).toBe(false)
   })
 })
 
@@ -53,44 +91,48 @@ describe('useAuth.login', () => {
     vi.mocked($fetch).mockReset()
   })
 
-  it('stores token + role after successful verification', async () => {
-    const nodes = useNodesStore()
-    nodes.addNode('http://localhost:10240')
-    nodes.setActive('http://localhost:10240')
-    nodes.markHealthy('http://localhost:10240')
-
-    vi.mocked($fetch).mockResolvedValueOnce({ role: 'admin' })
+  it('stores JWT + user on success', async () => {
+    seedActiveNode()
+    vi.mocked($fetch).mockResolvedValueOnce({ token: 'jwt.y', user: adminUser })
 
     const { useAuth } = await import('~/composables/useAuth')
     const { login } = useAuth()
-    await login('admin-token')
+    await login('admin', 'pw12345678')
 
     const auth = useAuthStore()
-    expect(auth.token).toBe('admin-token')
-    expect(auth.role).toBe('admin')
-    expect(auth.isAuthenticated).toBe(true)
+    expect(auth.token).toBe('jwt.y')
+    expect(auth.user).toEqual(adminUser)
+  })
+
+  it('seeds cluster_nodes from login response', async () => {
+    seedActiveNode()
+    vi.mocked($fetch).mockResolvedValueOnce({
+      token: 'jwt.z', user: adminUser,
+      cluster_nodes: ['http://localhost:10240', 'http://peer:10240'],
+    })
+
+    const { useAuth } = await import('~/composables/useAuth')
+    const { login } = useAuth()
+    await login('admin', 'pw12345678')
+
+    const nodes = useNodesStore()
+    expect(nodes.configured.map(n => n.url)).toContain('http://peer:10240')
   })
 
   it('throws when no backend node available', async () => {
     const { useAuth } = await import('~/composables/useAuth')
     const { login } = useAuth()
-    await expect(login('any')).rejects.toThrow(/No backend node reachable/)
+    await expect(login('u', 'p')).rejects.toThrow(/No backend node reachable/)
   })
 
-  it('propagates checkToken failure (does NOT mark as auth)', async () => {
-    const nodes = useNodesStore()
-    nodes.addNode('http://localhost:10240')
-    nodes.setActive('http://localhost:10240')
-    nodes.markHealthy('http://localhost:10240')
-
+  it('propagates login failure (does NOT mark as auth)', async () => {
+    seedActiveNode()
     vi.mocked($fetch).mockRejectedValueOnce(new Error('401'))
 
     const { useAuth } = await import('~/composables/useAuth')
     const { login } = useAuth()
-    await expect(login('wrong-token')).rejects.toThrow()
-
-    const auth = useAuthStore()
-    expect(auth.isAuthenticated).toBe(false)
+    await expect(login('u', 'wrong')).rejects.toThrow()
+    expect(useAuthStore().isAuthenticated).toBe(false)
   })
 })
 
@@ -99,18 +141,16 @@ describe('useAuth.logout', () => {
     setActivePinia(createPinia())
   })
 
-  it('clears token + role (navigation tested in e2e)', async () => {
+  it('clears token + user (navigation tested in e2e)', async () => {
     const auth = useAuthStore()
-    auth.setToken('some-token', 'admin')
+    auth.setAuth('jwt', adminUser)
 
     const { useAuth } = await import('~/composables/useAuth')
     const { logout } = useAuth()
-    // logout returns a Promise (navigateTo). We don't await it because
-    // navigateTo behavior in unit-test environment depends on the Nuxt
-    // test runtime — e2e tests verify the redirect.
+    // navigateTo returns a Promise; not awaited (Nuxt runtime tested via e2e).
     logout()
 
     expect(auth.token).toBeNull()
-    expect(auth.role).toBe('anonymous')
+    expect(auth.user).toBeNull()
   })
 })

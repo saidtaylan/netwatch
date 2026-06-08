@@ -99,6 +99,8 @@ const (
 	TableSLOIncidents       = "slo_incidents"        // migrates from incidents.json
 	TableTargetStates       = "target_states"        // migrates from state.json (B20)
 	TableAuditLog           = "audit_log"            // B25, local-only
+	TableUsers              = "users"                // B28 — user accounts
+	TableFrontendSettings   = "frontend_settings"    // B28 — frontend config (cluster nodes etc.)
 )
 
 // KnownTables returns the full set of tables managed by the storage
@@ -116,5 +118,7 @@ func KnownTables() []string {
 		TableSLOIncidents,
 		TableTargetStates,
 		TableAuditLog,
+		TableUsers,
+		TableFrontendSettings,
 	}
 }

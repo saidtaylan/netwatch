@@ -1,52 +1,81 @@
 /**
- * useAuth — Simple single-admin-token auth.
+ * useAuth — JWT-based multi-user auth (B28).
  *
- * This is a self-hosted application. Auth is intentionally minimal:
- *   - One admin token (from config.yaml admin.token)
- *   - Token verified against GET /auth/whoami
- *   - Token stored in localStorage via Pinia persist
- *   - No user registration, no sessions, no RBAC
- *   - Future: LDAP integration may add multi-user when needed
+ * Auth flow:
+ *   1. /connect → enter node URLs
+ *   2. GET /auth/status → setup_completed?
+ *      - false → /setup (setup_token + create admin user)
+ *      - true  → /login (username + password)
+ *   3. JWT stored in auth store, sent as Bearer token
  */
-import type { WhoAmIResponse } from '~/types/api'
+import type { AuthStatusResponse, AuthLoginResponse } from '~/types/api'
 
 export const useAuth = () => {
   const store = useAuthStore()
+  const nodes = useNodesStore()
   const { ensureActive } = useNodeConnection()
 
-  /**
-   * Verify token against /auth/whoami.
-   * Returns 'admin' when token matches, 'anonymous' when no auth is configured.
-   * Throws on wrong token (401) or network error.
-   */
-  async function checkToken(baseUrl: string, token: string): Promise<'admin' | 'anonymous'> {
-    const headers: Record<string, string> = {}
-    if (token) headers['Authorization'] = `Bearer ${token}`
-    const data = await $fetch<WhoAmIResponse>(`${baseUrl}/auth/whoami`, {
-      headers,
-      timeout: 5000,
-    })
-    return data.role
+  /** Check if backend has completed initial setup */
+  async function checkStatus(baseUrl: string): Promise<AuthStatusResponse> {
+    return $fetch<AuthStatusResponse>(`${baseUrl}/auth/status`, { timeout: 5000 })
   }
 
-  /** Connect + verify: call after selectActiveNode resolves. */
-  async function login(token: string): Promise<void> {
+  /** POST /auth/setup — create first admin user */
+  async function setup(setupToken: string, username: string, password: string, displayName?: string): Promise<AuthLoginResponse> {
     const baseUrl = await ensureActive()
-    if (!baseUrl) throw new Error('No backend node reachable. Check the URL(s) and try again.')
-    const role = await checkToken(baseUrl, token)
-    store.setToken(token, role)
+    if (!baseUrl) throw new Error('No backend node reachable.')
+
+    const nodeUrls = nodes.configured.map(n => n.url)
+    const resp = await $fetch<AuthLoginResponse>(`${baseUrl}/auth/setup`, {
+      method: 'POST',
+      body: {
+        setup_token: setupToken,
+        username,
+        password,
+        display_name: displayName || undefined,
+        node_urls: nodeUrls,
+      },
+      timeout: 10000,
+    })
+    store.setAuth(resp.token, resp.user)
+    return resp
+  }
+
+  /** POST /auth/login — username + password → JWT */
+  async function login(username: string, password: string): Promise<AuthLoginResponse> {
+    const baseUrl = await ensureActive()
+    if (!baseUrl) throw new Error('No backend node reachable.')
+
+    const resp = await $fetch<AuthLoginResponse>(`${baseUrl}/auth/login`, {
+      method: 'POST',
+      body: { username, password },
+      timeout: 10000,
+    })
+    store.setAuth(resp.token, resp.user)
+
+    // If the backend returned cluster nodes, update the nodes store
+    if (resp.cluster_nodes?.length) {
+      for (const url of resp.cluster_nodes) {
+        nodes.addNode(url)
+      }
+    }
+
+    return resp
   }
 
   function logout() {
     store.logout()
-    return navigateTo({ name: 'setup' })  // go back to setup, not login — single-user app
+    return navigateTo({ name: 'connect' })
   }
 
   return {
+    checkStatus,
+    setup,
     login,
     logout,
-    checkToken,
     isAuthenticated: computed(() => store.isAuthenticated),
-    isAdmin:         computed(() => store.isAdmin),
+    isAdmin: computed(() => store.isAdmin),
+    role: computed(() => store.role),
+    username: computed(() => store.username),
   }
 }

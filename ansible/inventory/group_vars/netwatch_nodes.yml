@@ -1,0 +1,24 @@
+---
+# ──────────────────────────────────────────────────────────────────────────────
+# netwatch — backend node variables (applies to [netwatch_nodes] group)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+# Empty string = write to journald stdout (recommended).
+# Set to an absolute path to write to a log file instead (e.g. /var/log/netwatch/netwatch.log).
+netwatch_log_path: ""
+
+# ── Probe settings ────────────────────────────────────────────────────────────
+netwatch_probe_interval_sec: 60   # How often each node runs probes (seconds)
+netwatch_max_retries: 3           # Retries before marking a target as down
+netwatch_timeout: 5               # Per-probe timeout in seconds
+
+# ── Cluster / gossip ──────────────────────────────────────────────────────────
+# probe_replication_factor: how many nodes cross-check a failing target.
+# Rule of thumb: 3 for small clusters, ceil(N/4) for larger ones.
+netwatch_probe_replication_factor: 3
+
+# NOTE: The gossip peer list is auto-built from the [netwatch_nodes] inventory
+# group by the config.yaml.j2 template. Every node that is NOT self is added
+# as a peer. You do not need to maintain a separate peer list — just keep
+# the inventory up to date and re-run the playbook.

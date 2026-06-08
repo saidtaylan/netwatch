@@ -25,6 +25,9 @@ async function submit() {
     await create(form.targetId.trim(), form.durationMs, form.reason.trim(), form.createdBy)
     showForm.value = false
     Object.assign(form, { targetId: '', reason: '' })
+  } catch (_) {
+    // useMaintenance.create() already shows an error toast; just close the form
+    showForm.value = false
   } finally {
     submitting.value = false
   }

@@ -1,7 +1,7 @@
 # netwatch — User Guide
 
 This guide is written for someone who has never seen netwatch before and wants to understand, install, and use it.
-For technical internals see `README.md`, for developer notes see `CLAUDE.md`.
+For technical internals see `README.md` and `backend/README.md`.
 
 ---
 

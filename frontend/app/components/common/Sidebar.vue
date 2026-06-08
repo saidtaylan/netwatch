@@ -1,6 +1,7 @@
 <script setup lang="ts">
 const ui     = useUIStore()
 const alerts = useAlertsStore()
+const auth   = useAuthStore()
 
 import type { RouteLocationNamedRaw } from 'vue-router'
 
@@ -11,6 +12,7 @@ interface NavItem {
   badge?:   string | number
   disabled?: boolean
   soon?:    boolean
+  adminOnly?: boolean
 }
 
 const sections: { title?: string; items: NavItem[] }[] = [
@@ -25,10 +27,13 @@ const sections: { title?: string; items: NavItem[] }[] = [
   {
     title: 'Observability',
     items: [
-      { label: 'Alerts',    icon: '🔔', to: { name: 'alerts' } },
-      { label: 'SLO',       icon: '📊', to: { name: 'slo' } },
+      { label: 'Alerts',      icon: '🔔', to: { name: 'alerts' } },
+      { label: 'SLO',         icon: '📊', to: { name: 'slo' } },
       { label: 'Geo Latency', icon: '🌍', to: { name: 'geo' } },
-      { label: 'Audit Log', icon: '📋', to: { name: 'audit' },    soon: true },
+      // Audit Log — henüz implement edilmedi, ileride eklenecek
+      // { label: 'Audit Log', icon: '📋', to: { name: 'audit' }, soon: true },
+      // Logs — her node'a direkt HTTP erişimi gerektiriyor, prod'da firewall engeller
+      // { label: 'Logs', icon: '📜', to: { name: 'logs' }, adminOnly: true },
     ],
   },
   {
@@ -48,6 +53,12 @@ const sections: { title?: string; items: NavItem[] }[] = [
     ],
   },
   {
+    title: 'Administration',
+    items: [
+      { label: 'Users', icon: '👥', to: { name: 'users' }, adminOnly: true },
+    ],
+  },
+  {
     title: 'Settings',
     items: [
       { label: 'Backend Nodes', icon: '🖥️', to: { name: 'settings-nodes' } },
@@ -56,6 +67,12 @@ const sections: { title?: string; items: NavItem[] }[] = [
     ],
   },
 ]
+
+const visibleSections = computed(() =>
+  sections
+    .map(s => ({ ...s, items: s.items.filter(it => !it.adminOnly || auth.isAdmin) }))
+    .filter(s => s.items.length > 0),
+)
 
 const alertCount = computed(() => alerts.unresolvedCount)
 </script>
@@ -79,7 +96,7 @@ const alertCount = computed(() => alerts.unresolvedCount)
 
     <!-- Nav -->
     <nav class="flex-1 py-2">
-      <template v-for="section in sections" :key="section.title">
+      <template v-for="section in visibleSections" :key="section.title">
         <p
           v-if="section.title && !ui.sidebarCollapsed"
           class="px-3 pt-3 pb-1 text-xs font-semibold uppercase tracking-wider text-gray-500"

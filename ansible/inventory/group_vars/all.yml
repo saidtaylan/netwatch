@@ -1,0 +1,36 @@
+---
+# ──────────────────────────────────────────────────────────────────────────────
+# netwatch — global variables (applies to all hosts)
+# ──────────────────────────────────────────────────────────────────────────────
+
+netwatch_version: "1.0.0"
+
+# ── Binary (backend) ──────────────────────────────────────────────────────────
+# Pre-built Linux/amd64 binary lives in ansible/files/netwatch
+# Build with: GOOS=linux GOARCH=amd64 go build -o netwatch ./cmd/linux/
+netwatch_binary_src: "{{ playbook_dir }}/../files/netwatch"
+netwatch_binary_dest: "/usr/local/bin/netwatch"
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+netwatch_config_dir: "/etc/netwatch"
+netwatch_state_dir: "/var/lib/netwatch"
+
+# ── System user / group ───────────────────────────────────────────────────────
+netwatch_user: "netwatch"
+netwatch_group: "netwatch"
+
+# ── Network ports ─────────────────────────────────────────────────────────────
+netwatch_http_port: 10240    # REST API / health check
+netwatch_gossip_port: 7946   # Memberlist gossip (TCP + UDP)
+
+# ── Security ──────────────────────────────────────────────────────────────────
+# IMPORTANT: Change this before deploying. Must be identical on ALL nodes.
+# Used for first admin setup and JWT signing.
+netwatch_setup_token: "CHANGE_ME_strong_secret"
+
+# ── Frontend ──────────────────────────────────────────────────────────────────
+# Pre-built Nuxt SPA static files live in ansible/files/frontend/
+# Build with: cd frontend && pnpm build  (output at frontend/.output/public/)
+netwatch_frontend_dir: "/opt/netwatch-frontend"
+netwatch_frontend_src: "{{ playbook_dir }}/../files/frontend/"
+netwatch_frontend_port: 80

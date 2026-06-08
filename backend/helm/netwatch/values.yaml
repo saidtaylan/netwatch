@@ -56,7 +56,7 @@ gossip:
 # config: raw netwatch config.yaml content (will be placed in a ConfigMap).
 # At minimum you must provide targets: and cluster: sections.
 config: |
-  app_name: "netwatch-agent"
+  node_alias: "netwatch-agent"
   port: "10240"
   state_file: "/tmp/state.json"
   timeout: 5

@@ -1,0 +1,24 @@
+# {{ ansible_managed }}
+server {
+    listen {{ netwatch_frontend_port }};
+    server_name _;
+
+    root {{ netwatch_frontend_dir }};
+    index index.html;
+
+    # SPA fallback — all routes return index.html so the client-side router handles them
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Cache static assets aggressively (content-hashed filenames by Nuxt/Vite)
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # Security headers
+    add_header X-Frame-Options        "SAMEORIGIN"                        always;
+    add_header X-Content-Type-Options "nosniff"                           always;
+    add_header Referrer-Policy        "strict-origin-when-cross-origin"   always;
+}

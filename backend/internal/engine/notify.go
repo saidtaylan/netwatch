@@ -37,14 +37,37 @@ type scriptAlerter struct {
 }
 
 func (s *scriptAlerter) Send(env map[string]string) error {
+	merged := mergeVars(s.params, env)
+
+	// Inline script: content stored in DB, no filesystem dependency.
+	// Write to a temp file, execute, then remove.
+	if body, ok := s.params["script_body"]; ok && body != "" {
+		tmp, err := os.CreateTemp("", "netwatch-alert-*.sh")
+		if err != nil {
+			return fmt.Errorf("script inline: create temp: %w", err)
+		}
+		tmpPath := tmp.Name()
+		defer os.Remove(tmpPath)
+		if _, err := tmp.WriteString(body); err != nil {
+			tmp.Close()
+			return fmt.Errorf("script inline: write: %w", err)
+		}
+		tmp.Close()
+		if err := os.Chmod(tmpPath, 0700); err != nil {
+			return fmt.Errorf("script inline: chmod: %w", err)
+		}
+		// Runner appends ".sh"; strip it so runner finds the file correctly.
+		base := strings.TrimSuffix(tmpPath, ".sh")
+		return s.runner(base, merged)
+	}
+
+	// File-based fallback: existing behaviour.
 	var base string
 	if p, ok := s.params["script"]; ok && p != "" {
-		// strip extension if present — runner appends .sh/.ps1
 		base = strings.TrimSuffix(strings.TrimSuffix(p, ".sh"), ".ps1")
 	} else {
 		base = filepath.Join(alertScriptsDir(), s.name)
 	}
-	merged := mergeVars(s.params, env)
 	return s.runner(base, merged)
 }
 

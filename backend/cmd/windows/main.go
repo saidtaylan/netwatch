@@ -969,10 +969,10 @@ func formatBudget(sec int64) string {
 }
 
 // checkAdminAuth validates the Authorization: Bearer <token> header.
-// Returns true when the request is authorised (or when no token is configured).
+// Authentication flow (B28): JWT verification first, then raw setup_token fallback.
 func checkAdminAuth(e *engine.Engine, w http.ResponseWriter, r *http.Request) bool {
-	token := e.AdminToken()
-	if token == "" {
+	setupToken := e.SetupToken()
+	if setupToken == "" {
 		return true
 	}
 	auth := r.Header.Get("Authorization")
@@ -986,13 +986,29 @@ func checkAdminAuth(e *engine.Engine, w http.ResponseWriter, r *http.Request) bo
 		})
 		return false
 	}
-	if auth[len(prefix):] != token {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusForbidden)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid token"})
-		return false
+	bearerToken := auth[len(prefix):]
+
+	// Try JWT verification first
+	claims, err := engine.VerifyJWT(bearerToken, setupToken)
+	if err == nil {
+		if claims.Role != "admin" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "admin role required"})
+			return false
+		}
+		return true
 	}
-	return true
+
+	// Fallback: raw setup_token match
+	if bearerToken == setupToken {
+		return true
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusForbidden)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid or expired token"})
+	return false
 }
 
 // parseSharedConfigBody converts a JSON or YAML body to a json.RawMessage.
