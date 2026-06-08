@@ -1,21 +1,23 @@
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
-# Update GO_VERSION to match the `go` directive in go.mod.
-ARG GO_VERSION=1.24
+# Keep GO_VERSION in sync with the `go` directive in go.mod.
+ARG GO_VERSION=1.25
 ARG BINARY_NAME=netwatch
 
-FROM golang:${GO_VERSION}-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS builder
 
 ARG BINARY_NAME
+# Provided automatically by buildx for multi-arch builds (e.g. amd64, arm64).
+ARG TARGETARCH
 WORKDIR /src
 
 # Download dependencies in a separate layer for better cache utilisation.
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy source and build a statically linked, stripped binary.
+# Copy source and cross-compile a static, stripped binary for the target arch.
 # BinaryName is embedded at link time so CLI output uses the correct name.
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
     go build \
     -ldflags="-s -w -X github.com/saidtaylan/netwatch/internal/engine.BinaryName=${BINARY_NAME}" \
     -trimpath \

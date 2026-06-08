@@ -1,0 +1,67 @@
+name: Release — build & push container
+
+# Builds a multi-arch (amd64 + arm64) image and pushes it to GitHub Container
+# Registry (ghcr.io/<owner>/<repo>). Authentication uses the repository's built-in
+# GITHUB_TOKEN — no personal access token or manual `docker login` is required.
+#
+# Triggers:
+#   - pushing a tag like v1.2.3   → publishes :1.2.3, :1.2, :latest
+#   - manual run (workflow_dispatch) from the Actions tab → publishes :latest
+#
+# One-time setup after the first run: open the package at
+#   https://github.com/users/<owner>/packages/container/<repo>/settings
+# and set its visibility to Public (and link it to this repository).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  docker:
+    name: Build & push image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU (cross-arch emulation)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags & labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=netwatch
+            org.opencontainers.image.description=Self-hosted distributed network monitoring
+
+      - name: Build and push (amd64 + arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          file: backend/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
