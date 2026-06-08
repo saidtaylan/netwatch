@@ -12,6 +12,10 @@ import { defineConfig, devices } from '@playwright/test'
  */
 export default defineConfig({
   testDir: './tests/e2e',
+  // The live/ suite runs against a REAL running cluster (no mock server) and has
+  // its own config (playwright.live.config.ts). Exclude it from the default/CI
+  // run, which only uses the mock backend.
+  testIgnore: '**/live/**',
   fullyParallel: false,         // sequential — mock server is shared
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
