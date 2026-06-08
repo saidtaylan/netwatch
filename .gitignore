@@ -73,3 +73,6 @@ frontend-plan.md
 GUIDE_OWNER.md
 backend/CLUSTER_TESTING_GUIDE.md
 backend/tests/CLUSTER_REPORT.md
+
+# GIF intermediate frames (regenerate via the live tour spec)
+screenshots/frames/

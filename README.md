@@ -1,14 +1,42 @@
-# netwatch
+<div align="center">
 
-Self-hosted, distributed network monitoring with a web UI — no cloud, no agents-as-a-service.
+# 🛰️ netwatch
 
-![netwatch Cluster Overview](screenshots/cluster-overview.png)
+### Self-hosted, distributed network monitoring with a web UI
+**No cloud · no SaaS agents · no external database — just two binaries and a YAML file.**
 
-> Live Cluster Overview: a 5-node gossip cluster with healthy quorum, per-zone members, target up/down counts, and config-drift status — served from your own infrastructure.
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/saidtaylan/netwatch?color=success)](https://github.com/saidtaylan/netwatch/releases)
+[![CI](https://github.com/saidtaylan/netwatch/actions/workflows/ci.yml/badge.svg)](https://github.com/saidtaylan/netwatch/actions/workflows/ci.yml)
+[![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![UI: Nuxt](https://img.shields.io/badge/UI-Nuxt-00DC82?logo=nuxtdotjs&logoColor=white)](https://nuxt.com)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
+
+[**Features**](#features) · [**Why netwatch**](#the-problems-netwatch-solves-and-how) · [**Install**](#installation) · [**Configuration**](#configuration) · [**Architecture**](#architecture-overview)
+
+![netwatch demo](screenshots/demo.gif)
+
+</div>
+
+> A live tour of a 5-node gossip cluster: healthy quorum and per-zone members, real-time target up/down state, dependency topology, SLO tracking, and per-region latency — all served from your own infrastructure, no external database required.
 
 ---
 
-## What is netwatch?
+## ⚡ Quick start (Docker)
+
+```bash
+# One agent, instant API + metrics. Add cluster.enabled + peers for a real cluster.
+docker run -d --name netwatch -p 10240:10240 --cap-add NET_RAW \
+  ghcr.io/saidtaylan/netwatch:latest
+
+curl http://localhost:10240/health        # → OK
+```
+
+For a real deployment (cluster + web UI) jump to **[Installation](#installation)** — systemd, Ansible, Docker, or Helm.
+
+---
+
+## 🤔 What is netwatch?
 
 **netwatch** is a distributed network monitoring system you run on your own infrastructure. Each backend node is a single Go binary that continuously probes TCP, HTTP/HTTPS, ICMP ping, DNS, and SQL targets, then exposes results over a REST API. Multiple nodes form a leaderless gossip cluster — they share probe state in real time and coordinate to ensure every outage produces exactly one alert, never duplicates, no matter how many nodes are watching the same target.
 
@@ -16,9 +44,34 @@ The frontend is a Nuxt 3 single-page application served by nginx. It connects di
 
 netwatch is designed for teams who want the power of Prometheus-level monitoring without the operational complexity of a full Prometheus + Alertmanager + Grafana stack. Everything ships as two binaries and a YAML file.
 
+## ✨ Features
+
+| Capability | Description |
+|---|---|
+| **Multi-protocol probes** | TCP, HTTP/HTTPS (status + body assertions), ICMP ping, DNS, SQL (MySQL / PostgreSQL / SQL Server / Oracle) |
+| **Smart state machine** | Transient failures enter a *soft-down* retry phase; only after `max_retries` consecutive failures is the target declared *hard-down* and an alert sent |
+| **Exactly-once alerting** | Consistent hashing assigns one responsible node per target — only that node sends the alert. Failover is automatic when the primary leaves the cluster |
+| **Leaderless cluster** | Gossip-based (hashicorp/memberlist); no single point of failure, no elected leader, no ZooKeeper |
+| **LWW conflict resolution** | Lamport sequence numbers on every state change; highest seq wins if two nodes disagree |
+| **Distributed probe ownership** | Only `probe_replication_factor` nodes (default 3) probe each target — a 50-node cluster does not hammer targets 50× |
+| **Dependency graph & root cause** | `depends_on` relationships between targets let the system report "checkout is down because db-primary is down" instead of alerting on every affected service |
+| **Scope classification** | Every alert carries `REAL_OUTAGE` / `NETWORK_PARTITION` / `LOCAL_FAILURE` / `AMBIGUOUS` — you know immediately whether the service or your network is the problem |
+| **SLO tracker** | Per-target uptime tracking with rolling windows (30d / 7d / 24h), error budget, and breach alerts |
+| **Config drift detection** | Each node gossips its config hash; diverging nodes are immediately visible in the UI and via a Prometheus metric |
+| **Quorum gating** | Alert dispatch is suppressed when the cluster loses quorum, preventing false positives from a split-brain node |
+| **Geo latency view** | Per-region latency breakdown with anomaly detection — self-hosted multi-region synthetic monitoring |
+| **Alert channels** | Shell script (`.sh` / `.ps1`), SMTP (HTML multipart), generic JSON webhook, Prometheus Alertmanager format |
+| **App → target indirection** | Group targets under named apps with owner teams; `AFFECTED_APPS` and `OWNER_TEAMS` are injected into every alert |
+| **Prometheus metrics** | `/metrics` endpoint with probe status, latency, SLO, cluster, and geo gauges |
+| **Hot-reload** | `config.yaml` is re-read on a configurable interval — no restart required |
+| **SQLite storage** | Single-binary, no external database — state and incidents persist across restarts |
+| **Credentials injection** | `${VAR}` placeholders in config are resolved from a separate `credentials.env` file |
+| **Windows Service** | Native Windows Service integration via `netwatch.exe service install/remove` |
+
 ---
 
-## The problems netwatch solves (and how)
+
+## 🧠 The problems netwatch solves (and how)
 
 Most monitoring tools work fine with one watcher and one target. The hard problems start when you put **many watchers** in front of **shared targets** across **multiple regions**. netwatch is built around those problems.
 
@@ -65,33 +118,7 @@ Because probers are region-tagged, netwatch records per-region latency for each 
 
 ---
 
-## Features
-
-| Capability | Description |
-|---|---|
-| **Multi-protocol probes** | TCP, HTTP/HTTPS (status + body assertions), ICMP ping, DNS, SQL (MySQL / PostgreSQL / SQL Server / Oracle) |
-| **Smart state machine** | Transient failures enter a *soft-down* retry phase; only after `max_retries` consecutive failures is the target declared *hard-down* and an alert sent |
-| **Exactly-once alerting** | Consistent hashing assigns one responsible node per target — only that node sends the alert. Failover is automatic when the primary leaves the cluster |
-| **Leaderless cluster** | Gossip-based (hashicorp/memberlist); no single point of failure, no elected leader, no ZooKeeper |
-| **LWW conflict resolution** | Lamport sequence numbers on every state change; highest seq wins if two nodes disagree |
-| **Distributed probe ownership** | Only `probe_replication_factor` nodes (default 3) probe each target — a 50-node cluster does not hammer targets 50× |
-| **Dependency graph & root cause** | `depends_on` relationships between targets let the system report "checkout is down because db-primary is down" instead of alerting on every affected service |
-| **Scope classification** | Every alert carries `REAL_OUTAGE` / `NETWORK_PARTITION` / `LOCAL_FAILURE` / `AMBIGUOUS` — you know immediately whether the service or your network is the problem |
-| **SLO tracker** | Per-target uptime tracking with rolling windows (30d / 7d / 24h), error budget, and breach alerts |
-| **Config drift detection** | Each node gossips its config hash; diverging nodes are immediately visible in the UI and via a Prometheus metric |
-| **Quorum gating** | Alert dispatch is suppressed when the cluster loses quorum, preventing false positives from a split-brain node |
-| **Geo latency view** | Per-region latency breakdown with anomaly detection — self-hosted multi-region synthetic monitoring |
-| **Alert channels** | Shell script (`.sh` / `.ps1`), SMTP (HTML multipart), generic JSON webhook, Prometheus Alertmanager format |
-| **App → target indirection** | Group targets under named apps with owner teams; `AFFECTED_APPS` and `OWNER_TEAMS` are injected into every alert |
-| **Prometheus metrics** | `/metrics` endpoint with probe status, latency, SLO, cluster, and geo gauges |
-| **Hot-reload** | `config.yaml` is re-read on a configurable interval — no restart required |
-| **SQLite storage** | Single-binary, no external database — state and incidents persist across restarts |
-| **Credentials injection** | `${VAR}` placeholders in config are resolved from a separate `credentials.env` file |
-| **Windows Service** | Native Windows Service integration via `netwatch.exe service install/remove` |
-
----
-
-## Architecture Overview
+## 🏗️ Architecture Overview
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -123,7 +150,7 @@ The frontend can connect to **any** backend node — they all serve the same clu
 
 ---
 
-## Requirements
+## 📋 Requirements
 
 | Component | Requirement |
 |---|---|
@@ -138,7 +165,7 @@ The frontend can connect to **any** backend node — they all serve the same clu
 
 ---
 
-## Installation
+## 🚀 Installation
 
 ### Option A — systemd (Recommended for Linux)
 
@@ -342,7 +369,7 @@ config: |
 
 ---
 
-## First Login
+## 🔑 First Login
 
 1. Open your browser and navigate to `http://<frontend-ip>` (or `http://localhost:3000` in dev mode).
 2. You'll be prompted to enter the **backend node URL** — e.g. `http://192.168.1.10:10240`. The frontend stores this in the browser and connects directly.
@@ -355,7 +382,7 @@ config: |
 
 ---
 
-## Configuration
+## ⚙️ Configuration
 
 Key fields in `/etc/netwatch/config.yaml`:
 
@@ -424,7 +451,7 @@ For a full annotated reference of all supported fields and probe types, see [`ba
 
 ---
 
-## Multi-Node Cluster
+## 🌐 Multi-Node Cluster
 
 All nodes run the same binary and the same basic config structure. Add a `cluster:` block to each node's `config.yaml`:
 
@@ -463,7 +490,7 @@ cluster:
 
 ---
 
-## Updating
+## ⬆️ Updating
 
 ### Backend binary
 
@@ -499,7 +526,7 @@ sudo ./install.sh
 
 ---
 
-## Contributing
+## 🤝 Contributing
 
 Pull requests are welcome. For backend build, configuration, and the full API reference, see [backend/README.md](backend/README.md); for the frontend, see [frontend/README.md](frontend/README.md).
 
@@ -507,6 +534,6 @@ Bug reports: open a GitHub issue with your `config.yaml` (redact secrets), Go ve
 
 ---
 
-## License
+## 📄 License
 
 MIT — see [LICENSE](LICENSE).
