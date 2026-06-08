@@ -30,6 +30,8 @@ incidents.json
 maintenance.json
 *.tmp
 demo/
+cluster-demo/
+backend/test_cluster/
 backend/config.yaml
 backend/credentials.env
 
@@ -41,6 +43,17 @@ frontend/dist/
 frontend/.env
 frontend/.env.*
 
+# Frontend — Playwright test artifacts & reports
+frontend/test-results/
+frontend/playwright-report/
+frontend/playwright-report-live/
+frontend/playwright-results-live.json
+frontend/tests/e2e/.auth/
+
+# Frontend — local debug scratch
+frontend/parse_results.py
+frontend/check_state.py
+
 # Local secrets / credentials
 credentials.env
 *.pem
@@ -48,3 +61,15 @@ credentials.env
 
 # Local Claude state (keep instructions; ignore session settings)
 .claude/settings.local.json
+
+# Internal development docs — kept locally, not published to the public repo
+CLAUDE.md
+developments.md
+docs/
+system_map.md
+sprint.md
+todo.md
+frontend-plan.md
+GUIDE_OWNER.md
+backend/CLUSTER_TESTING_GUIDE.md
+backend/tests/CLUSTER_REPORT.md
