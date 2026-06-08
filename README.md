@@ -17,6 +17,53 @@ netwatch is designed for teams who want the power of Prometheus-level monitoring
 
 ---
 
+## The problems netwatch solves (and how)
+
+Most monitoring tools work fine with one watcher and one target. The hard problems start when you put **many watchers** in front of **shared targets** across **multiple regions**. netwatch is built around those problems.
+
+### 1. Many watchers must not turn into a DoS on the target
+
+The naive way to get redundant monitoring is to have every node probe every target. In a 50-node cluster that means each database, API, and DNS server is hit **50 times per interval** — your monitoring system becomes an accidental denial-of-service attack on the very things it's supposed to protect, and a slow target gets pushed over the edge by health checks alone.
+
+netwatch instead treats "who probes what" as a **distributed ownership problem**. For each target it deterministically selects only a small subset of nodes — `probe_replication_factor` of them (default 3) — using a consistent-hash ring. The selection is **zone/region-aware**: it spreads the chosen probers across different regions first, so a target is observed from several vantage points without every node piling on. The result is bounded, predictable load on the target (3 probes, not 50) while still getting multi-perspective detection. Operators can also pin sensitive targets to specific nodes (`probe_from`) — e.g. only the two nodes that actually have network access to a restricted VPN segment.
+
+### 2. Many watchers must not turn into an alert storm
+
+If 3 nodes all notice the database is down, you do **not** want 3 alerts (or 50). netwatch uses the same consistent-hash ring to elect exactly **one responsible node** per target; only that node dispatches the alert. If the responsible node leaves the cluster, the ring reassigns ownership automatically — no elected leader, no failover script. One outage → one alert, deterministically.
+
+### 3. "Is it really down, or is it just *me*?"
+
+A single node losing its uplink looks identical to a real outage if you only have one observer. Because netwatch probes from multiple nodes and shares results over gossip, it can compare what every node sees and **classify the scope** of each event:
+
+- **REAL_OUTAGE** — every node that can vote sees it down → the service is genuinely down.
+- **NETWORK_PARTITION** — some nodes see it up, some down → a network split, not a service failure.
+- **LOCAL_FAILURE** — only the alerting node sees it down → probably that node's own connectivity.
+- **AMBIGUOUS** — not enough data to decide yet.
+
+Each alert carries this classification plus a confidence score and the exact list of nodes that voted up/down. You stop waking people at 3 a.m. because one probe node's switch hiccupped.
+
+### 4. One root cause, not twenty symptoms
+
+When a core database dies, every service that depends on it also fails. Most tools fire an alert for each one. netwatch lets you declare `depends_on` relationships, builds a dependency graph, and performs **root-cause analysis**: the alert for `checkout` says the root cause is `db-primary`, reports the dependency depth, and lists the full cascading impact. You get one meaningful page instead of a wall of noise — and this works **even when the failing dependency is probed by a different node**, because root cause is resolved against the gossip-merged, cluster-wide view of state.
+
+### 5. A split-brain node must not cry wolf
+
+If the cluster partitions and a node finds itself in the minority, its view of the world is untrustworthy. netwatch **gates alerting on quorum**: a node that has lost quorum enters an isolated mode and suppresses alert dispatch (and rejects config/state writes with HTTP 503) until it rejoins a healthy majority. Split-brain produces silence, not false alarms.
+
+### 6. Restarts and rejoins must not produce phantom alerts
+
+Probe state is persisted locally (SQLite, with a legacy `state.json` path) and carries Lamport sequence numbers. When a node restarts or rejoins, an **anti-entropy push-pull sync** reconciles its state with the cluster before it starts alerting, so a rolling restart of the whole fleet doesn't generate a storm of spurious recovery/outage alerts. Conflicts between nodes are resolved deterministically by last-writer-wins (highest Lamport seq, then timestamp, then node name).
+
+### 7. No external database, no master, no babysitting
+
+There is no Prometheus server, no Alertmanager, no etcd, no elected leader, and no shared SQL database to keep alive. Every node is a single self-contained Go binary with its own embedded SQLite file; the cluster is leaderless gossip (hashicorp/memberlist). Dynamic configuration (targets, SLOs, channels, silences, users) is replicated across the cluster over gossip with LWW conflict resolution, so you can edit it through the UI on any node and it converges everywhere. The frontend is static files behind nginx — no Node.js runtime in production.
+
+### 8. Multi-region synthetic monitoring without a SaaS
+
+Because probers are region-tagged, netwatch records per-region latency for each target and flags **latency anomalies** (one region suddenly 3× slower than the others, above a 5 ms floor to ignore sub-millisecond jitter). You get the "is the API slow from Europe but fine from US-East?" answer that you'd normally pay a synthetic-monitoring SaaS for — from your own nodes.
+
+---
+
 ## Features
 
 | Capability | Description |
