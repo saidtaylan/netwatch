@@ -2,8 +2,9 @@
 
 Self-hosted, distributed network monitoring with a web UI — no cloud, no agents-as-a-service.
 
-<!-- screenshot / demo gif placeholder -->
-<!-- ![netwatch dashboard](docs/screenshot.png) -->
+![netwatch Cluster Overview](screenshots/cluster-overview.png)
+
+> Live Cluster Overview: a 5-node gossip cluster with healthy quorum, per-zone members, target up/down counts, and config-drift status — served from your own infrastructure.
 
 ---
 

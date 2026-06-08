@@ -7,6 +7,15 @@
 node_alias: "netwatch-agent"    # Human-readable label for this node. Appears in metrics (as 'app_name' label) and alert env vars (NODE_ALIAS + APP_NAME).
 port:     "10240"                # HTTP port for /metrics, /health, /status.
 
+# ── Auth ──────────────────────────────────────────────────────────────────────
+# REQUIRED to use the web UI. The setup_token is a one-time bootstrap secret used
+# on the /setup page to create the first admin user; it is also the HMAC secret
+# that signs JWTs, so every node in a cluster MUST use the SAME value.
+# If left empty, /auth/setup returns "no setup_token configured" and you will not
+# be able to create an admin or log in.
+admin:
+  setup_token: "change-me-to-a-long-random-secret"
+
 # ── File paths ────────────────────────────────────────────────────────────────
 state_file:       "/var/lib/netwatch/state.json"
 log_path:         "/var/log/netwatch/agent.log"   # empty → stdout
