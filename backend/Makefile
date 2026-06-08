@@ -3,15 +3,18 @@
 ## Usage: make <target>
 ## ─────────────────────────────────────────────────────────────────────────────
 
-# Override at invocation: make build-linux BINARY_NAME=myagent
+# Override at invocation:
+#   make build-linux BINARY_NAME=myagent
+#   make build-linux GOARCH=arm64     # for arm64 servers (Graviton, Pi, Ampere)
 BINARY_NAME   ?= netwatch
+GOARCH        ?= amd64
 MODULE        := github.com/saidtaylan/netwatch
 GO_VERSION    := $(shell go version | awk '{print $$3}')
 
 LDFLAGS       := -s -w -X $(MODULE)/internal/engine.BinaryName=$(BINARY_NAME)
 BUILD_FLAGS   := -ldflags="$(LDFLAGS)" -trimpath
 
-LINUX_BIN     := bin/$(BINARY_NAME)-linux-amd64
+LINUX_BIN     := bin/$(BINARY_NAME)-linux-$(GOARCH)
 DARWIN_BIN    := bin/$(BINARY_NAME)-darwin
 WINDOWS_BIN   := bin/$(BINARY_NAME)-windows-amd64.exe
 DOCKER_IMAGE  := $(BINARY_NAME):latest
@@ -21,9 +24,9 @@ DOCKER_IMAGE  := $(BINARY_NAME):latest
 ## ─────────────────────────────────────────────────────────────────────────────
 
 .PHONY: build-linux
-build-linux:                          ## Build Linux amd64 binary (static, no CGO)
+build-linux:                          ## Build Linux binary (static, no CGO; GOARCH=amd64|arm64)
 	@mkdir -p bin
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(GOARCH) \
 	    go build $(BUILD_FLAGS) -o $(LINUX_BIN) ./cmd/linux/
 	@echo "→ $(LINUX_BIN)"
 

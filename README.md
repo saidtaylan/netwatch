@@ -148,8 +148,12 @@ The fastest path for a single node or small cluster on Linux.
 
 ```bash
 cd backend
-GOOS=linux GOARCH=amd64 go build -o bin/netwatch-linux-amd64 ./cmd/linux/
+make build-linux                 # amd64 (default) → bin/netwatch-linux-amd64
+# On arm64 servers (Graviton, Ampere, Raspberry Pi):
+make build-linux GOARCH=arm64    #        → bin/netwatch-linux-arm64
 ```
+
+> The install script auto-detects the host architecture and picks the matching `bin/netwatch-linux-<arch>` binary, so build for the arch of the server you're installing on.
 
 #### 2. Build the frontend
 
@@ -157,22 +161,23 @@ GOOS=linux GOARCH=amd64 go build -o bin/netwatch-linux-amd64 ./cmd/linux/
 cd frontend
 pnpm install
 pnpm build
-# Output: frontend/.output/public/  (static files)
+# Output: frontend/.output/public/  (static files, including index.html)
 ```
 
-#### 3. Run the install script
+#### 3. Install nginx (serves the static UI) and run the install script
 
 ```bash
+sudo apt-get install -y nginx     # or: sudo dnf install -y nginx
 cd deploy-systemd
 sudo ./install.sh
 ```
 
 This script:
 - Creates a `netwatch` system user
-- Installs the binary to `/usr/local/bin/netwatch`
-- Copies a skeleton `config.yaml` to `/etc/netwatch/config.yaml`
-- Copies frontend static files to `/opt/netwatch-ui`
-- Installs and starts `netwatch-backend.service`, `netwatch-frontend.service`, and `netwatch.target`
+- Installs the arch-matched binary to `/usr/local/bin/netwatch`
+- Copies a minimal runnable `config.yaml` to `/etc/netwatch/config.yaml` (boots out of the box; full reference is `backend/config.example.yaml`)
+- Copies the static UI to `/opt/netwatch-ui` and configures an nginx site (port 80) — no Node.js runtime
+- Installs and starts `netwatch-backend.service` + `netwatch.target`
 
 #### 4. Edit the config
 
@@ -203,15 +208,16 @@ curl http://localhost:10240/health
 
 **Backend:**
 ```bash
-# Build
+# Build (set GOARCH=arm64 for arm servers)
 cd backend
-GOOS=linux GOARCH=amd64 go build -o netwatch ./cmd/linux/
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o netwatch ./cmd/linux/
 
 # Install
 sudo install -m 755 netwatch /usr/local/bin/netwatch
 sudo mkdir -p /etc/netwatch /var/lib/netwatch
-sudo cp backend/config.example.yaml /etc/netwatch/config.yaml
-sudo nano /etc/netwatch/config.yaml
+# Minimal runnable starter (full reference: backend/config.example.yaml):
+sudo cp backend/config.skeleton.yaml /etc/netwatch/config.yaml
+sudo nano /etc/netwatch/config.yaml   # set admin.setup_token, add targets/cluster
 
 # Install and start service
 sudo cp deploy-systemd/netwatch-backend.service /etc/systemd/system/
@@ -462,9 +468,9 @@ cluster:
 ### Backend binary
 
 ```bash
-# Rebuild
+# Rebuild (set GOARCH=arm64 for arm servers)
 cd backend
-GOOS=linux GOARCH=amd64 go build -o netwatch ./cmd/linux/
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o netwatch ./cmd/linux/
 
 # Deploy
 sudo install -m 755 netwatch /usr/local/bin/netwatch

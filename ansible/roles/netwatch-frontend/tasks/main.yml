@@ -17,13 +17,16 @@
     group: www-data
     mode: "0755"
 
-- name: Sync frontend static files
-  ansible.posix.synchronize:
+# Plain copy — no rsync dependency. The synchronize module would require rsync
+# installed on BOTH the controller and every frontend target.
+- name: Copy frontend static files
+  ansible.builtin.copy:
     src: "{{ netwatch_frontend_src }}"
     dest: "{{ netwatch_frontend_dir }}/"
-    delete: true
-    recursive: true
-    checksum: true
+    owner: www-data
+    group: www-data
+    mode: "0644"
+    directory_mode: "0755"
   notify: reload nginx
 
 - name: Template nginx site config (Debian/Ubuntu)

@@ -1,13 +1,14 @@
 [Unit]
-Description=netwatch — backend agent + frontend UI
+Description=netwatch — backend agent (the UI is served by nginx, not a systemd unit)
 Documentation=https://github.com/saidtaylan/netwatch
 
-# Bring up both services together.
-# systemctl start netwatch.target   → starts both
-# systemctl stop  netwatch.target   → stops both
-# systemctl status netwatch.target  → shows aggregate status
-Wants=netwatch-backend.service netwatch-frontend.service
-After=netwatch-backend.service netwatch-frontend.service
+# Groups the netwatch backend so it can be managed as a unit:
+# systemctl start  netwatch.target   → starts the backend agent
+# systemctl status netwatch.target   → shows aggregate status
+# The web UI is static files served by nginx (see netwatch-ui.nginx.conf),
+# so it is managed via the system nginx service, not this target.
+Wants=netwatch-backend.service
+After=netwatch-backend.service
 
 [Install]
 WantedBy=multi-user.target

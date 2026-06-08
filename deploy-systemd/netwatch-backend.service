@@ -5,6 +5,10 @@ After=network-online.target
 Wants=network-online.target
 PartOf=netwatch.target
 
+# Restart rate-limiting (these keys belong in [Unit], not [Service])
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=netwatch
@@ -29,8 +33,6 @@ PrivateDevices=true
 # Auto-restart on failure (not during stop/reload)
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=5
 
 # Logging — use journald
 StandardOutput=journal
