@@ -34,6 +34,15 @@ export default defineNuxtConfig({
     fallback: 'light',
   },
 
+  // Prerender the SPA shell so `pnpm build` emits .output/public/index.html.
+  // Without this, ssr:false + `nuxt build` only produces a nitro server (no
+  // static index.html), which breaks serving the app from nginx / static hosts.
+  nitro: {
+    prerender: {
+      routes: ['/'],
+    },
+  },
+
   runtimeConfig: {
     public: {
       // Override with NUXT_PUBLIC_DEFAULT_BACKEND_URL env var
