@@ -376,8 +376,14 @@ func (d *gossipDelegate) GetBroadcasts(overhead, limit int) [][]byte {
 //   - join=false (periodic): return peerStates — individual gossip payloads
 //     from all known peers. This is the lightweight periodic exchange.
 func (d *gossipDelegate) LocalState(join bool) []byte {
-	if join && d.mgr.stateProvider != nil {
-		return d.mgr.stateProvider.FullState()
+	// Read stateProvider under mu to avoid a data race with SetStateProvider(),
+	// which writes under mu.Lock(). Memberlist starts its background goroutines
+	// inside cluster.New, before Engine.Init calls SetStateProvider.
+	d.mgr.mu.RLock()
+	sp := d.mgr.stateProvider
+	d.mgr.mu.RUnlock()
+	if join && sp != nil {
+		return sp.FullState()
 	}
 	// Periodic push-pull — exchange peer-states as before.
 	d.mgr.mu.RLock()
@@ -396,11 +402,15 @@ func (d *gossipDelegate) MergeRemoteState(buf []byte, join bool) {
 	if len(buf) == 0 {
 		return
 	}
-	if join && d.mgr.stateProvider != nil {
+	// Read stateProvider under mu (written under mu.Lock() by SetStateProvider).
+	d.mgr.mu.RLock()
+	sp := d.mgr.stateProvider
+	d.mgr.mu.RUnlock()
+	if join && sp != nil {
 		// Re-join full sync — let the engine merge with alarm suppression.
-		d.mgr.stateProvider.SetSyncing(true)
-		d.mgr.stateProvider.ApplyRemoteState(buf)
-		d.mgr.stateProvider.SetSyncing(false)
+		sp.SetSyncing(true)
+		sp.ApplyRemoteState(buf)
+		sp.SetSyncing(false)
 		return
 	}
 	// Periodic push-pull — treat as individual gossip updates.
@@ -1185,7 +1195,9 @@ func (m *Manager) Leave(timeout time.Duration) error {
 // immediately after cluster.New returns). It is safe to call even when the
 // manager was not created via New() (e.g. in tests with NewTestManager).
 func (m *Manager) SetStateProvider(p AntiEntropyProvider) {
+	m.mu.Lock()
 	m.stateProvider = p
+	m.mu.Unlock()
 }
 
 // SetPeerAlertHandler registers the engine callback used to dispatch alerts

@@ -5,10 +5,11 @@
 //
 // Scenario:
 //   - 4 node cluster, probe_replication_factor=1 (each target gets 1 prober)
-//   - target-db: probed by node-A only
-//   - target-api: probed by node-B only  (depends_on: target-db)
-//   - Both services go down simultaneously
-//   - ROOT_CAUSE in the api-gateway alert must be "target-db"
+//   - target-db:  pinned to n1 via probe_from (probed by n1 only)
+//   - target-api: pinned to n2 via probe_from (probed by n2 only; depends_on target-db)
+//   - target-db fails first; once its hard_down has propagated to n2, target-api fails
+//   - ROOT_CAUSE in the api-gateway alert must be "target-db", proving n2 resolved
+//     the cause from a peer-observed state it never probed itself.
 //
 // This test exercises the AllPeerStates() merge in notify.go which cross-pollinates
 // peer-observed states into the local allStates map before root-cause detection.
@@ -108,6 +109,11 @@ func TestCrossNode_RootCause_DisjointProbers(t *testing.T) {
 	}
 
 	// target-db depends_on nothing; target-api depends_on target-db.
+	// probe_from pins make prober assignment deterministic so the disjoint-set
+	// scenario is exercised on every run (without the pins the hash ring may put
+	// both targets on the same node, which cannot test cross-node resolution).
+	// All nodes share this config, satisfying the "same probe_from on every node"
+	// contract.
 	sharedTargets := fmt.Sprintf(`
 targets:
   - id: "target-db"
@@ -115,12 +121,14 @@ targets:
     type: tcp
     target: %q
     interval_sec: 5
+    probe_from: ["n1"]
   - id: "target-api"
     name: "API Gateway"
     type: tcp
     target: %q
     interval_sec: 5
     depends_on: ["target-db"]
+    probe_from: ["n2"]
 `, dbAddr, apiAddr)
 
 	peers := fmt.Sprintf(`
@@ -196,34 +204,67 @@ cluster:
 		t.Logf("cluster only %d/%d members after 30s — continuing anyway", nodes[0].ClusterMemberCount(), nodeCount)
 	}
 
-	// Wait for assignments to stabilize (~probe_replication_factor * (probe_interval + buffer)).
-	time.Sleep(10 * time.Second)
-
-	// Identify which node probes which target.
-	dbProber := -1
-	apiProber := -1
-	for i, e := range nodes {
-		if e.ClusterManager() != nil {
-			if e.ClusterManager().IsLocalProber("target-db") {
-				dbProber = i
-			}
-			if e.ClusterManager().IsLocalProber("target-api") {
-				apiProber = i
+	// Wait for prober assignments to converge to the pinned layout: target-db on
+	// n1 (index 0), target-api on n2 (index 1). probe_from makes this deterministic,
+	// but the recompute is debounced after cluster membership settles, so poll.
+	dbProber, apiProber := -1, -1
+	assignDeadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(assignDeadline) {
+		dbProber, apiProber = -1, -1
+		for i, e := range nodes {
+			if e.ClusterManager() != nil {
+				if e.ClusterManager().IsLocalProber("target-db") {
+					dbProber = i
+				}
+				if e.ClusterManager().IsLocalProber("target-api") {
+					apiProber = i
+				}
 			}
 		}
+		if dbProber == 0 && apiProber == 1 {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 	t.Logf("target-db prober: n%d, target-api prober: n%d", dbProber+1, apiProber+1)
 
-	if dbProber == apiProber || dbProber == -1 || apiProber == -1 {
-		t.Skipf("probers not disjoint (db=%d api=%d) — cannot test cross-node scenario with this ring assignment", dbProber, apiProber)
+	if dbProber == -1 || apiProber == -1 || dbProber == apiProber {
+		t.Fatalf("probe_from pins did not produce disjoint probers (db=%d api=%d) — assignment failed to converge", dbProber, apiProber)
 	}
 
-	// Kill both services simultaneously.
+	// Causal-order outage: the upstream (target-db) fails first. We wait until its
+	// hard_down state has actually propagated via gossip to the api prober (n2)
+	// before failing the downstream (target-api). This is the realistic scenario
+	// root-cause-across-disjoint-probers exists for: when the dependent service's
+	// alert fires, the upstream failure is already known cluster-wide, so n2 can
+	// attribute the api outage to target-db. (Killing both simultaneously is a
+	// race the eventually-consistent gossip layer cannot resolve deterministically:
+	// the first api alert may legitimately fire before db's state arrives.)
 	closeDB()
-	closeAPI()
-	t.Log("both services killed — waiting for alerts")
+	t.Log("target-db killed — waiting for hard_down to propagate to api prober (n2)")
 
-	// Collect alerts for up to 45 seconds. We need the api-gateway alert.
+	apiMgr := nodes[apiProber].ClusterManager()
+	propDeadline := time.Now().Add(40 * time.Second)
+	dbDownSeen := false
+	for time.Now().Before(propDeadline) {
+		for _, p := range apiMgr.AllPeerStates() {
+			if p.TargetID == "target-db" && p.State == "hard_down" {
+				dbDownSeen = true
+				break
+			}
+		}
+		if dbDownSeen {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if !dbDownSeen {
+		t.Fatal("target-db hard_down did not propagate to api prober within 40s — cross-node gossip not converging")
+	}
+	t.Log("target-db hard_down observed on n2 — now killing target-api")
+	closeAPI()
+
+	// Collect alerts. We need the api-gateway unreachable alert.
 	var apiAlert *capture
 	timeout := time.After(45 * time.Second)
 outer:
