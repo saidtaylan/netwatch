@@ -169,62 +169,46 @@ The frontend can connect to **any** backend node — they all serve the same clu
 
 ### Option A — systemd (Recommended for Linux)
 
-The fastest path for a single node or small cluster on Linux.
+The fastest path for a single node or small cluster on Linux. **Nothing is compiled** — `install.sh` downloads the prebuilt backend binary (arch-matched) and frontend bundle from the [Releases page](https://github.com/saidtaylan/netwatch/releases).
 
-#### 1. Build the backend binary
-
-```bash
-cd backend
-make build-linux                 # amd64 (default) → bin/netwatch-linux-amd64
-# On arm64 servers (Graviton, Ampere, Raspberry Pi):
-make build-linux GOARCH=arm64    #        → bin/netwatch-linux-arm64
-```
-
-> The install script auto-detects the host architecture and picks the matching `bin/netwatch-linux-<arch>` binary, so build for the arch of the server you're installing on.
-
-#### 2. Build the frontend
+#### 1. Get the repo (for the install script + unit files) and install nginx
 
 ```bash
-cd frontend
-pnpm install
-pnpm build
-# Output: frontend/.output/public/  (static files, including index.html)
-```
-
-#### 3. Install nginx (serves the static UI) and run the install script
-
-```bash
+git clone https://github.com/saidtaylan/netwatch.git
+cd netwatch
 sudo apt-get install -y nginx     # or: sudo dnf install -y nginx
+```
+
+#### 2. Run the install script
+
+```bash
 cd deploy-systemd
-sudo ./install.sh
+sudo ./install.sh                 # installs the latest release
+# Pin a version:        sudo ./install.sh --version v0.1.3
+# Use a local build:    sudo ./install.sh --from-source   (needs make build-linux + pnpm build)
 ```
 
 This script:
 - Creates a `netwatch` system user
-- Installs the arch-matched binary to `/usr/local/bin/netwatch`
+- **Downloads** the arch-matched binary (`netwatch-linux-amd64`/`-arm64`) to `/usr/local/bin/netwatch`
+- **Downloads** the UI bundle (`netwatch-frontend.tar.gz`) to `/opt/netwatch-ui` and configures an nginx site (port 80) — no Node.js runtime
 - Copies a minimal runnable `config.yaml` to `/etc/netwatch/config.yaml` (boots out of the box; full reference is `backend/config.example.yaml`)
-- Copies the static UI to `/opt/netwatch-ui` and configures an nginx site (port 80) — no Node.js runtime
 - Installs and starts `netwatch-backend.service` + `netwatch.target`
 
-#### 4. Edit the config
+#### 3. Edit the config
 
 ```bash
-sudo nano /etc/netwatch/config.yaml
+sudo nano /etc/netwatch/config.yaml      # set admin.setup_token, add targets / cluster
 ```
 
 See [Configuration](#configuration) for the key fields to set.
 
-#### 5. Restart and verify
+#### 4. Restart and verify
 
 ```bash
 sudo systemctl restart netwatch-backend
 sudo systemctl status netwatch.target
-journalctl -u netwatch-backend -f
-```
-
-Check the API is up:
-```bash
-curl http://localhost:10240/health
+curl http://localhost:10240/health       # → OK
 ```
 
 ---
@@ -233,14 +217,14 @@ curl http://localhost:10240/health
 
 #### Linux (systemd, step-by-step)
 
-**Backend:**
+**Backend** — download the prebuilt binary from the release:
 ```bash
-# Build (set GOARCH=arm64 for arm servers)
-cd backend
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o netwatch ./cmd/linux/
+# Pick your arch: amd64 or arm64
+ARCH=amd64
+sudo curl -fSL -o /usr/local/bin/netwatch \
+  https://github.com/saidtaylan/netwatch/releases/latest/download/netwatch-linux-$ARCH
+sudo chmod 755 /usr/local/bin/netwatch
 
-# Install
-sudo install -m 755 netwatch /usr/local/bin/netwatch
 sudo mkdir -p /etc/netwatch /var/lib/netwatch
 # Minimal runnable starter (full reference: backend/config.example.yaml):
 sudo cp backend/config.skeleton.yaml /etc/netwatch/config.yaml
@@ -252,14 +236,13 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now netwatch-backend
 ```
 
-**Frontend:**
-```bash
-cd frontend
-pnpm install && pnpm build
+> Prefer to build it yourself? `cd backend && make build-linux [GOARCH=arm64]` then `sudo install -m 755 bin/netwatch-linux-* /usr/local/bin/netwatch`.
 
-# Copy static files to nginx web root
+**Frontend** — download the prebuilt static bundle from the release:
+```bash
 sudo mkdir -p /var/www/netwatch
-sudo cp -r .output/public/. /var/www/netwatch/
+curl -fSL https://github.com/saidtaylan/netwatch/releases/latest/download/netwatch-frontend.tar.gz \
+  | sudo tar -xz -C /var/www/netwatch
 
 # nginx — serve the SPA (all routes → index.html)
 # Add a server block like:
@@ -267,6 +250,8 @@ sudo cp -r .output/public/. /var/www/netwatch/
 #   location / { try_files $uri $uri/ /index.html; }
 sudo nginx -t && sudo systemctl reload nginx
 ```
+
+> Prefer to build it yourself? `cd frontend && pnpm install && pnpm build`, then copy `.output/public/.` into the web root.
 
 ---
 
@@ -492,37 +477,32 @@ cluster:
 
 ## ⬆️ Updating
 
-### Backend binary
-
-```bash
-# Rebuild (set GOARCH=arm64 for arm servers)
-cd backend
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o netwatch ./cmd/linux/
-
-# Deploy
-sudo install -m 755 netwatch /usr/local/bin/netwatch
-sudo systemctl restart netwatch-backend
-```
-
-### Frontend
-
-```bash
-cd frontend
-pnpm install   # pick up any new dependencies
-pnpm build
-
-sudo cp -r .output/public/. /var/www/netwatch/
-sudo nginx -s reload
-```
-
-### Full re-install (using install.sh)
-
-If you used `deploy-systemd/install.sh` originally, re-running it after building new binaries/frontend will update everything in place:
+The easiest path is to re-run the installer, which pulls the newest release:
 
 ```bash
 cd deploy-systemd
-sudo ./install.sh
+sudo ./install.sh                 # latest release
+# or pin: sudo ./install.sh --version v0.1.4
+sudo systemctl restart netwatch-backend
 ```
+
+Updating individual pieces by hand (download from the release):
+
+```bash
+# Backend
+ARCH=amd64
+sudo curl -fSL -o /usr/local/bin/netwatch \
+  https://github.com/saidtaylan/netwatch/releases/latest/download/netwatch-linux-$ARCH
+sudo systemctl restart netwatch-backend
+
+# Frontend (nginx reloads gracefully — zero downtime)
+curl -fSL https://github.com/saidtaylan/netwatch/releases/latest/download/netwatch-frontend.tar.gz \
+  | sudo tar -xz -C /var/www/netwatch
+sudo nginx -s reload
+```
+
+> **Ansible:** bump `netwatch_version` in `group_vars/all.yml` and re-run the playbook.
+> **Helm/Docker:** pull the new image tag (`ghcr.io/saidtaylan/netwatch:vX.Y.Z`).
 
 ---
 

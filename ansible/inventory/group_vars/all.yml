@@ -3,13 +3,18 @@
 # netwatch — global variables (applies to all hosts)
 # ──────────────────────────────────────────────────────────────────────────────
 
-netwatch_version: "1.0.0"
+# ── Install source ────────────────────────────────────────────────────────────
+# "release" (default) downloads prebuilt artifacts from the GitHub Releases page —
+# nothing is compiled on the target hosts. "local" uses files you place under
+# ansible/files/ yourself (build them first).
+netwatch_install_from: "release"           # release | local
+netwatch_repo_slug: "saidtaylan/netwatch"
+netwatch_version: "latest"                  # "latest" or a tag like "v0.1.3"
 
 # ── Binary (backend) ──────────────────────────────────────────────────────────
-# Pre-built Linux/amd64 binary lives in ansible/files/netwatch
-# Build with: GOOS=linux GOARCH=amd64 go build -o netwatch ./cmd/linux/
-netwatch_binary_src: "{{ playbook_dir }}/../files/netwatch"
 netwatch_binary_dest: "/usr/local/bin/netwatch"
+# Used only when netwatch_install_from == "local":
+netwatch_binary_src: "{{ playbook_dir }}/../files/netwatch"
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 netwatch_config_dir: "/etc/netwatch"
@@ -29,8 +34,9 @@ netwatch_gossip_port: 7946   # Memberlist gossip (TCP + UDP)
 netwatch_setup_token: "CHANGE_ME_strong_secret"
 
 # ── Frontend ──────────────────────────────────────────────────────────────────
-# Pre-built Nuxt SPA static files live in ansible/files/frontend/
-# Build with: cd frontend && pnpm build  (output at frontend/.output/public/)
+# Default (install_from=release): the Nuxt SPA bundle is downloaded from the
+# release as netwatch-frontend.tar.gz. netwatch_frontend_src is only used when
+# install_from=local (place your own build under ansible/files/frontend/).
 netwatch_frontend_dir: "/opt/netwatch-frontend"
 netwatch_frontend_src: "{{ playbook_dir }}/../files/frontend/"
 netwatch_frontend_port: 80

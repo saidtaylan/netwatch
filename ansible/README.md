@@ -13,45 +13,44 @@ Kubespray-style deployment for the **netwatch** distributed network monitoring c
 | Requirement | Details |
 |---|---|
 | Ansible | ≥ 2.14 (`pip install ansible`) |
-| `ansible.posix` collection | `ansible-galaxy collection install ansible.posix` |
 | SSH access | Key-based auth to all target hosts |
 | sudo / become | Passwordless `sudo` on all targets (or use `--ask-become-pass`) |
 | Target OS | Debian/Ubuntu or RedHat/CentOS/Rocky (systemd required) |
+| Internet on targets | Default mode downloads release artifacts from github.com on each host |
+
+No Go, Node.js, or rsync is needed — neither on the controller nor the targets.
 
 ---
 
-## Step 1 — Pre-build artifacts
+## Step 1 — Choose what to install (no build required)
 
-Nothing is compiled on the target servers. You build locally and Ansible copies the binaries.
+By default Ansible **downloads prebuilt artifacts from the GitHub Releases page** —
+the backend binary (arch-matched: amd64/arm64) and the frontend `tar.gz` — and
+installs them. Nothing is compiled anywhere.
 
-### Backend binary
+Pin the version (or track `latest`) in `inventory/group_vars/all.yml`:
 
-```bash
-# From the repo root
-GOOS=linux GOARCH=amd64 go build -o ansible/files/netwatch ./cmd/linux/
+```yaml
+netwatch_install_from: "release"   # default
+netwatch_version: "latest"         # or a tag, e.g. "v0.1.3"
+netwatch_repo_slug: "saidtaylan/netwatch"
 ```
 
-### Frontend static files
+<details>
+<summary><b>Optional: install from a local build instead</b></summary>
+
+If you'd rather ship your own build (air-gapped networks, forks, unreleased
+changes), set `netwatch_install_from: "local"` and place the artifacts yourself:
 
 ```bash
-# From the frontend/ directory
-cd frontend
-pnpm install
-pnpm build        # output lands at frontend/.output/public/
+# Backend (set GOARCH=arm64 for arm targets)
+cd backend && make build-linux && cp bin/netwatch-linux-amd64 ../ansible/files/netwatch
 
-# Copy static output into the ansible files/ directory
+# Frontend
+cd ../frontend && pnpm install && pnpm build
 cp -r .output/public/. ../ansible/files/frontend/
 ```
-
-After this step:
-```
-ansible/files/
-├── netwatch          ← Linux/amd64 binary
-└── frontend/
-    ├── index.html
-    └── _nuxt/
-        └── *.js / *.css
-```
+</details>
 
 ---
 
@@ -157,20 +156,16 @@ Open the following ports on your firewall / security groups:
 
 ## Updating
 
-### Update backend binary
+### Update to a new release
 
-1. Rebuild: `GOOS=linux GOARCH=amd64 go build -o ansible/files/netwatch ./cmd/linux/`
-2. Re-run: `ansible-playbook playbooks/setup.yml -i inventory/hosts.ini --tags backend`
+1. Bump `netwatch_version` in `inventory/group_vars/all.yml` (or keep `latest`).
+2. Backend: `ansible-playbook playbooks/setup.yml -i inventory/hosts.ini --tags backend`
+   (the service restarts only when the binary actually changes).
+3. Frontend: `ansible-playbook playbooks/setup.yml -i inventory/hosts.ini --tags frontend`
+   (nginx reloads gracefully; zero downtime).
 
-The service will only restart if the binary checksum changed.
-
-### Update frontend
-
-1. Rebuild: `cd frontend && pnpm build`
-2. Sync output: `cp -r .output/public/. ../ansible/files/frontend/`
-3. Re-run: `ansible-playbook playbooks/setup.yml -i inventory/hosts.ini --tags frontend`
-
-nginx reloads gracefully; zero downtime.
+> Local-build mode (`netwatch_install_from: local`): rebuild and refresh
+> `ansible/files/` as in Step 1, then re-run the same commands.
 
 ### Add a new backend node
 

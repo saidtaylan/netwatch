@@ -17,9 +17,27 @@
     group: www-data
     mode: "0755"
 
-# Plain copy — no rsync dependency. The synchronize module would require rsync
-# installed on BOTH the controller and every frontend target.
-- name: Copy frontend static files
+- name: Compute release download base URL
+  ansible.builtin.set_fact:
+    netwatch_dl_base: >-
+      {{ ('https://github.com/' + netwatch_repo_slug + '/releases/latest/download')
+         if netwatch_version == 'latest'
+         else ('https://github.com/' + netwatch_repo_slug + '/releases/download/' + netwatch_version) }}
+
+# Default: download the prebuilt static bundle from the GitHub Releases page and
+# unpack it (remote_src) — no rsync, no Node.js, no build on the target.
+- name: Download + unpack frontend bundle (release)
+  ansible.builtin.unarchive:
+    src: "{{ netwatch_dl_base }}/netwatch-frontend.tar.gz"
+    dest: "{{ netwatch_frontend_dir }}/"
+    remote_src: true
+    owner: www-data
+    group: www-data
+  notify: reload nginx
+  when: netwatch_install_from == "release"
+
+# Alternative: copy a locally built bundle from ansible/files/frontend/.
+- name: Copy frontend static files (local build)
   ansible.builtin.copy:
     src: "{{ netwatch_frontend_src }}"
     dest: "{{ netwatch_frontend_dir }}/"
@@ -28,6 +46,7 @@
     mode: "0644"
     directory_mode: "0755"
   notify: reload nginx
+  when: netwatch_install_from == "local"
 
 - name: Template nginx site config (Debian/Ubuntu)
   ansible.builtin.template:

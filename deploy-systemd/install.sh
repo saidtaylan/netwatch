@@ -1,22 +1,29 @@
 #!/usr/bin/env bash
 # install.sh — Install the netwatch backend (systemd) + UI (nginx static)
 #
-# Usage:
-#   sudo ./install.sh [--backend-bin PATH] [--frontend-dir PATH] [--no-enable]
+# By default this downloads the prebuilt backend binary and frontend bundle from
+# the GitHub Releases page — nothing is compiled on the target host.
 #
-# Defaults:
-#   --backend-bin  /usr/local/bin/netwatch
-#   --frontend-dir /opt/netwatch-ui
-#   --config-dir   /etc/netwatch
-#   --state-dir    /var/lib/netwatch
+# Usage:
+#   sudo ./install.sh [--version vX.Y.Z] [--from-source]
+#                     [--backend-bin PATH] [--frontend-dir PATH] [--no-enable]
+#
+#   --version vX.Y.Z  Install a specific release (default: latest)
+#   --from-source     Use locally built artifacts instead of downloading:
+#                       backend/bin/netwatch-linux-<arch>  (make build-linux)
+#                       frontend/.output/public            (pnpm build)
 #
 # Requirements:
 #   - systemd
-#   - nginx              (serves the static UI; no Node.js runtime needed)
-#   - Built backend binary:  cd backend && make build-linux       (GOARCH=arm64 for arm)
-#   - Built frontend:        cd frontend && pnpm build            (emits .output/public/)
+#   - nginx   (serves the static UI; no Node.js runtime needed)
+#   - curl + tar          (download mode, the default)
+#   - Go + pnpm           (only for --from-source)
 
 set -euo pipefail
+
+REPO_SLUG="${REPO_SLUG:-saidtaylan/netwatch}"
+VERSION="${VERSION:-latest}"
+SOURCE=false
 
 BACKEND_BIN="${BACKEND_BIN:-/usr/local/bin/netwatch}"
 FRONTEND_DIR="${FRONTEND_DIR:-/opt/netwatch-ui}"
@@ -30,6 +37,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # ── Parse args ───────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --version)      VERSION="$2"; shift 2 ;;
+    --from-source)  SOURCE=true; shift ;;
     --backend-bin)  BACKEND_BIN="$2"; shift 2 ;;
     --frontend-dir) FRONTEND_DIR="$2"; shift 2 ;;
     --no-enable)    ENABLE=false; shift ;;
@@ -44,12 +53,20 @@ case "$(uname -m)" in
   *) echo "WARN: unknown architecture '$(uname -m)', defaulting to amd64"; ARCH=amd64 ;;
 esac
 
+# release asset URL helper (latest vs pinned tag)
+asset_url() {
+  if [[ "$VERSION" == "latest" ]]; then
+    echo "https://github.com/$REPO_SLUG/releases/latest/download/$1"
+  else
+    echo "https://github.com/$REPO_SLUG/releases/download/$VERSION/$1"
+  fi
+}
+
 echo "==> Installing netwatch"
+echo "    Source         : $([[ "$SOURCE" == true ]] && echo 'local build (--from-source)' || echo "GitHub Releases ($VERSION)")"
 echo "    Architecture   : $ARCH"
 echo "    Backend binary : $BACKEND_BIN"
 echo "    Frontend dir   : $FRONTEND_DIR"
-echo "    Config dir     : $CONFIG_DIR"
-echo "    State dir      : $STATE_DIR"
 
 # ── Create user ───────────────────────────────────────────────────────────────
 if ! id netwatch &>/dev/null; then
@@ -62,18 +79,21 @@ mkdir -p "$CONFIG_DIR" "$STATE_DIR"
 chown netwatch:netwatch "$CONFIG_DIR" "$STATE_DIR"
 chmod 750 "$CONFIG_DIR" "$STATE_DIR"
 
-# ── Backend binary (arch-aware; falls back to any built linux binary) ─────────
-BUILT_BIN="$REPO_ROOT/backend/bin/netwatch-linux-$ARCH"
-if [[ ! -f "$BUILT_BIN" ]]; then
-  BUILT_BIN="$(ls "$REPO_ROOT"/backend/bin/netwatch-linux-* 2>/dev/null | head -1 || true)"
-fi
-if [[ -n "${BUILT_BIN:-}" && -f "$BUILT_BIN" ]]; then
-  echo "==> Installing backend binary → $BACKEND_BIN  (from $(basename "$BUILT_BIN"))"
-  install -m 755 "$BUILT_BIN" "$BACKEND_BIN"
+# ── Backend binary ────────────────────────────────────────────────────────────
+if [[ "$SOURCE" == true ]]; then
+  BUILT_BIN="$REPO_ROOT/backend/bin/netwatch-linux-$ARCH"
+  [[ -f "$BUILT_BIN" ]] || BUILT_BIN="$(ls "$REPO_ROOT"/backend/bin/netwatch-linux-* 2>/dev/null | head -1 || true)"
+  if [[ -n "${BUILT_BIN:-}" && -f "$BUILT_BIN" ]]; then
+    echo "==> Installing backend binary → $BACKEND_BIN  (local: $(basename "$BUILT_BIN"))"
+    install -m 755 "$BUILT_BIN" "$BACKEND_BIN"
+  else
+    echo "ERROR: --from-source set but no binary in $REPO_ROOT/backend/bin/."
+    echo "       Run:  cd backend && make build-linux [GOARCH=arm64]"; exit 1
+  fi
 else
-  echo "WARN: No built binary found in $REPO_ROOT/backend/bin/"
-  echo "      Run:  cd backend && make build-linux            # amd64"
-  echo "      or:   cd backend && make build-linux GOARCH=arm64"
+  echo "==> Downloading backend binary → $BACKEND_BIN  (netwatch-linux-$ARCH)"
+  curl -fSL --retry 3 -o "$BACKEND_BIN" "$(asset_url "netwatch-linux-$ARCH")"
+  chmod 755 "$BACKEND_BIN"
 fi
 
 # ── Config (minimal runnable skeleton; full reference: config.example.yaml) ───
@@ -91,37 +111,45 @@ install -m 644 "$SCRIPT_DIR/netwatch-backend.service" /etc/systemd/system/
 install -m 644 "$SCRIPT_DIR/netwatch.target"          /etc/systemd/system/
 systemctl daemon-reload
 
-# ── Frontend (static files served by nginx) ──────────────────────────────────
-FRONTEND_OUTPUT="$REPO_ROOT/frontend/.output/public"
-if [[ -d "$FRONTEND_OUTPUT" ]]; then
-  echo "==> Installing UI static files → $FRONTEND_DIR"
-  mkdir -p "$FRONTEND_DIR"
-  cp -r "$FRONTEND_OUTPUT/." "$FRONTEND_DIR/"
-
-  if command -v nginx &>/dev/null; then
-    echo "==> Configuring nginx site"
-    if [[ -d /etc/nginx/sites-available ]]; then            # Debian/Ubuntu
-      install -m 644 "$SCRIPT_DIR/netwatch-ui.nginx.conf" /etc/nginx/sites-available/netwatch
-      ln -sf /etc/nginx/sites-available/netwatch /etc/nginx/sites-enabled/netwatch
-      rm -f /etc/nginx/sites-enabled/default
-    else                                                    # RHEL/CentOS
-      install -m 644 "$SCRIPT_DIR/netwatch-ui.nginx.conf" /etc/nginx/conf.d/netwatch.conf
-    fi
-    if nginx -t; then
-      systemctl enable nginx >/dev/null 2>&1 || true
-      systemctl reload nginx 2>/dev/null || systemctl restart nginx
-      echo "    UI available on http://<host>/  (port 80)"
-    else
-      echo "WARN: nginx config test failed — review /etc/nginx and reload manually."
-    fi
+# ── Frontend static files → $FRONTEND_DIR ────────────────────────────────────
+mkdir -p "$FRONTEND_DIR"
+if [[ "$SOURCE" == true ]]; then
+  FRONTEND_OUTPUT="$REPO_ROOT/frontend/.output/public"
+  if [[ -d "$FRONTEND_OUTPUT" ]]; then
+    echo "==> Installing UI static files → $FRONTEND_DIR  (local build)"
+    cp -r "$FRONTEND_OUTPUT/." "$FRONTEND_DIR/"
   else
-    echo "WARN: nginx not installed — install it, then re-run this script."
-    echo "      The static UI is in $FRONTEND_DIR; point nginx 'root' there with"
-    echo "      an SPA fallback (try_files \$uri \$uri/ /index.html;)."
+    echo "ERROR: --from-source set but $FRONTEND_OUTPUT missing. Run: cd frontend && pnpm build"; exit 1
   fi
 else
-  echo "WARN: Frontend build not found at $FRONTEND_OUTPUT"
-  echo "      Run:  cd frontend && pnpm build"
+  echo "==> Downloading UI bundle → $FRONTEND_DIR  (netwatch-frontend.tar.gz)"
+  tmp="$(mktemp)"
+  curl -fSL --retry 3 -o "$tmp" "$(asset_url netwatch-frontend.tar.gz)"
+  tar -xzf "$tmp" -C "$FRONTEND_DIR"
+  rm -f "$tmp"
+fi
+
+# ── nginx site ───────────────────────────────────────────────────────────────
+if command -v nginx &>/dev/null; then
+  echo "==> Configuring nginx site"
+  if [[ -d /etc/nginx/sites-available ]]; then            # Debian/Ubuntu
+    install -m 644 "$SCRIPT_DIR/netwatch-ui.nginx.conf" /etc/nginx/sites-available/netwatch
+    ln -sf /etc/nginx/sites-available/netwatch /etc/nginx/sites-enabled/netwatch
+    rm -f /etc/nginx/sites-enabled/default
+  else                                                    # RHEL/CentOS
+    install -m 644 "$SCRIPT_DIR/netwatch-ui.nginx.conf" /etc/nginx/conf.d/netwatch.conf
+  fi
+  if nginx -t; then
+    systemctl enable nginx >/dev/null 2>&1 || true
+    systemctl reload nginx 2>/dev/null || systemctl restart nginx
+    echo "    UI available on http://<host>/  (port 80)"
+  else
+    echo "WARN: nginx config test failed — review /etc/nginx and reload manually."
+  fi
+else
+  echo "WARN: nginx not installed — install it, then re-run this script."
+  echo "      The static UI is in $FRONTEND_DIR; point nginx 'root' there with"
+  echo "      an SPA fallback (try_files \$uri \$uri/ /index.html;)."
 fi
 
 # ── Enable + start backend ───────────────────────────────────────────────────

@@ -18,10 +18,65 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
-  packages: write
+  contents: write   # create the release + upload binary/frontend assets
+  packages: write   # push the container image to GHCR
 
 jobs:
+  # ── Prebuilt artifacts (so installs never build from source) ───────────────
+  artifacts:
+    name: Build binaries + frontend bundle, attach to release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+          cache-dependency-path: backend/go.sum
+
+      - name: Build backend binaries (linux amd64 + arm64)
+        working-directory: backend
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build \
+              -ldflags="-s -w -X github.com/saidtaylan/netwatch/internal/engine.BinaryName=netwatch" \
+              -trimpath -o "dist/netwatch-linux-$arch" ./cmd/linux/
+          done
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '11'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Build frontend static bundle
+        working-directory: frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+          tar -czf ../backend/dist/netwatch-frontend.tar.gz -C .output/public .
+
+      - name: Checksums
+        working-directory: backend/dist
+        run: sha256sum netwatch-* > SHA256SUMS.txt
+
+      - name: Create/update GitHub Release with assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            backend/dist/netwatch-linux-amd64
+            backend/dist/netwatch-linux-arm64
+            backend/dist/netwatch-frontend.tar.gz
+            backend/dist/SHA256SUMS.txt
+
+  # ── Container image → GHCR ─────────────────────────────────────────────────
   docker:
     name: Build & push image
     runs-on: ubuntu-latest

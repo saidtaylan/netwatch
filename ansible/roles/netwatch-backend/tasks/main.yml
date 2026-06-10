@@ -34,7 +34,31 @@
     group: "{{ netwatch_group }}"
     mode: "0750"
 
-- name: Copy netwatch binary
+# Map the host CPU arch to the release asset suffix.
+- name: Resolve target architecture
+  ansible.builtin.set_fact:
+    netwatch_arch: "{{ {'x86_64': 'amd64', 'amd64': 'amd64', 'aarch64': 'arm64', 'arm64': 'arm64'}[ansible_architecture] | default('amd64') }}"
+
+- name: Compute release download base URL
+  ansible.builtin.set_fact:
+    netwatch_dl_base: >-
+      {{ ('https://github.com/' + netwatch_repo_slug + '/releases/latest/download')
+         if netwatch_version == 'latest'
+         else ('https://github.com/' + netwatch_repo_slug + '/releases/download/' + netwatch_version) }}
+
+# Default: download the prebuilt binary from the GitHub Releases page.
+- name: Download netwatch binary (release)
+  ansible.builtin.get_url:
+    url: "{{ netwatch_dl_base }}/netwatch-linux-{{ netwatch_arch }}"
+    dest: "{{ netwatch_binary_dest }}"
+    owner: root
+    group: root
+    mode: "0755"
+  notify: restart netwatch-backend
+  when: netwatch_install_from == "release"
+
+# Alternative: use a locally built binary from ansible/files/netwatch.
+- name: Copy netwatch binary (local build)
   ansible.builtin.copy:
     src: "{{ netwatch_binary_src }}"
     dest: "{{ netwatch_binary_dest }}"
@@ -42,6 +66,7 @@
     group: root
     mode: "0755"
   notify: restart netwatch-backend
+  when: netwatch_install_from == "local"
 
 - name: Template netwatch config.yaml
   ansible.builtin.template:
