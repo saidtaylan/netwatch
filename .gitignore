@@ -65,7 +65,7 @@ credentials.env
 # Internal development docs — kept locally, not published to the public repo
 CLAUDE.md
 developments.md
-docs/
+/docs/
 system_map.md
 sprint.md
 todo.md
