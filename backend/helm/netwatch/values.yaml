@@ -4,8 +4,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 image:
-  repository: netwatch
-  tag:        "latest"
+  # Published multi-arch image (amd64+arm64) from GitHub Releases / GHCR.
+  repository: ghcr.io/saidtaylan/netwatch
+  tag:        "latest"        # or pin a release tag, e.g. "v0.1.3"
   pullPolicy: IfNotPresent
 
 # nameOverride / fullnameOverride follow standard Helm conventions.
