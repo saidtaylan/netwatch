@@ -304,6 +304,28 @@ func TestSelectProbers_AllCandidatesWhenBelowFactor(t *testing.T) {
 	}
 }
 
+func TestSelectProbers_Percent(t *testing.T) {
+	nodes := []string{"n1", "n2", "n3", "n4", "n5", "n6", "n7", "n8", "n9", "n10"}
+	m := &Manager{
+		cfg:        Config{NodeName: "n1", ProbeReplicationPercent: 30},
+		peerStates: make(map[string]map[string]GossipPayload),
+	}
+	setAliveForTest(m, nodes...)
+	for _, n := range nodes {
+		seed(m, n, "t1")
+	}
+	// 30% of 10 candidates → 3 probers.
+	if got := m.SelectProbers("t1"); len(got) != 3 {
+		t.Fatalf("percent=30 of 10: want 3 probers, got %d (%v)", len(got), got)
+	}
+
+	// 10% of 10 → 1 (never zero).
+	m.cfg.ProbeReplicationPercent = 10
+	if got := m.SelectProbers("t1"); len(got) != 1 {
+		t.Fatalf("percent=10 of 10: want 1 prober, got %d (%v)", len(got), got)
+	}
+}
+
 func TestSelectProbers_DeterministicWith100Iterations(t *testing.T) {
 	m := makeMgr("n3", "", 3)
 	setAliveForTest(m, "n1", "n2", "n3", "n4", "n5")

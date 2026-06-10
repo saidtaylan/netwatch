@@ -454,6 +454,7 @@ cluster:
   expected_node_count: 3
   min_quorum_ratio:    0.5               # suppress alerts if < 50% of nodes alive
   probe_replication_factor: 3            # max nodes that probe any single target
+  # probe_replication_percent: 10        # alternative: % of nodes instead of a fixed count (overrides factor)
   zone: "eu-central"                     # optional, for geo-aware probe distribution
 ```
 

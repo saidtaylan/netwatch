@@ -60,8 +60,9 @@ type SharedClusterConfig struct {
 	Peers                  []string `json:"peers,omitempty" yaml:"peers,omitempty"`
 	ExpectedNodeCount      int      `json:"expected_node_count,omitempty" yaml:"expected_node_count,omitempty"`
 	MinQuorumRatio         float64  `json:"min_quorum_ratio,omitempty" yaml:"min_quorum_ratio,omitempty"`
-	ProbeReplicationFactor int      `json:"probe_replication_factor,omitempty" yaml:"probe_replication_factor,omitempty"`
-	MinProbeConfirmations  int      `json:"min_probe_confirmations,omitempty" yaml:"min_probe_confirmations,omitempty"`
+	ProbeReplicationFactor  int      `json:"probe_replication_factor,omitempty" yaml:"probe_replication_factor,omitempty"`
+	ProbeReplicationPercent int      `json:"probe_replication_percent,omitempty" yaml:"probe_replication_percent,omitempty"`
+	MinProbeConfirmations   int      `json:"min_probe_confirmations,omitempty" yaml:"min_probe_confirmations,omitempty"`
 }
 
 // ConfigPushResult is returned by PUT /cluster/config and POST /cluster/config/sync.
@@ -137,7 +138,7 @@ func extractSharedMap(m map[string]interface{}) map[string]interface{} {
 
 	clusterShared := []string{
 		"keyring", "peers", "expected_node_count", "min_quorum_ratio",
-		"probe_replication_factor", "min_probe_confirmations",
+		"probe_replication_factor", "probe_replication_percent", "min_probe_confirmations",
 	}
 	if clusterRaw, ok := m["cluster"]; ok {
 		if cm, ok := clusterRaw.(map[string]interface{}); ok {
@@ -292,7 +293,7 @@ func mergeSharedMap(dst, src map[string]interface{}) {
 	clusterShared := map[string]bool{
 		"keyring": true, "peers": true, "expected_node_count": true,
 		"min_quorum_ratio": true, "probe_replication_factor": true,
-		"min_probe_confirmations": true,
+		"probe_replication_percent": true, "min_probe_confirmations": true,
 	}
 
 	for k, v := range src {

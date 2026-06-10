@@ -93,7 +93,7 @@ func (m *Manager) ProberAssignmentsSnapshot() ProberSnapshot {
 
 	return ProberSnapshot{
 		LocalNode:         m.cfg.NodeName,
-		ReplicationFactor: m.cfg.effectiveReplicationFactor(),
+		ReplicationFactor: m.ReplicationFactor(),
 		Members:           m.Members(),
 		Assignments:       assignments,
 	}
@@ -236,7 +236,7 @@ func (m *Manager) FleetSummarySnapshot() FleetSummary {
 			Isolated:          m.isolated.Load(),
 			ExpectedNodeCount: m.cfg.ExpectedNodeCount,
 			MinQuorumRatio:    m.cfg.MinQuorumRatio,
-			ReplicationFactor: m.cfg.effectiveReplicationFactor(),
+			ReplicationFactor: m.ReplicationFactor(),
 		},
 		Members:     members,
 		Targets:     counts,

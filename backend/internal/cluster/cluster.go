@@ -109,6 +109,19 @@ type Config struct {
 	// keep the current behaviour with zero configuration.
 	ProbeReplicationFactor int `json:"probe_replication_factor,omitempty"`
 
+	// ProbeReplicationPercent, when > 0, expresses the prober count as a
+	// percentage of the eligible candidate nodes instead of a fixed number —
+	// useful for large clusters where a constant like 3 may be too few or too
+	// many. The effective factor is ceil(percent/100 × candidates), at least 1,
+	// and it takes precedence over ProbeReplicationFactor.
+	//
+	// Example: percent=10 on 100 candidates → 10 probers; on 20 → 2.
+	//
+	// Because it is derived from the candidate set every node already agrees on
+	// (gossiped peer states), all nodes compute the same effective factor, so
+	// the exactly-once / deterministic-assignment guarantees are preserved.
+	ProbeReplicationPercent int `json:"probe_replication_percent,omitempty"`
+
 	// ConfigSync holds gossip-based config drift detection settings (P1.5).
 	// When nil or Enabled=false, no config hash is broadcast.
 	ConfigSync *ConfigSyncConfig `json:"config_sync,omitempty"`
@@ -124,9 +137,20 @@ type Config struct {
 	MinProbeConfirmations int `json:"min_probe_confirmations,omitempty"`
 }
 
-// effectiveReplicationFactor returns ProbeReplicationFactor when set, else the
-// default of 3. Centralised so the default is defined in one place.
-func (c Config) effectiveReplicationFactor() int {
+// effectiveReplicationFactor resolves the desired prober count for a target
+// given the number of eligible candidate nodes. Precedence:
+//   - ProbeReplicationPercent > 0 → ceil(percent/100 × candidates), at least 1
+//   - else ProbeReplicationFactor when set
+//   - else the default of 3
+// Centralised so the default and the percent maths live in one place.
+func (c Config) effectiveReplicationFactor(candidates int) int {
+	if c.ProbeReplicationPercent > 0 {
+		f := int(math.Ceil(float64(c.ProbeReplicationPercent) * float64(candidates) / 100.0))
+		if f < 1 {
+			f = 1
+		}
+		return f
+	}
 	if c.ProbeReplicationFactor > 0 {
 		return c.ProbeReplicationFactor
 	}
@@ -155,6 +179,9 @@ func (c Config) Validate() error {
 	}
 	if c.ProbeReplicationFactor < 0 {
 		return fmt.Errorf("cluster.probe_replication_factor must be >= 0, got %d", c.ProbeReplicationFactor)
+	}
+	if c.ProbeReplicationPercent < 0 || c.ProbeReplicationPercent > 100 {
+		return fmt.Errorf("cluster.probe_replication_percent must be 0–100, got %d", c.ProbeReplicationPercent)
 	}
 	// Zone is free-form text — no constraints. An empty value disables
 	// zone-aware prober selection for this node specifically.
@@ -1343,9 +1370,12 @@ func (m *Manager) QuorumHealthy() bool {
 	return m.checkQuorum()
 }
 
-// ReplicationFactor returns the configured probe_replication_factor (default 3).
+// ReplicationFactor returns the current effective prober count. With a fixed
+// probe_replication_factor this is that number; with probe_replication_percent
+// it is derived from the live cluster size (a representative value for display
+// and metrics — per-target selection uses each target's own candidate count).
 func (m *Manager) ReplicationFactor() int {
-	return m.cfg.effectiveReplicationFactor()
+	return m.cfg.effectiveReplicationFactor(m.AliveCount())
 }
 
 // MinProbeConfirmations returns the configured min_probe_confirmations (default 0 = 1).

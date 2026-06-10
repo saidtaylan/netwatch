@@ -411,7 +411,7 @@ func (m *Manager) SelectProbers(targetID string) []string {
 	if len(candidates) == 0 {
 		return nil
 	}
-	factor := m.cfg.effectiveReplicationFactor()
+	factor := m.cfg.effectiveReplicationFactor(len(candidates))
 	if len(candidates) <= factor {
 		return candidates
 	}

@@ -297,6 +297,7 @@ export interface SharedConfig {
     expected_node_count?:     number
     min_quorum_ratio?:        number
     probe_replication_factor?: number
+    probe_replication_percent?: number
     min_probe_confirmations?: number
   }
 }

@@ -108,6 +108,7 @@ Copy `config.example.yaml` as a starting point. Values that contain `${VARNAME}`
 | `cluster.expected_node_count` | int | `0` | Total expected cluster members. Used to compute quorum threshold |
 | `cluster.min_quorum_ratio` | float | `0.5` | Fraction of `expected_node_count` that must be alive for alerts to fire |
 | `cluster.probe_replication_factor` | int | `3` | Number of nodes that probe each target. Others listen passively |
+| `cluster.probe_replication_percent` | int | `0` | Alternative to the fixed factor: prober count as a % of candidate nodes (`ceil(pct/100×N)`, min 1). When > 0 it overrides the factor — handy for large clusters |
 | `cluster.zone` | string | _(empty)_ | Availability zone / data-centre label. Prober selection spreads across distinct zones |
 | `cluster.region` | string | _(empty)_ | Broader geographic region. Used for `probe_from_regions` target constraint |
 

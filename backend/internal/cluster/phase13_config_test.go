@@ -10,7 +10,7 @@ import (
 
 func TestConfig_EffectiveReplicationFactor_DefaultsToThree(t *testing.T) {
 	c := Config{}
-	if got := c.effectiveReplicationFactor(); got != 3 {
+	if got := c.effectiveReplicationFactor(100); got != 3 {
 		t.Fatalf("default factor: want 3, got %d", got)
 	}
 }
@@ -26,8 +26,45 @@ func TestConfig_EffectiveReplicationFactor_ExplicitOverride(t *testing.T) {
 	}
 	for _, c := range cases {
 		cfg := Config{ProbeReplicationFactor: c.in}
-		if got := cfg.effectiveReplicationFactor(); got != c.want {
+		// Candidate count must not affect a fixed factor.
+		if got := cfg.effectiveReplicationFactor(50); got != c.want {
 			t.Errorf("factor=%d: want %d, got %d", c.in, c.want, got)
+		}
+	}
+}
+
+func TestConfig_EffectiveReplicationFactor_Percent(t *testing.T) {
+	cases := []struct {
+		percent, candidates, want int
+	}{
+		{10, 100, 10}, // 10% of 100
+		{10, 20, 2},   // 10% of 20
+		{10, 3, 1},    // ceil(0.3) → 1 (never zero)
+		{50, 3, 2},    // ceil(1.5) → 2
+		{100, 7, 7},   // all
+		{25, 8, 2},    // exactly 2
+		{33, 9, 3},    // ceil(2.97) → 3
+	}
+	for _, c := range cases {
+		cfg := Config{ProbeReplicationPercent: c.percent}
+		if got := cfg.effectiveReplicationFactor(c.candidates); got != c.want {
+			t.Errorf("percent=%d candidates=%d: want %d, got %d", c.percent, c.candidates, c.want, got)
+		}
+	}
+}
+
+func TestConfig_EffectiveReplicationFactor_PercentBeatsFactor(t *testing.T) {
+	cfg := Config{ProbeReplicationFactor: 3, ProbeReplicationPercent: 10}
+	if got := cfg.effectiveReplicationFactor(100); got != 10 {
+		t.Fatalf("percent should take precedence: want 10, got %d", got)
+	}
+}
+
+func TestConfig_Validate_RejectsBadPercent(t *testing.T) {
+	for _, p := range []int{-1, 101, 250} {
+		cfg := Config{Enabled: true, NodeName: "n1", ProbeReplicationPercent: p}
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("percent=%d: expected validation error", p)
 		}
 	}
 }

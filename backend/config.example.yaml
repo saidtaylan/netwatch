@@ -267,6 +267,14 @@ cluster:
   # to a number larger than the cluster size, e.g. 999.
   probe_replication_factor: 3
 
+  # Alternative to the fixed factor above: express the prober count as a
+  # PERCENTAGE of the eligible candidate nodes. Handy on large clusters where a
+  # constant is awkward. When > 0 it takes precedence over probe_replication_factor.
+  # Effective probers = ceil(percent/100 × candidates), at least 1.
+  #   e.g. probe_replication_percent: 10  → 10% of nodes (10 of 100, 2 of 20).
+  # 0 (default) = disabled, use probe_replication_factor.
+  # probe_replication_percent: 0
+
   # Minimum number of probers that must independently reach hard_down
   # before the responsible node fires an alert. Default 0 (treated as 1).
   #
