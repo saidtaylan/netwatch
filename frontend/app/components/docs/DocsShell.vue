@@ -131,8 +131,6 @@ onBeforeUnmount(() => observer?.disconnect())
 .dark .docs-content th { background: rgb(31 41 55); }
 .docs-content hr { border: 0; border-top: 1px solid rgb(229 231 235); margin: 2rem 0; }
 .dark .docs-content hr { border-top-color: rgb(55 65 81); }
-.docs-content .header-anchor { color: rgb(156 163 175); text-decoration: none; margin-left: 0.4rem; opacity: 0; font-weight: 400; }
-.docs-content h2:hover .header-anchor, .docs-content h3:hover .header-anchor { opacity: 1; }
 
 /* ── Compact highlight.js theme (adapts to dark mode) ────────────── */
 .hljs-comment, .hljs-quote { color: rgb(107 114 128); font-style: italic; }

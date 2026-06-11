@@ -44,10 +44,9 @@ const md: MarkdownIt = new MarkdownIt({
   },
 })
 
-md.use(anchor, {
-  slugify,
-  permalink: anchor.permalink.headerLink(),
-})
+// Adds id="" to every heading (so the TOC can link to #id). No permalink symbol
+// or link wrapper — headings render as plain, fully-styleable text.
+md.use(anchor, { slugify })
 
 /** Render markdown to sanitized HTML and extract an h2/h3 table of contents. */
 export function renderMarkdown(src: string): { html: string; toc: TocEntry[] } {
