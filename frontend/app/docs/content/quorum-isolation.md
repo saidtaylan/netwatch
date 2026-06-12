@@ -10,7 +10,14 @@ Each node continuously checks how many peers it can see against the expected siz
 - `min_quorum_ratio` *(default 0.5)* — the fraction that must be alive.
 - A node has quorum when `alive ≥ floor(expected_node_count × min_quorum_ratio) + 1` — i.e. a strict majority by default.
 
-The check runs on a loop (`runQuorumLoop`, every 5s) and drives the `network_prober_quorum_healthy` metric.
+```
+needed = floor(expected_node_count × min_quorum_ratio) + 1
+quorum = aliveCount ≥ needed
+```
+
+> **Opt-out:** if `expected_node_count ≤ 0`, the check always returns "quorum healthy" — quorum gating is effectively disabled. Set it to your real steady-state size to turn the protection on.
+
+The check runs on a loop (`runQuorumLoop`, every 5 s) and drives the `network_prober_quorum_healthy` metric; a lost-quorum transition flips the node into isolated mode.
 
 ## Isolated mode
 

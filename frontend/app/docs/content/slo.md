@@ -28,9 +28,27 @@ slo:
 Outages are recorded as **incidents** when the state machine fires `markHardDown` / `markRecovered`:
 
 - `RecordStart` opens an incident; `RecordEnd` closes it.
-- `ComputeSLO` sums incident durations inside the window, clamps to the window, and derives the actual uptime and remaining error budget.
 - Incidents persist to `incidents.json` (next to `state_file`) in the `slo_incidents` table. **They are local-only** — each node keeps its own observations; aggregating them cluster-wide would multiply downtime.
 - Open incidents (no end time) are re-opened automatically after a restart, so a crash mid-outage doesn't lose the incident.
+
+`ComputeSLO(target, targetUptime, window)` evaluates the SLO over a **rolling** window ending now. For each incident overlapping `[now − window, now]`:
+
+```
+start    = max(incident.startedAt, now − window)   # clamp to window
+end      = incident.endedAt  OR  now               # an open incident counts up to "now"
+downtime += max(0, end − start)
+```
+
+then (with `windowSec = window in seconds`, `downtime` capped at `windowSec` as a clock-skew guard):
+
+```
+actualUptime = (windowSec − downtime) / windowSec
+errorBudget  = round(windowSec × (1 − targetUptime))   # allowed downtime, seconds
+remaining    = errorBudget − downtime                  # negative ⇒ breached
+breached     = actualUptime < targetUptime
+```
+
+So an **active** outage erodes the budget in real time (its `end` is `now`), and the result also exposes the incident count and the longest single incident — surfaced as alert vars and in the UI.
 
 ## Breach alerts
 

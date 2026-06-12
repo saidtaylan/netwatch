@@ -15,17 +15,21 @@ Without reconciliation, that node would alert on stale information — e.g. fire
 
 netwatch rides memberlist's **push-pull** mechanism. Periodically (and on every join) two nodes exchange a full snapshot of their state and merge:
 
-- The cluster layer asks the engine for a snapshot via the `AntiEntropyProvider` interface — `FullState()` serializes the node's `lastKnown` map.
-- The remote snapshot is merged back with `ApplyRemoteState()`, using the same Lamport rule as live gossip: a remote entry wins only if its `seq` is higher (or equal with a greater node name).
-- Because the merge is Lamport-ordered, it is **idempotent and commutative** — applying snapshots in any order converges to the same result.
+- The cluster layer asks the engine for a snapshot via the `AntiEntropyProvider` interface — `FullState()` serializes a copy of the node's `lastKnown` map (every target's persisted state) to JSON.
+- The remote snapshot is merged back with `ApplyRemoteState()`. For each target it applies the **exact same Lamport rule as live gossip**, accepting the remote entry when:
+  1. there is **no local record** for that target, or
+  2. `remote.Seq > local.Seq`, or
+  3. `remote.Seq == local.Seq` **and** `remote.OwnerNode > local.OwnerNode` (the lexical tie-break).
+- Crucially, accepted entries are merged **without raising any alert** — the cluster already decided this state; anti-entropy only *reconciles* it. Updated entries are re-broadcast so the merge propagates onward.
+- Because the rule is a pure function of `(seq, owner_node)`, the merge is **idempotent and commutative** — applying snapshots in any order converges every node to the same result.
 
 ## Suppression during sync
 
 The dangerous moment is exactly when a rejoining node is catching up: if it started alerting mid-sync it could page on half-merged state. To prevent this:
 
 - During a join-time full sync the engine sets a `syncing` flag (`SetSyncing(true)`).
-- While `syncing` is true, the probe loops and the alert path **early-return** — no alerts are dispatched.
-- When the sync completes (`SetSyncing(false)`), normal operation resumes and prober assignments recompute.
+- While `syncing` is true, the probe loops, `runCheck`, and `processPending` all **early-return** — no probing escalations, no alerts.
+- When the sync completes (`SetSyncing(false)`) the node logs "sync complete", resumes normal operation, and — because membership/inventory may have shifted while it was catching up — triggers a `TriggerProberRecompute()` to apply any prober reassignments it deferred during the merge.
 
 This is why a **rolling restart of the entire fleet does not produce an alert storm**: each node reconciles to the cluster's current truth before it's allowed to alert.
 

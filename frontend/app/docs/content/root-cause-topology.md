@@ -35,11 +35,11 @@ This works **even across nodes**: root cause is resolved against the gossip-merg
 
 ## Cascading impact
 
-The graph is also traversed the other way. For a target that is down, `CascadingImpact` lists every target that (transitively) depends on it — the blast radius:
+The graph is also traversed the other way — over the **reverse edges** (who-depends-on-me). `CascadingImpact` does a depth-first walk of the reverse edges from the failed target, collecting every target that *transitively* depends on it — the blast radius:
 
-- `db-primary` down → `CASCADING_IMPACT=api-gateway,checkout`.
+- `db-primary` down → walk reverse edges → `CASCADING_IMPACT=api-gateway,checkout`.
 
-This is attached to the root cause's alert, so the one page you get says both *what failed* and *what it takes down*.
+`DependencyDepth(failed, rootCause)` is a breadth-first search over the same reverse edges from the root cause, returning the **hop distance** to the failed target (`0` when the failed target *is* the root cause). So `checkout`'s alert carries `ROOT_CAUSE=db-primary` and `DEPENDENCY_DEPTH=2` (db-primary → api-gateway → checkout). Both pieces are attached to the alert, so the one page you get says *what failed*, *why*, and *what it takes down*.
 
 ## In alerts
 
