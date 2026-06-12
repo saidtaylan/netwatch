@@ -171,6 +171,8 @@ type Target struct {
 	ProbeFromRegions []string `json:"probe_from_regions,omitempty"`
 }
 
+// active reports whether the target should be probed. A target is active unless
+// its Enabled field is explicitly false (nil means enabled by default).
 func (t Target) active() bool { return t.Enabled == nil || *t.Enabled }
 
 // key returns the canonical lookup key (ID if set, else Name).
@@ -182,6 +184,9 @@ func (t Target) key() string {
 	return t.Name
 }
 
+// typeKey returns a key that combines the probe type and the canonical key
+// ("type|key"), used to index pending/recovery maps so two targets that share a
+// name but differ in type never collide.
 func (t Target) typeKey() string { return t.Type + "|" + t.key() }
 
 // Config is the top-level configuration structure.
@@ -294,6 +299,12 @@ func (e *Engine) CORSOrigin() string {
 	return e.cfg.Admin.CORSOrigin
 }
 
+// The global* accessors below return the effective cluster-wide default for a
+// timing/threshold field, substituting a hard default when the config leaves it
+// unset. Per-target overrides are resolved on top of these by the effective*
+// helpers in loop.go.
+
+// globalMaxRetries returns the default retry budget before hard_down (default 1).
 func (c Config) globalMaxRetries() int {
 	if c.MaxRetries != nil {
 		return *c.MaxRetries
@@ -301,6 +312,8 @@ func (c Config) globalMaxRetries() int {
 	return 1
 }
 
+// globalRecoveryProbes returns the default consecutive successes required to
+// leave hard_down (default 1 = recover on first success).
 func (c Config) globalRecoveryProbes() int {
 	if c.RecoveryProbes != nil && *c.RecoveryProbes > 0 {
 		return *c.RecoveryProbes
@@ -308,6 +321,8 @@ func (c Config) globalRecoveryProbes() int {
 	return 1 // default: 1 successful probe = recovered (backward compat)
 }
 
+// globalRetryInterval returns the default seconds between soft-down retries
+// (default 30).
 func (c Config) globalRetryInterval() int {
 	if c.RetryIntervalSec != nil {
 		return *c.RetryIntervalSec
@@ -315,6 +330,8 @@ func (c Config) globalRetryInterval() int {
 	return 30
 }
 
+// globalTickerInterval returns the default retry-loop tick granularity in
+// seconds (default 5).
 func (c Config) globalTickerInterval() int {
 	if c.TickerIntervalSec != nil {
 		return *c.TickerIntervalSec
@@ -322,6 +339,7 @@ func (c Config) globalTickerInterval() int {
 	return 5
 }
 
+// globalProbeInterval returns the default probe interval in seconds (default 60).
 func (c Config) globalProbeInterval() int {
 	if c.ProbeIntervalSec != nil {
 		return *c.ProbeIntervalSec
@@ -329,6 +347,8 @@ func (c Config) globalProbeInterval() int {
 	return 60
 }
 
+// globalReloadInterval returns the config hot-reload interval in seconds,
+// clamped to a 5 s floor (default 30).
 func (c Config) globalReloadInterval() int {
 	if c.ReloadIntervalSec != nil && *c.ReloadIntervalSec >= 5 {
 		return *c.ReloadIntervalSec
@@ -336,6 +356,8 @@ func (c Config) globalReloadInterval() int {
 	return 30
 }
 
+// watchdogThresholdSec returns the Prometheus scrape-watchdog threshold in
+// seconds; 0 (the default) disables the watchdog.
 func (c Config) watchdogThresholdSec() int {
 	if c.WatchdogThresholdSec != nil {
 		return *c.WatchdogThresholdSec
@@ -497,8 +519,12 @@ func initLogger(logPath string) error {
 }
 
 // multiHandler fans out a single log record to multiple slog.Handlers.
+// multiHandler is a slog.Handler that fans every log record out to several
+// underlying handlers (e.g. stdout + a file), so netwatch can log to multiple
+// destinations at once.
 type multiHandler struct{ handlers []slog.Handler }
 
+// Enabled reports whether any underlying handler is enabled for the level.
 func (m *multiHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	for _, h := range m.handlers {
 		if h.Enabled(ctx, level) {
@@ -507,12 +533,17 @@ func (m *multiHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	}
 	return false
 }
+
+// Handle writes the record to every underlying handler (errors are ignored so
+// one failing sink doesn't suppress the others).
 func (m *multiHandler) Handle(ctx context.Context, r slog.Record) error {
 	for _, h := range m.handlers {
 		_ = h.Handle(ctx, r)
 	}
 	return nil
 }
+
+// WithAttrs returns a new multiHandler whose handlers each carry the given attrs.
 func (m *multiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	hs := make([]slog.Handler, len(m.handlers))
 	for i, h := range m.handlers {
@@ -520,6 +551,8 @@ func (m *multiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	}
 	return &multiHandler{handlers: hs}
 }
+
+// WithGroup returns a new multiHandler whose handlers each open the named group.
 func (m *multiHandler) WithGroup(name string) slog.Handler {
 	hs := make([]slog.Handler, len(m.handlers))
 	for i, h := range m.handlers {
@@ -531,7 +564,11 @@ func (m *multiHandler) WithGroup(name string) slog.Handler {
 // slogWriter bridges stdlib log → slog.Info so third-party libs use our handler.
 type slogWriter struct{}
 
+// newSlogWriter returns an io.Writer that forwards stdlib log output to slog.
 func newSlogWriter() *slogWriter { return &slogWriter{} }
+
+// Write implements io.Writer: it logs the (newline-trimmed) bytes via slog.Info
+// and reports the full input length as written.
 func (w *slogWriter) Write(p []byte) (int, error) {
 	slog.Info(strings.TrimRight(string(p), "\n"))
 	return len(p), nil
@@ -564,6 +601,12 @@ type stateFileV2 struct {
 	Targets map[string]PersistedState `json:"targets"`
 }
 
+// loadPersistedState reads the on-disk probe state (state.json) into the
+// in-memory lastKnown map at startup. It accepts the v2 envelope
+// ({"version":2,"targets":{...}}) and transparently migrates the legacy v1
+// format (a plain map[string]bool of up/down), rewriting the file as v2 so
+// future starts don't re-migrate. Missing/unreadable files are tolerated (the
+// node simply starts with no prior state). Called once during Init.
 func (e *Engine) loadPersistedState() {
 	e.mu.RLock()
 	path := e.cfg.StateFile
@@ -618,6 +661,10 @@ func (e *Engine) loadPersistedState() {
 	}
 }
 
+// persistState writes the in-memory lastKnown map to disk in the v2 format. The
+// write is atomic — it marshals to a temporary file and renames it over the real
+// path — so a crash mid-write never corrupts state.json. A no-op when no
+// state_file is configured. Called after every confirmed state transition.
 func (e *Engine) persistState() {
 	e.mu.RLock()
 	path := e.cfg.StateFile
@@ -1820,6 +1867,10 @@ func (e *Engine) LoadConfig() error {
 	return nil
 }
 
+// validateConfig checks the global (non-target) config fields at load time:
+// it validates the cluster section and enforces the lower bounds on the timing
+// fields (max_retries >= 0, retry_interval_sec >= 5, ticker_interval_sec >= 1,
+// probe_interval_sec >= 5). Returns the first violation so startup fails fast.
 func validateConfig(c Config) error {
 	if err := c.Cluster.Validate(); err != nil {
 		return err
@@ -1839,6 +1890,11 @@ func validateConfig(c Config) error {
 	return nil
 }
 
+// validateTargets checks every active target at config-load time: a non-empty
+// name, a unique key (no duplicates), a known probe type with a registered
+// checker, a valid URL for http targets, type-specific option validity (via the
+// checker's ValidateOptions), and sane per-target timing overrides. Disabled
+// targets are skipped. Returns the first problem found.
 func (e *Engine) validateTargets(targets []Target) error {
 	seen := make(map[string]bool)
 	for _, t := range targets {

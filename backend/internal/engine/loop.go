@@ -476,6 +476,8 @@ func (e *Engine) execProbe(ctx context.Context, t Target) (bool, error) {
 
 // ── Effective parameter helpers ───────────────────────────────────────────────
 
+// effectiveRecoveryProbes returns the recovery-probe threshold for a target: its
+// own override when set (> 0), otherwise the cluster-wide default.
 func (e *Engine) effectiveRecoveryProbes(t Target) int {
 	if t.RecoveryProbes != nil && *t.RecoveryProbes > 0 {
 		return *t.RecoveryProbes
@@ -486,6 +488,8 @@ func (e *Engine) effectiveRecoveryProbes(t Target) int {
 	return v
 }
 
+// effectiveMaxRetries returns the retry budget for a target: its own override
+// when set, otherwise the cluster-wide default.
 func (e *Engine) effectiveMaxRetries(t Target) int {
 	if t.MaxRetries != nil {
 		return *t.MaxRetries
@@ -496,6 +500,8 @@ func (e *Engine) effectiveMaxRetries(t Target) int {
 	return v
 }
 
+// effectiveRetryInterval returns the soft-down retry interval for a target as a
+// Duration: its own override when set, otherwise the cluster-wide default.
 func (e *Engine) effectiveRetryInterval(t Target) time.Duration {
 	if t.RetryIntervalSec != nil {
 		return time.Duration(*t.RetryIntervalSec) * time.Second
