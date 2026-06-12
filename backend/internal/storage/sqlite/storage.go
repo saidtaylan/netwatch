@@ -115,6 +115,8 @@ func Open(path string) (*Storage, error) {
 // Path returns the underlying database file path.
 func (s *Storage) Path() string { return s.path }
 
+// checkOpen returns an error if the store has been closed, guarding every
+// operation against use-after-close.
 func (s *Storage) checkOpen() error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -124,6 +126,9 @@ func (s *Storage) checkOpen() error {
 	return nil
 }
 
+// checkTable returns ErrTableNotKnown unless table is in the allow-list,
+// preventing writes to arbitrary/unknown table names (the table is interpolated
+// into SQL, so this is also an injection guard).
 func (s *Storage) checkTable(table string) error {
 	if !allowedTables[table] {
 		return fmt.Errorf("%w: %q", storage.ErrTableNotKnown, table)
@@ -426,6 +431,9 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
+// scanRecord reads one row (id, payload, the LWW version columns seq/updated_at/
+// updated_by, and the tombstone flag) into a storage.Record. Shared by Get and
+// List so the column order stays in one place. Returns a scan error.
 func scanRecord(r rowScanner) (storage.Record, error) {
 	var id string
 	var payload []byte

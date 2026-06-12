@@ -42,6 +42,8 @@ func (m *MemoryStorage) known(table string) bool {
 	return ok
 }
 
+// checkOpen returns an error if the in-memory store has been closed, so
+// operations after Close fail rather than silently succeed.
 func (m *MemoryStorage) checkOpen() error {
 	if m.closed {
 		return fmt.Errorf("storage: closed")

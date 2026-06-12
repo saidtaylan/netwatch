@@ -33,6 +33,11 @@ import (
 	sigs_yaml "sigs.k8s.io/yaml"
 )
 
+// main is the Linux entry point. It dispatches CLI subcommands (init / join /
+// validate / leave / uninstall / keyring), and with no subcommand starts the
+// agent: it builds the Engine, registers all HTTP handlers (auth, status,
+// fleet, cluster, CRUD, metrics), serves them, and handles graceful shutdown on
+// SIGINT/SIGTERM (leaving the cluster cleanly).
 func main() {
 	// Subcommand routing — if the first argument is a known verb (not a flag),
 	// handle it and exit. Everything else starts the monitoring agent.
@@ -2332,6 +2337,8 @@ func writeIfAbsent(path, content string) {
 
 // ── Config / unit templates ───────────────────────────────────────────────────
 
+// configSkeleton returns the contents of a minimal, runnable config.yaml written
+// by `netwatch init`, with paths rooted at cfgDir.
 func configSkeleton(cfgDir string) string {
 	type tdata struct{ BinaryName, CfgDir string }
 	tmpl := template.Must(template.New("cfg").Parse(
@@ -2388,6 +2395,9 @@ const credsSkeleton = `# Credentials for the monitoring agent.
 # DB_PASSWORD=secret
 `
 
+// systemdUnit returns a systemd service unit (with CAP_NET_RAW and journald
+// logging) that runs the agent against the config in cfgDir, written by
+// `netwatch init`.
 func systemdUnit(cfgDir string) string {
 	type tdata struct{ BinaryName, CfgDir string }
 	tmpl := template.Must(template.New("unit").Parse(
@@ -2844,6 +2854,9 @@ func validKeyringKey(s string) bool {
 	return len(raw) == 16 || len(raw) == 24 || len(raw) == 32
 }
 
+// keyringRawLen returns the decoded byte length of a base64 keyring key (trying
+// both standard and raw base64), used to confirm a key is a valid 16/24/32-byte
+// AES key without revealing it.
 func keyringRawLen(s string) int {
 	raw, err := base64.StdEncoding.DecodeString(s)
 	if err != nil {
@@ -2852,6 +2865,8 @@ func keyringRawLen(s string) int {
 	return len(raw)
 }
 
+// maskKeyring redacts a keyring key for logs/UI, showing only "****" plus the
+// last 6 characters so an operator can tell keys apart without exposing them.
 func maskKeyring(s string) string {
 	if len(s) <= 8 {
 		return "****"
