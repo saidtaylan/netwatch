@@ -11,6 +11,10 @@ export const useNodeConnection = () => {
   const nodes  = useNodesStore()
   const config = useRuntimeConfig()
 
+  // selectActiveNode races a /health request against all configured nodes and
+  // picks the first to respond (Promise.any), marking it active. Returns its URL,
+  // or null when no node is configured or reachable. This is the multi-node
+  // failover entry point.
   async function selectActiveNode(): Promise<string | null> {
     const candidates = nodes.configured
     if (candidates.length === 0) return null

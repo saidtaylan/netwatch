@@ -25,6 +25,9 @@ export function usePolling<T>(
     options?.intervalMs ?? ui.pollingIntervalMs
   )
 
+  // fetch runs the fetcher once, storing the result in `data` and clearing the
+  // error/streak on success, or recording the error and incrementing the
+  // consecutive-error streak (which drives the back-off) on failure.
   async function fetch() {
     loading.value = true
     try {
@@ -39,12 +42,16 @@ export function usePolling<T>(
     }
   }
 
+  // nextDelay returns the delay before the next poll: the base interval, scaled
+  // up to 3× under consecutive errors (exponential back-off, capped).
   function nextDelay(): number {
     // Back-off: base × min(2^errorStreak, 3) — caps at 3× base interval
     const factor = Math.min(Math.pow(2, errorStreak), 3)
     return intervalMs.value * (errorStreak > 0 ? factor : 1)
   }
 
+  // schedule arms the next poll after nextDelay(), skipping the fetch while the
+  // tab is hidden, then re-schedules itself.
   function schedule() {
     timer = setTimeout(async () => {
       if (import.meta.client && document.visibilityState !== 'hidden') {
@@ -54,6 +61,7 @@ export function usePolling<T>(
     }, nextDelay())
   }
 
+  // stop cancels any pending poll timer.
   function stop() {
     if (timer) { clearTimeout(timer); timer = null }
   }

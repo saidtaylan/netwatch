@@ -17,6 +17,8 @@ function jwtExp(token: string): number {
   }
 }
 
+/** Route guard: allows the public pages, otherwise requires a present,
+ * non-expired JWT (checked via jwtExp) and redirects to /connect when missing. */
 export default defineNuxtRouteMiddleware((to) => {
   const publicPages = ['connect', 'setup', 'login', 'reset-password']
   if (publicPages.includes(to.name as string)) return

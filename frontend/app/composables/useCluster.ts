@@ -1,5 +1,7 @@
 import type { ClusterState, ConfigSyncSnapshot } from '~/types/api'
 
+/** Polls cluster state (/cluster/state) and config-sync drift (/cluster/config),
+ * returning both as reactive, auto-refreshing refs. */
 export const useCluster = () => {
   const api = useApi()
 

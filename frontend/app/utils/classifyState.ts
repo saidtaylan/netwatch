@@ -30,10 +30,13 @@ export const CLASS_STYLE: Record<Classification, { color: string; label: string 
   AMBIGUOUS:          { color: 'text-gray-500',   label: 'Ambiguous' },
 }
 
+/** Returns the badge color + label for a target state, falling back to the
+ * "unknown" style for unrecognised values. */
 export function stateStyle(state: TargetState): StateStyle {
   return STATE_STYLE[state] ?? STATE_STYLE.unknown
 }
 
+/** Reports whether a state counts as down (hard_down or soft_down). */
 export function isDown(state: TargetState): boolean {
   return state === 'hard_down' || state === 'soft_down'
 }

@@ -1,5 +1,7 @@
 import type { MaintenanceWindow } from '~/types/api'
 
+/** Polls maintenance windows (/cluster/maintenance) and exposes create/cancel
+ * actions plus the currently-active windows, with toast feedback. */
 export const useMaintenance = () => {
   const api = useApi()
   const ui  = useUIStore()
@@ -9,6 +11,8 @@ export const useMaintenance = () => {
     { intervalMs: 15000 }
   )
 
+  /** Creates a maintenance window for a target (PUT /cluster/maintenance), shows
+   * a toast, and refreshes the list. Re-throws on failure. */
   async function create(targetId: string, durationMs: number, reason: string, createdBy = 'ui') {
     try {
       await api.put('/cluster/maintenance', {
@@ -25,6 +29,8 @@ export const useMaintenance = () => {
     }
   }
 
+  /** Cancels a maintenance window by id (DELETE /cluster/maintenance/{id}),
+   * shows a toast, and refreshes the list. Re-throws on failure. */
   async function cancel(id: string) {
     try {
       await api.del(`/cluster/maintenance/${id}`)

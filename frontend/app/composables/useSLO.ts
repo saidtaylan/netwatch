@@ -12,6 +12,8 @@
  */
 import type { SLOSnapshot, AlertEntry } from '~/types/api'
 
+/** Polls SLO results (/slo) every 60 s and pushes an alert-feed entry whenever a
+ * target's breach state flips, returning the reactive snapshot. */
 export const useSLO = () => {
   const api    = useApi()
   const alerts = useAlertsStore()
@@ -28,6 +30,9 @@ export const useSLO = () => {
     { intervalMs: 60000 }
   )
 
+  // detectBreaches compares each target's breach flag against the previous poll
+  // and pushes an alert-feed entry on a transition into breach, then records the
+  // new state.
   function detectBreaches(snapshot: SLOSnapshot) {
     if (!snapshot.targets) return
     for (const [id, t] of Object.entries(snapshot.targets)) {

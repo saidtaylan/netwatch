@@ -10,6 +10,8 @@
  */
 import type { AuthStatusResponse, AuthLoginResponse } from '~/types/api'
 
+/** Returns the auth helpers (status check, setup, login, logout) plus reactive
+ * auth state getters (see file header for the flow). */
 export const useAuth = () => {
   const store = useAuthStore()
   const nodes = useNodesStore()
@@ -63,6 +65,7 @@ export const useAuth = () => {
     return resp
   }
 
+  /** Clears the stored JWT/user and navigates back to the connect screen. */
   function logout() {
     store.logout()
     return navigateTo({ name: 'connect' })

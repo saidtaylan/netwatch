@@ -1,6 +1,10 @@
 import type { FleetSnapshot, FleetTarget } from '~/types/api'
 import type { AlertEntry } from '~/types/api'
 
+/** Polls the cluster-wide fleet view (/fleet/status) and exposes it as reactive
+ * helpers: the raw snapshot, a target list and id→target index, quorum/isolation
+ * flags, summary counts, and the list of down target ids. It also synthesises
+ * client-side alert-feed entries whenever a target's consensus state changes. */
 export const useFleet = () => {
   const api    = useApi()
   const alerts = useAlertsStore()
@@ -15,6 +19,10 @@ export const useFleet = () => {
     }
   )
 
+  // detectStateChanges compares each target's consensus state against the
+  // previous poll and pushes an in-memory alert-feed entry on any transition,
+  // then records the new state. This is the UI's local alert feed (the backend
+  // owns the real notifications).
   function detectStateChanges(snapshot: FleetSnapshot) {
     if (!snapshot.targets) return
     // targets is an array — iterate by id
@@ -53,6 +61,7 @@ export const useFleet = () => {
     return idx
   })
 
+  /** O(1) lookup of a fleet target by id, or null when not present. */
   const targetById = (id: string): FleetTarget | null => targetIndex.value[id] ?? null
 
   // Cluster info shortcuts (null in standalone mode)

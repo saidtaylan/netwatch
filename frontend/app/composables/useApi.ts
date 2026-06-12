@@ -18,11 +18,18 @@ async function waitFor(predicate: () => boolean, maxMs = 300, intervalMs = 50): 
   return predicate()
 }
 
+/** Returns the API helper bound to the active backend node (see file header). */
 export const useApi = () => {
   const auth  = useAuthStore()
   const nodes = useNodesStore()
   const { ensureActive, selectActiveNode } = useNodeConnection()
 
+  /**
+   * call performs a typed request to `path` on the active node. It resolves the
+   * base URL (waiting briefly for Pinia hydration if needed), injects the JWT,
+   * and on a network error fails over to another node and retries once; a 401
+   * logs the user out. Returns the parsed JSON of type T, or throws.
+   */
   async function call<T>(path: string, opts: FetchOptions<'json'> = {}): Promise<T> {
     let baseUrl = await ensureActive()
 
