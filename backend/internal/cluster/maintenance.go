@@ -85,6 +85,8 @@ func (m *Manager) BroadcastMaintenanceCancel(id string) {
 	m.broadcastMaintenance(msg)
 }
 
+// broadcastMaintenance gossips a maintenance-window change (create/cancel) to
+// every peer over reliable TCP so all nodes converge on the same active windows.
 func (m *Manager) broadcastMaintenance(msg MaintenanceBroadcast) {
 	data, err := json.Marshal(msg)
 	if err != nil {

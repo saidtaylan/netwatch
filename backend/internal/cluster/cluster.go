@@ -273,6 +273,8 @@ type broadcast struct {
 	data    []byte // pre-encoded JSON
 }
 
+// newBroadcast wraps a GossipPayload in a memberlist.Broadcast, pre-marshalling
+// it to JSON once. Returns an error if the payload can't be encoded.
 func newBroadcast(p GossipPayload) (*broadcast, error) {
 	data, err := json.Marshal(p)
 	if err != nil {
@@ -293,8 +295,12 @@ func (b *broadcast) Invalidates(other memberlist.Broadcast) bool {
 		b.payload.Seq >= ob.payload.Seq
 }
 
+// Message returns the encoded bytes memberlist gossips to peers.
 func (b *broadcast) Message() []byte { return b.data }
-func (b *broadcast) Finished()       {}
+
+// Finished is the memberlist callback invoked once the broadcast has been sent
+// to enough peers; nothing to clean up here.
+func (b *broadcast) Finished() {}
 
 // ── gossipDelegate (implements memberlist.Delegate) ───────────────────────────
 
@@ -319,6 +325,10 @@ type nodeMeta struct {
 	HTTPPort string `json:"http_port,omitempty"`
 }
 
+// NodeMeta returns this node's metadata (zone, region, HTTP port) encoded for
+// memberlist to attach to every gossip message, so peers learn each node's
+// labels without extra round-trips. If the encoded meta would exceed memberlist's
+// limit, optional fields are dropped (region first) to fit.
 func (d *gossipDelegate) NodeMeta(limit int) []byte {
 	full := nodeMeta{
 		Node:     d.mgr.cfg.NodeName,
@@ -459,6 +469,12 @@ type eventDelegate struct {
 	mgr *Manager
 }
 
+// NotifyJoin is the memberlist callback fired when a node joins. It rebuilds the
+// hash ring, schedules a debounced prober recompute (the new member changes
+// candidate sets), and re-broadcasts this node's inventory and config
+// fingerprint so the newcomer catches up. The work runs in a goroutine because
+// memberlist holds an internal lock during the callback that updateRing would
+// otherwise deadlock on.
 func (e *eventDelegate) NotifyJoin(node *memberlist.Node) {
 	slog.Info("cluster member joined", "node", node.Name, "addr", node.Addr)
 	// updateRing calls list.Members() which acquires nodeLock.RLock.
@@ -487,6 +503,10 @@ func (e *eventDelegate) NotifyJoin(node *memberlist.Node) {
 	}()
 }
 
+// NotifyLeave is the memberlist callback fired when a node leaves or is declared
+// dead. It drops that node's peer states, rebuilds the ring (which may make this
+// node the new primary/prober for targets the departed node owned), and
+// schedules a recompute. Runs asynchronously to avoid the memberlist lock.
 func (e *eventDelegate) NotifyLeave(node *memberlist.Node) {
 	slog.Info("cluster member left", "node", node.Name, "addr", node.Addr)
 	nodeName := node.Name
@@ -501,6 +521,9 @@ func (e *eventDelegate) NotifyLeave(node *memberlist.Node) {
 	}()
 }
 
+// NotifyUpdate is the memberlist callback fired when a node's metadata changes
+// (e.g. its zone label). It rebuilds the ring and schedules a recompute, since a
+// changed zone can alter zone-aware prober selection. Runs asynchronously.
 func (e *eventDelegate) NotifyUpdate(node *memberlist.Node) {
 	slog.Debug("cluster member updated", "node", node.Name)
 	go func() {
@@ -1523,6 +1546,8 @@ func (m *Manager) KeyringInfo() KeyringInfo {
 	return info
 }
 
+// nodeStateStr converts a memberlist node state enum into a human-readable
+// string ("alive"/"suspect"/"dead"/"left") for snapshots and the API.
 func nodeStateStr(s memberlist.NodeStateType) string {
 	switch s {
 	case memberlist.StateAlive:

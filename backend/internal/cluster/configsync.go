@@ -48,6 +48,8 @@ type ConfigSyncConfig struct {
 	SyncIntervalSec int `yaml:"sync_interval_sec,omitempty" json:"sync_interval_sec,omitempty"`
 }
 
+// effectiveSyncInterval returns how often the config fingerprint is broadcast,
+// enforcing a 5 s floor and defaulting to 30 s when unset/too small.
 func (c ConfigSyncConfig) effectiveSyncInterval() time.Duration {
 	if c.SyncIntervalSec >= 5 {
 		return time.Duration(c.SyncIntervalSec) * time.Second
@@ -84,6 +86,8 @@ type cfgBroadcast struct {
 	data []byte
 }
 
+// newCfgBroadcast wraps a ConfigBroadcast in a memberlist.Broadcast, marshalling
+// it once. Returns an error if the payload can't be encoded.
 func newCfgBroadcast(cb ConfigBroadcast) (*cfgBroadcast, error) {
 	data, err := json.Marshal(cb)
 	if err != nil {
@@ -99,8 +103,11 @@ func (b *cfgBroadcast) Invalidates(other memberlist.Broadcast) bool {
 	return ok
 }
 
+// Message returns the encoded config broadcast bytes for memberlist to gossip.
 func (b *cfgBroadcast) Message() []byte { return b.data }
-func (b *cfgBroadcast) Finished()       {}
+
+// Finished is memberlist's post-send callback; nothing to clean up.
+func (b *cfgBroadcast) Finished() {}
 
 // ── ConfigDrift ───────────────────────────────────────────────────────────────
 
