@@ -88,7 +88,7 @@ Every `hard_down`/`recovered` transition increments a per-target `seq` under loc
 |---|---|---|
 | `probe_interval_sec` (`interval_sec`) | 60 | How often the probe loop checks. |
 | `timeout` | 5 | Per-probe deadline; a timeout counts as a failure. |
-| `max_retries` | 2 | Retries before `hard_down` (total failures = `1 + max_retries`). |
+| `max_retries` | 1 | Retries before `hard_down` (total failures = `1 + max_retries`). |
 | `retry_interval_sec` | 30 | Delay between retries while `soft_down`. |
 | `ticker_interval_sec` | 5 | Granularity of the retry loop. |
 | `recovery_probes` | 1 | Consecutive successes required to leave `hard_down`. |

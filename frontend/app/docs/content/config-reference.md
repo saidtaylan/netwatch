@@ -33,7 +33,7 @@ A minimal runnable starter lives in `config.skeleton.yaml`; the fully annotated 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `timeout` | int (s) | `5` | Per-probe connect/response timeout. |
-| `max_retries` | int | `2` | Consecutive failures in the `soft_down` phase before a target is declared `hard_down`. |
+| `max_retries` | int | `1` | Retries in the `soft_down` phase before a target is declared `hard_down` (total failures = `1 + max_retries`). |
 | `retry_interval_sec` | int (s) | `30` | Delay between retries while `soft_down`. |
 | `probe_interval_sec` | int (s) | `60` | Default probe interval; overridable per target via `interval_sec`. |
 | `ticker_interval_sec` | int (s) | `5` | Granularity of the internal scheduler tick. |
