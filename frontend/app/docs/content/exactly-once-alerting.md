@@ -1,59 +1,72 @@
 # Exactly-once alerting
 
-With many nodes watching the same target, the hard part isn't *detecting* an outage — it's making sure it produces **exactly one** alert, from the right node, even as nodes come and go. This page walks the full decision chain.
+With many nodes watching the same target, the hard part isn't *detecting* an outage — it's making sure it produces **exactly one** alert, from the right node, even as nodes come and go. This page walks the full decision chain, in the exact order it executes.
 
 ## The responsible node
 
-The same consistent-hash ring that selects probers also picks, for each target, a single **responsible node** — the primary in the deterministically-ordered set. Only that node may dispatch the alert. Because every node computes the identical ordering from the same gossiped candidate set, they all agree on who is responsible without any coordination. See [Distributed Probe Ownership](distributed-probe-ownership).
+The same selection that picks probers also picks, for each target, a single **responsible node** — `picked[0]`, the first node after the target-keyed rotation and zone-aware pick (see [Distributed Probe Ownership](distributed-probe-ownership)). Only that node may dispatch the alert. Because every node computes the identical ordering from the same gossiped candidate set, they all agree on who is responsible with no coordination.
 
-When the responsible node leaves, a membership event triggers `updateRing()` and the next node in the order becomes responsible — **automatic failover, no elected leader**.
+When the responsible node leaves, a membership event recomputes the ring and the next node becomes responsible — **automatic failover, no elected leader**.
 
-## The alert gate
+## The alert gate — `shouldAlert(t)`
 
-Before any alert is sent, `shouldAlert()` checks, in order:
+Before any alert is sent, these checks run **in this order**; the first failing check suppresses the alert:
 
-1. **Standalone?** If there is no cluster (`clusterMgr == nil`) → alert (single observer, nothing to coordinate).
-2. **Isolated?** If the node has lost quorum → **do not alert** (its view is untrustworthy). See [Quorum & isolated mode](quorum-isolation).
-3. **Responsible?** If this node is not the primary for the target → **do not alert** (some other node owns it).
-4. **Confirmations met?** If `min_probe_confirmations > 1`, require that many independent probers to report `hard_down` first.
+1. **Maintenance window** — if the target is inside an active [maintenance window](maintenance-silences), suppress. (Highest priority — probing continues, only the alert is muted.)
+2. **Silence** — if the target matches an active silence, suppress.
+3. **Standalone?** — if there is no cluster (`clusterMgr == nil`), alert. A single observer has nothing to coordinate.
+4. **Isolated?** — if the node has lost quorum (`IsolatedMode`), suppress. Its view is untrustworthy. See [Quorum & isolated mode](quorum-isolation).
+5. **Responsible?** — if this node is not the primary (`IsResponsible`), suppress. Some other node owns the alert.
+6. **Confirmations** — *conditionally*; see below.
 
-Only if all gates pass does the responsible node build the alert env and dispatch it.
+Only if every gate passes does the responsible node build the alert env and dispatch.
 
-## Confirmations: suppressing single-prober false alarms
+## Confirmations: the prober-primary exemption
 
-`min_probe_confirmations` *(default 0 = treat as 1)* sets how many probers must independently reach `hard_down` before alerting:
+`min_probe_confirmations` *(default 0/1)* can require multiple probers to agree before alerting — but with a deliberate, important exemption:
 
-- `0` / `1` — alert as soon as any one prober declares the target down. Fastest.
-- `2` — wait for a second prober to agree. This eliminates the classic false alarm where one prober has a broken path to the target while everyone else still sees it up. The cost is up to one extra `probe_interval_sec` of detection latency.
+- The confirmation guard applies **only when the responsible node is *not itself* a prober** for the target. Such a node is relying entirely on gossip from others, so it waits until `min_probe_confirmations` peers have gossiped `hard_down`:
 
-This pairs naturally with [scope classification](scope-classification): a lone prober seeing down is a `LOCAL_FAILURE` candidate, and confirmations stop it from paging.
+  ```
+  confirmCount = count(peer in PeerStatesForTarget(target) where peer.state == "hard_down")
+  if confirmCount < min_probe_confirmations: suppress
+  ```
 
-## The cross-node safety net
+- If the responsible node **is** a prober, it has **first-hand evidence** — it probed the target itself and got a connection error. It fires immediately; the confirmation guard adds no safety and would only introduce a silent suppression window.
 
-A subtle case: the responsible node (by hash) might not actually probe the target itself — its prober set and its responsibility are computed independently. netwatch handles this with **primary-forwards-peer-alert**:
+So `min_probe_confirmations: 2` means: *a non-prober primary waits for two probers to agree* (eliminating the classic false alarm where one prober has a broken path while everyone else sees the target up), while a prober-primary with direct proof still alerts at once.
 
-- Probers broadcast their state with the target's name and type.
-- If the responsible node receives a `hard_down` from a peer for a target it doesn't probe locally — and quorum is healthy and the sequence is new — it dispatches the alert on that peer's behalf (`DispatchPeerAlert`), deduplicating by sequence so a target never double-alerts.
-- The `NODE_NAME` in the alert reflects the node that actually detected the outage.
+## The cross-node safety net (primary-forwards-peer-alert)
+
+The responsible node (by rotation) might not actually probe the target itself — responsibility and the prober set are computed independently. netwatch closes that gap:
+
+- Probers broadcast their state including the target's name and type.
+- When a node receives a peer `hard_down` for a target it does **not** probe locally — and it is responsible, quorum is healthy, and the sequence is newer than the last it alerted on (`peerAlerted[targetID]`) — it dispatches the alert on that peer's behalf (`DispatchPeerAlert`).
+- The `peerAlerted` map deduplicates by sequence, so a target never double-alerts. `NODE_NAME` in the alert reflects the node that actually detected the outage.
 
 ## Recovery
 
-Recovery alerts follow the same gates. A `hard_down → up` transition (after `recovery_probes` successes) increments `seq` and, on the responsible node, emits the "reachable" alert. The monotonic `seq` makes recovery and outage alerts strictly orderable, so consumers (e.g. Alertmanager) can match a `ProbeDown` to its later `ProbeUp`.
+Recovery alerts pass the same gate. A `hard_down → up` transition (after `recovery_probes` successes) increments `seq` and, on the responsible node, emits the "reachable" alert. The monotonic `seq` makes each `ProbeDown` strictly orderable against its later `ProbeUp`, so downstream consumers (e.g. Alertmanager) can pair them.
 
 ## Channel selection
 
-Once the gate passes, the channels are chosen as `union(target.notify, apps.notifications)`, deduplicated; if empty, `default_notify`; if still empty, the alert is logged only. Each channel (script / SMTP / webhook) receives the full alert env — see the [Alert env reference](alert-env).
+Once the gate passes, channels are chosen as `union(target.notify, apps.notifications)`, deduplicated; if empty → `default_notify`; if still empty → logged only. Each channel (script / mail / webhook) receives the full alert env — see [Alert env reference](alert-env) and [Notifications](notifications).
 
-## Putting it together
+## The whole chain
 
 ```
 probe fails → state machine → hard_down (seq++)
-        │
-        ▼  on the RESPONSIBLE node only:
-   shouldAlert(): standalone? isolated? responsible? confirmations?
+        │  on EVERY node that observes it
+        ▼
+   shouldAlert(t):
+     maintenance? silence? standalone? isolated? responsible?
         │ all pass
+        ▼
+     prober-primary → fire immediately
+     non-prober primary → require min_probe_confirmations peers in hard_down
+        │
         ▼
    build env (scope, classification, root cause, apps) → dispatch to channels
 ```
 
-The result: one outage, one alert, from the right node, with automatic failover and no duplicates — the property the whole distributed design exists to guarantee.
+The result: **one outage, one alert, from the right node**, with automatic failover, confirmation safety for gossip-only primaries, and no duplicates — the property the entire distributed design exists to guarantee.
