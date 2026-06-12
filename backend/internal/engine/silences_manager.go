@@ -264,6 +264,10 @@ func GenerateSilenceID() string {
 
 // ── internal: storage interaction ──────────────────────────────────────
 
+// loadFromStorage populates the in-memory silence cache from the silences table
+// at startup. It skips tombstoned and already-expired rows, compiles each
+// silence's matchers (regex/field) into a ready-to-evaluate entry, and tolerates
+// malformed or uncompilable records by logging and skipping them.
 func (m *silencesManager) loadFromStorage(ctx context.Context) error {
 	recs, err := m.storage.List(ctx, storage.TableSilences, storage.Filter{})
 	if err != nil {
@@ -297,6 +301,9 @@ func (m *silencesManager) loadFromStorage(ctx context.Context) error {
 	return nil
 }
 
+// watchLoop applies storage change events (local and gossip-replicated) to the
+// silence cache for the manager's lifetime: upserts compile and store the
+// silence, deletes drop it. Exits when ctx is cancelled or the channel closes.
 func (m *silencesManager) watchLoop(ctx context.Context) {
 	ch, err := m.storage.Watch(ctx, storage.TableSilences)
 	if err != nil {

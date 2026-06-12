@@ -223,6 +223,11 @@ func (e *Engine) ApplySharedConfigJSON(raw json.RawMessage) error {
 	return e.applySharedConfig(sc)
 }
 
+// applySharedConfig merges a partial shared config (received via PUT
+// /cluster/config or gossiped from a peer) into this node's on-disk config.yaml,
+// touching only the cluster-shared fields and preserving node-specific bootstrap
+// fields, then reloads so the change takes effect. Returns an error if the config
+// can't be read, rewritten or reloaded.
 func (e *Engine) applySharedConfig(sc SharedConfig) error {
 	e.mu.RLock()
 	rawBytes := e.rawConfigBytes

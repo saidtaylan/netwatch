@@ -36,6 +36,11 @@ type scriptAlerter struct {
 	runner AlertRunner
 }
 
+// Send dispatches an alert through a script channel: it merges the channel's
+// configured params with the alert env and runs the script. An inline script
+// body stored in the DB (script_body) is written to a temp file and executed;
+// otherwise the configured script path is run. Returns an error if the script
+// can't be prepared or exits non-zero.
 func (s *scriptAlerter) Send(env map[string]string) error {
 	merged := mergeVars(s.params, env)
 

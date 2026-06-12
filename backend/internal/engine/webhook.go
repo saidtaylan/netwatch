@@ -60,6 +60,11 @@ type amAlert struct {
 	EndsAt      *time.Time        `json:"endsAt,omitempty"`
 }
 
+// newWebhookAlerter builds a webhookAlerter from a channel's params: it
+// validates the url and format (generic|alertmanager), parses timeout_sec,
+// configures TLS verification (tls_insecure), collects header_<Name> params as
+// custom headers, and captures optional basic-auth credentials. Returns an error
+// for a missing/invalid url, unknown format, or bad timeout.
 func newWebhookAlerter(params map[string]string) (*webhookAlerter, error) {
 	url := params["url"]
 	if url == "" {
@@ -113,6 +118,8 @@ func newWebhookAlerter(params map[string]string) (*webhookAlerter, error) {
 	}, nil
 }
 
+// Send POSTs the alert as JSON to the configured URL with any custom headers and
+// basic auth, returning an error on a transport failure or a non-2xx response.
 func (w *webhookAlerter) Send(env map[string]string) error {
 	body, err := w.buildPayload(env)
 	if err != nil {
@@ -143,6 +150,8 @@ func (w *webhookAlerter) Send(env map[string]string) error {
 	return nil
 }
 
+// buildPayload encodes the alert env into the JSON body for the configured
+// format — the Alertmanager v2 array or the generic single-object payload.
 func (w *webhookAlerter) buildPayload(env map[string]string) ([]byte, error) {
 	now := time.Now().UTC()
 
@@ -154,6 +163,8 @@ func (w *webhookAlerter) buildPayload(env map[string]string) ([]byte, error) {
 	}
 }
 
+// buildGenericPayload marshals the alert env into the netwatch "generic" JSON
+// object (name, target, host/port, status, seq, error, affected apps, fired_at).
 func (w *webhookAlerter) buildGenericPayload(env map[string]string, now time.Time) ([]byte, error) {
 	seq, _ := strconv.ParseUint(env["SEQ"], 10, 64)
 	p := genericPayload{
@@ -174,6 +185,10 @@ func (w *webhookAlerter) buildGenericPayload(env map[string]string, now time.Tim
 	return json.Marshal(p)
 }
 
+// buildAlertmanagerPayload marshals the alert into a Prometheus Alertmanager v2
+// array: labels (alertname ProbeDown/ProbeUp, name, target, type, ...) and
+// annotations (summary, error, seq), with endsAt set on recovery so Alertmanager
+// resolves the alert.
 func (w *webhookAlerter) buildAlertmanagerPayload(env map[string]string, now time.Time) ([]byte, error) {
 	// Alertmanager uses "resolved" for recovery; active alerts have no endsAt.
 	status := env["STATUS"]

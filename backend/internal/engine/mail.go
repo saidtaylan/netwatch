@@ -11,6 +11,10 @@ import (
 	"strings"
 )
 
+// mail.go — the SMTP mail Alerter. Implements the Alerter interface (Send): it
+// renders a multipart/alternative (plain + HTML) email from the alert env and
+// delivers it over SMTP, supporting STARTTLS, implicit TLS, or plain transport.
+
 // mailAlerter sends email notifications via SMTP.
 //
 // Required params: smtp_host, from, to
@@ -34,6 +38,10 @@ type mailAlerter struct {
 	lastEnv map[string]string
 }
 
+// newMailAlerter builds a mailAlerter from a channel's params, validating the
+// required fields (smtp_host, from, to) and the tls_mode (starttls|tls|none),
+// and defaulting the SMTP port from the mode (587/465/25). Returns an error for
+// missing required fields, an invalid mode, or an empty recipient list.
 func newMailAlerter(params map[string]string) (*mailAlerter, error) {
 	host := params["smtp_host"]
 	if host == "" {
@@ -85,6 +93,9 @@ func newMailAlerter(params map[string]string) (*mailAlerter, error) {
 	}, nil
 }
 
+// Send delivers one alert email. It builds the subject, plain and MIME message
+// from the alert env, then dispatches over the configured transport (implicit
+// TLS, plain, or STARTTLS by default). Returns any SMTP/transport error.
 func (m *mailAlerter) Send(env map[string]string) error {
 	m.lastEnv = env
 	subject := m.buildSubject(env)
@@ -101,6 +112,8 @@ func (m *mailAlerter) Send(env map[string]string) error {
 	}
 }
 
+// buildSubject formats the email subject as "<prefix> <NAME> — <STATUS>",
+// defaulting the prefix to "[ALERT]" when none is configured.
 func (m *mailAlerter) buildSubject(env map[string]string) string {
 	prefix := m.subjectPrefix
 	if prefix == "" {
@@ -109,6 +122,9 @@ func (m *mailAlerter) buildSubject(env map[string]string) string {
 	return fmt.Sprintf("%s %s — %s", prefix, env["NAME"], strings.ToUpper(env["STATUS"]))
 }
 
+// buildBody renders the plain-text part of the email — a labelled summary of the
+// alert env (name, target, status, host/port, node, seq) plus error and affected
+// apps/teams when present.
 func (m *mailAlerter) buildBody(env map[string]string) string {
 	plain := fmt.Sprintf(
 		"Name:       %s\nTarget:     %s\nType:       %s\nStatus:     %s\nHost:       %s\nPort:       %s\nAgent:      %s\nNode:       %s\nSeq:        %s\n",
@@ -192,6 +208,9 @@ func (m *mailAlerter) buildHTMLBody(env map[string]string) string {
 // mailBoundary uses BinaryName so rebranded builds produce consistent MIME output.
 var mailBoundary = "==" + BinaryName + "_mime_boundary=="
 
+// buildMessage assembles the full RFC 822 message bytes: the headers and a
+// multipart/alternative body carrying both the plain-text and HTML parts (MUAs
+// prefer the last matching part, i.e. HTML). Returns the encoded message.
 func (m *mailAlerter) buildMessage(subject, plainBody string) []byte {
 	htmlBody := m.buildHTMLBody(m.lastEnv)
 
@@ -219,6 +238,8 @@ func (m *mailAlerter) buildMessage(subject, plainBody string) []byte {
 	return []byte(sb.String())
 }
 
+// auth returns SMTP PLAIN auth when a username is configured, or nil for an
+// unauthenticated relay.
 func (m *mailAlerter) auth() smtp.Auth {
 	if m.user == "" {
 		return nil
@@ -226,6 +247,10 @@ func (m *mailAlerter) auth() smtp.Auth {
 	return smtp.PlainAuth("", m.user, m.pass, m.host)
 }
 
+// tlsCfg builds the TLS config for the SMTP connection. With tls_insecure it
+// skips verification; on Windows/macOS it relies on the OS verifier; elsewhere
+// it uses the system cert pool plus an optional custom ca_cert. The server name
+// is always pinned to the configured host.
 func (m *mailAlerter) tlsCfg() *tls.Config {
 	if m.tlsInsecure {
 		return &tls.Config{ServerName: m.host, InsecureSkipVerify: true} //nolint:gosec
@@ -245,6 +270,8 @@ func (m *mailAlerter) tlsCfg() *tls.Config {
 	return &tls.Config{ServerName: m.host, RootCAs: pool}
 }
 
+// sendStartTLS connects in plaintext, upgrades to TLS via STARTTLS when the
+// server advertises it, authenticates if configured, and delivers the message.
 func (m *mailAlerter) sendStartTLS(addr string, msg []byte) error {
 	c, err := smtp.Dial(addr)
 	if err != nil {
@@ -264,6 +291,8 @@ func (m *mailAlerter) sendStartTLS(addr string, msg []byte) error {
 	return deliverMail(c, m.from, m.to, msg)
 }
 
+// sendImplicitTLS opens a TLS connection from the start (port 465 style),
+// authenticates if configured, and delivers the message.
 func (m *mailAlerter) sendImplicitTLS(addr string, msg []byte) error {
 	conn, err := tls.Dial("tcp", addr, m.tlsCfg())
 	if err != nil {
@@ -282,6 +311,8 @@ func (m *mailAlerter) sendImplicitTLS(addr string, msg []byte) error {
 	return deliverMail(c, m.from, m.to, msg)
 }
 
+// sendPlain delivers the message over an unencrypted SMTP connection (tls_mode
+// none), authenticating if configured. For trusted internal relays only.
 func (m *mailAlerter) sendPlain(addr string, msg []byte) error {
 	c, err := smtp.Dial(addr)
 	if err != nil {

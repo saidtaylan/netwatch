@@ -184,6 +184,9 @@ func (m *channelsManager) Delete(name string) (bool, error) {
 
 // ── internal: storage + index ─────────────────────────────────────────
 
+// loadFromStorage populates the in-memory channel config cache from the
+// notification_channels table at startup, skipping tombstoned (deleted) rows and
+// logging (but tolerating) any malformed record. Returns a storage error.
 func (m *channelsManager) loadFromStorage(ctx context.Context) error {
 	recs, err := m.storage.List(ctx, storage.TableNotifChannels, storage.Filter{})
 	if err != nil {
@@ -208,6 +211,11 @@ func (m *channelsManager) loadFromStorage(ctx context.Context) error {
 	return nil
 }
 
+// watchLoop runs for the lifetime of the manager, applying storage change
+// events (from local writes and gossip-replicated peer writes) to the in-memory
+// cache so every node converges on the same channel set. Upserts replace a
+// config, deletes remove it; each change rebuilds the live alerter instances.
+// Exits when ctx is cancelled or the watch channel closes.
 func (m *channelsManager) watchLoop(ctx context.Context) {
 	ch, err := m.storage.Watch(ctx, storage.TableNotifChannels)
 	if err != nil {

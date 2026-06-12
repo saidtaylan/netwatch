@@ -60,6 +60,8 @@ type SLOTarget struct {
 	Window string `json:"window"`
 }
 
+// retentionDays returns how many days of SLO incident history to keep, defaulting
+// to 90 when unset or non-positive (and when the config is nil).
 func (s *SLOConfig) retentionDays() int {
 	if s != nil && s.RetentionDays > 0 {
 		return s.RetentionDays

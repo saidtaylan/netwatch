@@ -233,6 +233,9 @@ func (m *usersManager) DeleteUser(id string) (bool, error) {
 
 // ── Storage interaction ────────────────────────────────────────────────────
 
+// loadFromStorage populates the in-memory user cache (and the username→id
+// index) from the users table at startup, skipping tombstoned and malformed
+// rows. Returns a storage error.
 func (m *usersManager) loadFromStorage(ctx context.Context) error {
 	recs, err := m.storage.List(ctx, storage.TableUsers, storage.Filter{})
 	if err != nil {
@@ -259,6 +262,9 @@ func (m *usersManager) loadFromStorage(ctx context.Context) error {
 	return nil
 }
 
+// watchStorageLoop forwards storage change events (local and gossip-replicated)
+// to applyStorageEvent for the manager's lifetime, keeping the user cache in
+// sync cluster-wide. Exits when ctx is cancelled or the channel closes.
 func (m *usersManager) watchStorageLoop(ctx context.Context) {
 	ch, err := m.storage.Watch(ctx, storage.TableUsers)
 	if err != nil {
@@ -270,6 +276,8 @@ func (m *usersManager) watchStorageLoop(ctx context.Context) {
 	}
 }
 
+// applyStorageEvent applies one storage event to the user cache under the lock:
+// an upsert decodes and stores the user, a delete removes it by id.
 func (m *usersManager) applyStorageEvent(evt storage.Event) {
 	switch evt.Type {
 	case storage.EventUpsert:
@@ -290,6 +298,9 @@ func (m *usersManager) applyStorageEvent(evt storage.Event) {
 
 // ── Cache mutators (caller must hold m.mu) ─────────────────────────────────
 
+// applyUser inserts or updates a user in the cache and keeps the username→id
+// index consistent, removing a stale username mapping when a user is renamed.
+// The caller must hold m.mu.
 func (m *usersManager) applyUser(u User) {
 	// Remove old username mapping if username changed
 	if old, ok := m.users[u.ID]; ok && old.Username != u.Username {
@@ -299,6 +310,8 @@ func (m *usersManager) applyUser(u User) {
 	m.byUsername[u.Username] = u.ID
 }
 
+// removeUser deletes a user from the cache and its username index by id.
+// The caller must hold m.mu.
 func (m *usersManager) removeUser(id string) {
 	if u, ok := m.users[id]; ok {
 		delete(m.byUsername, u.Username)
