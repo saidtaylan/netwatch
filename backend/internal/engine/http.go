@@ -11,6 +11,12 @@ import (
 	"strings"
 )
 
+// http.go — the HTTP/HTTPS Checker. A target is "up" when a request to its URL
+// returns a status the operator accepts (default: any < 400) and, optionally,
+// the body matches/avoids given substrings. Implements the Checker interface;
+// the target is a full URL. Rich options (status operators, body assertions,
+// redirect control) are parsed from the target's raw JSON options.
+
 var allowedMethods = map[string]bool{
 	"GET": true, "POST": true, "PUT": true,
 	"DELETE": true, "HEAD": true, "OPTIONS": true, "PATCH": true,
@@ -27,6 +33,9 @@ type statusRule struct {
 	Between []int `json:"between,omitempty"`
 }
 
+// validate ensures exactly one status operator is set (in / lt / lte / gt / gte
+// / between) and that `between` has exactly two bounds. Returns an error used at
+// config-load time so a malformed expected_status is rejected early.
 func (r *statusRule) validate() error {
 	n := 0
 	if len(r.In) > 0 {
@@ -59,6 +68,9 @@ func (r *statusRule) validate() error {
 	return nil
 }
 
+// matches reports whether an HTTP status code satisfies the rule. A nil rule
+// (no expected_status configured) accepts any code below 400. Otherwise it
+// applies the single configured operator (in / lt / lte / gt / gte / between).
 func (r *statusRule) matches(code int) bool {
 	if r == nil {
 		return code < 400
@@ -112,6 +124,13 @@ type httpChecker struct {
 	client *http.Client
 }
 
+// Run performs one HTTP request to addr (a URL) and decides up/down. It parses
+// the JSON options (method, headers, body, expected_status, body_contains /
+// body_not_contains, follow_redirects, max_redirects), issues the request under
+// ctx's deadline, then checks the status against the rule and, when configured,
+// reads up to 1 MiB of body to assert the contains/not-contains conditions.
+// Returns (true, nil) when all checks pass, otherwise (false, err) describing
+// the first failing check (transport error, bad status, or body mismatch).
 func (c *httpChecker) Run(ctx context.Context, addr string, raw json.RawMessage) (bool, error) {
 	var opts *httpOptions
 	if len(raw) > 0 && string(raw) != "null" {
@@ -183,6 +202,10 @@ func (c *httpChecker) Run(ctx context.Context, addr string, raw json.RawMessage)
 	return true, nil
 }
 
+// ValidateOptions checks the http options at config-load time: rejects unknown
+// fields, validates the method is allowed, validates the expected_status rule,
+// forbids body assertions with HEAD (no body), and requires max_redirects >= 0.
+// Returns an error that fails config validation early.
 func (c *httpChecker) ValidateOptions(raw json.RawMessage) error {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil
@@ -210,6 +233,8 @@ func (c *httpChecker) ValidateOptions(raw json.RawMessage) error {
 	return nil
 }
 
+// ParseAddr extracts the host and port from a URL for the alert env, defaulting
+// the port to 443 for https and 80 otherwise when the URL omits it.
 func (c *httpChecker) ParseAddr(addr string) (string, string, error) {
 	u, err := url.Parse(addr)
 	if err != nil {

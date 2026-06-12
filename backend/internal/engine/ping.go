@@ -12,6 +12,11 @@ import (
 	"golang.org/x/net/ipv4"
 )
 
+// ping.go — the ICMP ping Checker. A target is "up" when it answers an ICMPv4
+// echo request within the deadline. Needs CAP_NET_RAW (or root / Windows admin)
+// for the raw-socket fallback; tries an unprivileged ICMP socket first.
+// Implements the Checker interface; the target is a hostname or IPv4 address.
+
 const icmpProto = 1 // IANA ICMPv4 protocol number
 
 // pingOptions is reserved for future fields (packet count, size, etc.).
@@ -26,6 +31,13 @@ type pingOptions struct{}
 //     automatic when installed as a Windows Service.
 type pingChecker struct{}
 
+// Run sends a single ICMPv4 echo request to addr and waits for a matching
+// reply. It resolves addr to an IPv4 address, opens an ICMP socket
+// (unprivileged UDP first, raw-socket fallback), writes an echo packet tagged
+// with a random id, and reads replies until one is an echo reply whose id
+// matches — returning (true, nil). Any resolution, socket, send, receive or
+// deadline error returns (false, err). Options are unused for ping. ctx carries
+// the per-probe deadline.
 func (c *pingChecker) Run(ctx context.Context, addr string, _ json.RawMessage) (bool, error) {
 	ip, err := lookupIPv4(ctx, addr)
 	if err != nil {
@@ -95,6 +107,8 @@ func (c *pingChecker) Run(ctx context.Context, addr string, _ json.RawMessage) (
 	}
 }
 
+// ValidateOptions checks the ping options at config-load time. Ping takes no
+// options, so it accepts empty/null and rejects any unknown field.
 func (c *pingChecker) ValidateOptions(raw json.RawMessage) error {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil
@@ -108,6 +122,8 @@ func (c *pingChecker) ValidateOptions(raw json.RawMessage) error {
 	return nil
 }
 
+// ParseAddr treats the whole target as the host (HOST) and reports "0" as the
+// PORT for the alert env, since ICMP has no port. Errors on an empty addr.
 func (c *pingChecker) ParseAddr(addr string) (string, string, error) {
 	if addr == "" {
 		return "", "", fmt.Errorf("ping: addr cannot be empty")

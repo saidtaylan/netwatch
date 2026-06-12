@@ -1,10 +1,10 @@
 # Probe types reference
 
-Each target has a `type` and a type-specific `options` object. Crucially, `options` is stored as **raw JSON** and parsed by each checker — so rich, type-specific options (HTTP body assertions, DNS expected IPs, SQL queries) are never flattened away.
+Each target has a `type` and a type-specific `options` object. `options` is stored as **raw JSON** and parsed by that type's checker, so rich, type-specific options are never flattened away. Every checker validates its options at config-load time and rejects unknown fields — a typo fails startup, not a 3 a.m. probe.
 
 ## tcp
 
-A successful TCP connect within `timeout` = up. No options required.
+A successful TCP connect within `timeout` = up. No options.
 
 ```yaml
 - id: "pg"
@@ -14,77 +14,89 @@ A successful TCP connect within `timeout` = up. No options required.
 
 ## http / https
 
+The target is a full URL. Up = an accepted status (default: any `< 400`) and, optionally, body assertions pass.
+
 ```yaml
 - id: "api-health"
   type: http
   target: "https://api.internal/health"
   options:
-    method: "GET"
-    expected_status:
-      in: [200, 204]            # accept any of these
+    method: "GET"                 # GET POST PUT DELETE HEAD OPTIONS PATCH
+    headers: { Authorization: "Bearer ${API_TOKEN}" }
+    body: ""                      # optional request body
+    expected_status: { in: [200, 204] }
     body_contains: "\"status\":\"ok\""
+    body_not_contains: "error"
     follow_redirects: true
-    headers:
-      Authorization: "Bearer ${API_TOKEN}"
-    timeout_sec: 10
-    tls_insecure: false
+    max_redirects: 5
 ```
 
 | Option | Meaning |
 |---|---|
 | `method` | HTTP method (default GET). |
-| `expected_status` | `{ in: [...] }` set of acceptable codes, or a single code. |
+| `headers` | Request headers (supports `${VAR}` injection). |
+| `body` | Request body string. |
+| `expected_status` | A status rule — **exactly one** operator: `in: [...]`, `lt`, `lte`, `gt`, `gte`, or `between: [min,max]`. Omit to accept any `< 400`. |
 | `body_contains` | Substring that must appear in the response body. |
-| `follow_redirects` | Whether to follow 3xx. |
-| `headers` | Map of request headers (supports `${VAR}` injection). |
-| `timeout_sec` | Per-request timeout override. |
-| `tls_insecure` | Skip certificate verification. |
+| `body_not_contains` | Substring that must **not** appear. |
+| `follow_redirects` | Whether to follow 3xx (default follows). |
+| `max_redirects` | Redirect hop limit (`>= 0`). |
+
+Body assertions are read from up to 1 MiB of the response and are not allowed with `HEAD` (no body).
 
 ## ping (ICMP)
 
 ```yaml
 - id: "gw"
   type: ping
-  target: "192.168.1.1"
+  target: "192.168.1.1"          # hostname or IPv4
 ```
 
-ICMP echo. **Requires `CAP_NET_RAW`** on Linux (the systemd unit and container images grant it) or root/Administrator elsewhere.
+One ICMPv4 echo; up = a matching echo reply within the deadline. **Requires `CAP_NET_RAW`** on Linux (granted by the systemd unit and the container images), or root / Administrator. IPv4 only. No options.
 
 ## dns
+
+The target is the hostname to resolve. Up = it resolves (and, if `expected_ips` is set, to one of those addresses).
 
 ```yaml
 - id: "zone-a"
   type: dns
   target: "example.com"
   options:
-    resolve: "A"                  # record type
-    expected_ips: ["93.184.216.34"]
-    server: "8.8.8.8:53"          # optional resolver
+    expected_ips: ["93.184.216.34"]   # any match → up; omit to accept any resolution
+    nameserver: "8.8.8.8"             # or "8.8.8.8:53"; omit to use the system resolver
 ```
 
 | Option | Meaning |
 |---|---|
-| `resolve` | Record type (A/AAAA/CNAME/MX/TXT/…). |
-| `expected_ips` | The resolution must return these. |
-| `server` | Query a specific resolver instead of the system one. |
+| `expected_ips` | Acceptable resolved addresses; any match is up. Each must be a valid IP. |
+| `nameserver` | A specific resolver (IP or IP:port) instead of the system one. |
 
 ## sql
+
+The target is `host:port`. Up = a connection succeeds and an optional liveness query runs without error. The DSN is **built for you** from the options — you never write a raw connection string.
 
 ```yaml
 - id: "warehouse"
   type: sql
   target: "warehouse.internal:1521"
   options:
-    driver: "oracle"              # oracle | mysql | postgres | mssql
-    dsn: "user/${ORA_PASS}@//warehouse.internal:1521/ORCL"
-    query: "SELECT 1 FROM dual"
+    driver: "oracle"             # oracle | mysql | postgres | mssql
+    username: "monitor"
+    password: "${ORA_PASS}"
+    service_name: "ORCL"         # oracle: service_name OR database (SID)
+    query: "SELECT 1 FROM dual"  # optional; omit to just ping
 ```
 
 | Option | Meaning |
 |---|---|
 | `driver` | `oracle`, `mysql`, `postgres`, or `mssql`. |
-| `dsn` | Driver-specific connection string (use `${VAR}` for secrets). |
-| `query` | A query that must succeed; defaults to a trivial liveness query per driver. |
+| `username` / `password` | Credentials (use `${VAR}` for the password). |
+| `database` | Database name. Required for mysql/postgres/mssql; for Oracle it is the SID (or use `service_name`). |
+| `service_name` | Oracle only — the service name. |
+| `query` | A query that must succeed (no-rows is OK). Omit to just open + ping. |
+| `ssl_mode` | Postgres only: `disable` / `require` / `verify-ca` / `verify-full`. |
+| `tls_insecure` | mysql / postgres / mssql: skip certificate verification. |
 
 ## Credential injection
 
@@ -95,9 +107,8 @@ credentials_file: "/etc/netwatch/credentials.env"
 ```
 
 ```
-# credentials.env
 ORA_PASS=supersecret
 API_TOKEN=abc123
 ```
 
-Unresolved `${VAR}` references fail config validation, so a missing secret is caught at startup rather than at probe time.
+Unresolved `${VAR}` references fail config validation, so a missing secret is caught at startup, not at probe time.

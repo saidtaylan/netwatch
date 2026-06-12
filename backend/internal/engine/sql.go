@@ -15,6 +15,12 @@ import (
 	_ "github.com/sijms/go-ora/v2"
 )
 
+// sql.go — the SQL Checker. A target is "up" when a connection to the database
+// succeeds and an optional liveness query runs without error. Implements the
+// Checker interface; the target is "host:port" and the connection details
+// (driver, credentials, database/service, TLS) come from the JSON options. The
+// DSN is built per driver by makeDSN — operators never write a raw DSN.
+
 var supportedDrivers = map[string]bool{
 	"mysql": true, "postgres": true, "mssql": true, "oracle": true,
 }
@@ -39,6 +45,11 @@ type sqlOptions struct {
 // The target field must be "host:port".
 type sqlChecker struct{}
 
+// Run opens a database connection to addr ("host:port") using a per-driver DSN
+// built from the JSON options, then verifies liveness: it runs opts.Query (if
+// set) and accepts any result including no rows, otherwise it pings the
+// connection. Returns (true, nil) on success or (false, err) on a DSN, open,
+// query or ping failure. The pool is capped at a single short-lived connection.
 func (c *sqlChecker) Run(ctx context.Context, addr string, raw json.RawMessage) (bool, error) {
 	var opts sqlOptions
 	if err := json.Unmarshal(raw, &opts); err != nil {
@@ -70,6 +81,9 @@ func (c *sqlChecker) Run(ctx context.Context, addr string, raw json.RawMessage) 
 	return true, nil
 }
 
+// ValidateOptions checks the sql options at config-load time. SQL options are
+// mandatory (unlike other types), so empty/null is rejected; it then rejects
+// unknown fields and delegates the per-driver rules to checkSQLOptions.
 func (c *sqlChecker) ValidateOptions(raw json.RawMessage) error {
 	if len(raw) == 0 || string(raw) == "null" {
 		return fmt.Errorf("sql options: driver, username and password are required")
@@ -83,6 +97,7 @@ func (c *sqlChecker) ValidateOptions(raw json.RawMessage) error {
 	return checkSQLOptions(opts)
 }
 
+// ParseAddr splits the "host:port" target into host and port for the alert env.
 func (c *sqlChecker) ParseAddr(addr string) (string, string, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -91,6 +106,11 @@ func (c *sqlChecker) ParseAddr(addr string) (string, string, error) {
 	return host, port, nil
 }
 
+// checkSQLOptions applies the per-driver validation rules: a supported driver
+// and username are always required; Oracle needs a database (SID) or
+// service_name and rejects TLS options; Postgres/MySQL/MSSQL need a database and
+// reject Oracle's service_name; and the TLS knobs (ssl_mode vs tls_insecure) are
+// constrained to what each driver actually supports. Returns the first violation.
 func checkSQLOptions(o sqlOptions) error {
 	if o.Driver == "" {
 		return fmt.Errorf("sql: driver is required (mysql, postgres, mssql, oracle)")
@@ -149,6 +169,12 @@ func checkSQLOptions(o sqlOptions) error {
 	return nil
 }
 
+// makeDSN builds the driver-specific connection string (and the database/sql
+// driver name) from the "host:port" target and the options. It encodes
+// credentials, database/service name and TLS settings the way each driver
+// expects (mysql config, postgres/mssql/oracle URLs). Returns the dsn, the
+// driver name to pass to sql.Open, and an error for an unparseable address or
+// unsupported driver.
 func makeDSN(addr string, o *sqlOptions) (dsn, driver string, err error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {

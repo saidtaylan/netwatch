@@ -9,6 +9,10 @@ import (
 	"strings"
 )
 
+// dns.go — the DNS Checker. A target is "up" when its hostname resolves (and,
+// if expected_ips is set, resolves to one of those addresses). Implements the
+// Checker interface; the target string is the hostname to resolve.
+
 // dnsOptions holds options for dns-type targets.
 type dnsOptions struct {
 	// ExpectedIPs lists acceptable resolved addresses.
@@ -22,6 +26,12 @@ type dnsOptions struct {
 // dnsChecker implements Checker for dns-type targets.
 type dnsChecker struct{}
 
+// Run resolves addr (a hostname) using either the system resolver or, when
+// opts.Nameserver is set, a custom one. It returns (true, nil) if resolution
+// yields at least one address and — when opts.ExpectedIPs is non-empty — at
+// least one resolved address matches the expected set. Otherwise it returns
+// (false, err) describing the lookup failure or the expected/actual mismatch.
+// raw is the target's JSON options (expected_ips, nameserver).
 func (c *dnsChecker) Run(ctx context.Context, addr string, raw json.RawMessage) (bool, error) {
 	var opts dnsOptions
 	if len(raw) > 0 && string(raw) != "null" {
@@ -54,6 +64,10 @@ func (c *dnsChecker) Run(ctx context.Context, addr string, raw json.RawMessage) 
 	return false, fmt.Errorf("dns: %q resolved to %v — none matched expected %v", addr, addrs, opts.ExpectedIPs)
 }
 
+// ValidateOptions checks the dns options at config-load time: it rejects
+// unknown fields, verifies every expected_ips entry parses as an IP, and (when
+// set) that nameserver is a valid IP or IP:port. Returns an error that fails
+// config validation early.
 func (c *dnsChecker) ValidateOptions(raw json.RawMessage) error {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil
@@ -85,6 +99,8 @@ func (c *dnsChecker) ValidateOptions(raw json.RawMessage) error {
 	return nil
 }
 
+// ParseAddr treats the whole target as the hostname (HOST) and reports the
+// conventional DNS port "53" as PORT for the alert env. Errors on an empty addr.
 func (c *dnsChecker) ParseAddr(addr string) (string, string, error) {
 	if addr == "" {
 		return "", "", fmt.Errorf("dns: addr cannot be empty")
