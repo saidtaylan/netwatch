@@ -1,6 +1,6 @@
 # Full netwatch stack in one command: backend agent + web UI.
 #
-#   1. cp ../backend/config.skeleton.yaml ./config.yaml   # then set admin.setup_token
+#   1. edit config.yaml      # a runnable starter ships here; set admin.setup_token
 #   2. docker compose up -d
 #
 #   UI       → http://localhost:8080   (on /connect, enter http://localhost:10240)
@@ -9,9 +9,21 @@
 # The UI is static files served by nginx; ui-init downloads the prebuilt bundle
 # from the GitHub release into a shared volume, so nothing is built locally.
 services:
+  # One-shot: make the state volume writable by the image's nonroot user (65532)
+  # so the agent can create its SQLite DB and state file there.
+  state-init:
+    image: alpine:latest
+    command: sh -c "chown -R 65532:65532 /var/lib/netwatch"
+    volumes:
+      - netwatch-state:/var/lib/netwatch
+    restart: "no"
+
   netwatch:
     image: ghcr.io/saidtaylan/netwatch:latest   # pin a tag, e.g. :v0.1.3
     container_name: netwatch
+    depends_on:
+      state-init:
+        condition: service_completed_successfully
     ports:
       - "10240:10240"        # REST API / metrics / health
       - "7946:7946"          # gossip (only needed for a cluster)

@@ -31,7 +31,7 @@ The fastest way to get **both** the agent and the dashboard running:
 ```bash
 git clone https://github.com/saidtaylan/netwatch.git
 cd netwatch/deploy
-cp ../backend/config.skeleton.yaml ./config.yaml   # then set admin.setup_token
+nano config.yaml          # set admin.setup_token (a starter config ships here)
 docker compose up -d
 ```
 
@@ -326,7 +326,8 @@ pnpm build
 **Full stack (backend + UI)** — use the Compose file (see the [Quick start](#-quick-start)):
 
 ```bash
-cd deploy && cp ../backend/config.skeleton.yaml ./config.yaml
+cd deploy
+nano config.yaml            # set admin.setup_token
 docker compose up -d        # backend :10240, UI :8080
 ```
 

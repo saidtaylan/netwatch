@@ -1,0 +1,42 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# netwatch — minimal starter config (boots out of the box)
+#
+# This file is intentionally small so the agent starts immediately after install.
+# For the FULL reference (every probe type, notifications, SLO, cluster, geo,
+# credentials injection, ...) see config.example.yaml.
+# ─────────────────────────────────────────────────────────────────────────────
+
+node_alias: "netwatch-1"
+port: "10240"
+state_file: "/var/lib/netwatch/state.json"
+log_path: ""                 # empty → journald / stdout
+
+timeout: 5
+max_retries: 2
+retry_interval_sec: 30
+probe_interval_sec: 60
+ticker_interval_sec: 5
+reload_interval_sec: 30
+
+# REQUIRED for the web UI. Used once on the /setup page to create the first
+# admin user, and as the HMAC secret that signs JWTs. In a cluster, every node
+# MUST use the SAME value. Change it to a long random string.
+admin:
+  setup_token: "change-me-to-a-long-random-secret"
+
+# No notification channels yet. Add them here (or via the UI) later.
+notifications: {}
+default_notify: []
+
+# No targets yet. Add the services you want to monitor, e.g.:
+# targets:
+#   - id: "my-api"
+#     name: "My API"
+#     type: http
+#     target: "https://api.internal/health"
+targets: []
+
+# Single-node by default. To form a gossip cluster, set enabled: true and add
+# node_name, peers and a shared keyring — see config.example.yaml.
+cluster:
+  enabled: false

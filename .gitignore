@@ -76,6 +76,3 @@ backend/tests/CLUSTER_REPORT.md
 
 # GIF intermediate frames (regenerate via the live tour spec)
 screenshots/frames/
-
-# docker-compose user config (copied from config.skeleton.yaml)
-deploy/config.yaml
