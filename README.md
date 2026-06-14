@@ -353,6 +353,8 @@ released `netwatch-frontend.tar.gz` bundle — exactly what `deploy/docker-compo
 
 A DaemonSet Helm chart ships under [`backend/helm/netwatch`](backend/helm/netwatch). It runs one agent per node with `hostNetwork: true` (so gossip and ICMP work), a headless service for peer discovery, and the keyring as a Secret.
 
+> The chart deploys the **backend** only. Serve the web UI separately — host the released `netwatch-frontend.tar.gz` bundle on any static host / nginx Ingress (the same static files the Docker `ui` service and the systemd installer use), pointed at any backend node's `:10240`.
+
 ```bash
 # Render to review, then install
 helm template nw backend/helm/netwatch -f my-values.yaml
