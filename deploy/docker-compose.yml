@@ -1,0 +1,51 @@
+# Full netwatch stack in one command: backend agent + web UI.
+#
+#   1. cp ../backend/config.skeleton.yaml ./config.yaml   # then set admin.setup_token
+#   2. docker compose up -d
+#
+#   UI       → http://localhost:8080   (on /connect, enter http://localhost:10240)
+#   Backend  → http://localhost:10240/health
+#
+# The UI is static files served by nginx; ui-init downloads the prebuilt bundle
+# from the GitHub release into a shared volume, so nothing is built locally.
+services:
+  netwatch:
+    image: ghcr.io/saidtaylan/netwatch:latest   # pin a tag, e.g. :v0.1.3
+    container_name: netwatch
+    ports:
+      - "10240:10240"        # REST API / metrics / health
+      - "7946:7946"          # gossip (only needed for a cluster)
+      - "7946:7946/udp"
+    cap_add: [NET_RAW]       # ICMP ping probes; remove if you don't use type: ping
+    volumes:
+      - ./config.yaml:/etc/netwatch/config.yaml:ro
+      - netwatch-state:/var/lib/netwatch
+    restart: unless-stopped
+
+  # One-shot: fetch the prebuilt UI bundle from the release into the shared volume.
+  ui-init:
+    image: alpine:latest
+    command: >
+      sh -c "apk add --no-cache curl >/dev/null &&
+      curl -fSL https://github.com/saidtaylan/netwatch/releases/latest/download/netwatch-frontend.tar.gz
+      | tar -xz -C /html"
+    volumes:
+      - ui-static:/html
+    restart: "no"
+
+  ui:
+    image: nginx:alpine
+    container_name: netwatch-ui
+    depends_on:
+      ui-init:
+        condition: service_completed_successfully
+    ports:
+      - "8080:80"
+    volumes:
+      - ui-static:/usr/share/nginx/html:ro
+      - ./netwatch-ui.nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    restart: unless-stopped
+
+volumes:
+  netwatch-state:
+  ui-static:

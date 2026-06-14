@@ -22,17 +22,35 @@
 
 ---
 
-## ⚡ Quick start (Docker)
+## ⚡ Quick start
+
+### Full stack (backend + web UI) — Docker Compose
+
+The fastest way to get **both** the agent and the dashboard running:
 
 ```bash
-# One agent, instant API + metrics. Add cluster.enabled + peers for a real cluster.
+git clone https://github.com/saidtaylan/netwatch.git
+cd netwatch/deploy
+cp ../backend/config.skeleton.yaml ./config.yaml   # then set admin.setup_token
+docker compose up -d
+```
+
+- **Web UI** → http://localhost:8080 — on the connect screen, enter the backend URL `http://localhost:10240`, then create your admin user.
+- **Backend** → http://localhost:10240/health
+
+The compose file runs the backend image, downloads the prebuilt UI bundle from the release, and serves it with nginx — nothing is built locally. See [`deploy/docker-compose.yml`](deploy/docker-compose.yml).
+
+### Backend only — one container
+
+Just the agent (REST API + Prometheus metrics, **no UI**):
+
+```bash
 docker run -d --name netwatch -p 10240:10240 --cap-add NET_RAW \
   ghcr.io/saidtaylan/netwatch:latest
-
 curl http://localhost:10240/health        # → OK
 ```
 
-For a real deployment (cluster + web UI) jump to **[Installation](#installation)** — systemd, Ansible, Docker, or Helm.
+For a clustered, production deployment jump to **[Installation](#installation)** — systemd, Ansible, Docker, or Helm (all install the backend **and** the UI).
 
 ---
 
@@ -305,6 +323,15 @@ pnpm build
 
 #### Docker
 
+**Full stack (backend + UI)** — use the Compose file (see the [Quick start](#-quick-start)):
+
+```bash
+cd deploy && cp ../backend/config.skeleton.yaml ./config.yaml
+docker compose up -d        # backend :10240, UI :8080
+```
+
+**Backend container only** (no UI):
+
 ```bash
 docker run -d \
   --name netwatch \
@@ -315,6 +342,10 @@ docker run -d \
   --cap-add NET_RAW \
   ghcr.io/saidtaylan/netwatch:latest
 ```
+
+To serve the UI alongside this container, run an nginx container over the
+released `netwatch-frontend.tar.gz` bundle — exactly what `deploy/docker-compose.yml`'s
+`ui` / `ui-init` services do.
 
 > `--cap-add NET_RAW` is required for ICMP ping probes. Remove it if you don't use `type: ping` targets.
 
