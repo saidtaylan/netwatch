@@ -70,6 +70,9 @@ jobs:
       - name: Create/update GitHub Release with assets
         uses: softprops/action-gh-release@v2
         with:
+          # Tags containing "-rc" (e.g. v0.1.7-rc.1) are marked as GitHub
+          # pre-releases so they never show up as "Latest release".
+          prerelease: ${{ contains(github.ref_name, '-rc') }}
           files: |
             backend/dist/netwatch-linux-amd64
             backend/dist/netwatch-linux-arm64
@@ -101,10 +104,14 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
+          # A release candidate (v*-rc*) publishes ONLY its exact version tag,
+          # e.g. :0.1.7-rc.1. It must not move :latest or :0.1 — those are
+          # reserved for promoted stable releases, so production never pulls an
+          # untested artifact. The enable= guards implement that.
           tags: |
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+            type=semver,pattern={{major}}.{{minor}},enable=${{ !contains(github.ref_name, '-rc') }}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-rc') }}
           labels: |
             org.opencontainers.image.title=netwatch
             org.opencontainers.image.description=Self-hosted distributed network monitoring
