@@ -59,21 +59,24 @@ deploy/staging/netem.sh netwatch-3 loss 30     # 30% loss
 deploy/staging/netem.sh netwatch-3 delay 200   # +200ms latency
 ```
 
-### Known behavior — rejoin after a *full* partition
+### Rejoin after a *full* partition
 
 A **brief** partition (cleared before memberlist declares the node dead) heals on
-its own. A **prolonged full partition** is different: the other nodes declare the
-isolated node dead and remove it, and after the fault clears it does **not**
-auto-rejoin — it stays split-brained (it sees only itself; the majority sees only
-each other). Recovery today is to restart that node:
+its own. A **prolonged full partition** is harder: the other nodes declare the
+isolated node dead and remove it. The node now **auto-rejoins** once the fault
+clears — a background re-join loop re-attempts `Join(peers)` every
+`cluster.rejoin_interval_sec` (default 15s) while the node is below target
+strength, so the cluster re-forms on its own with no restart:
 
 ```bash
-docker restart netwatch-3      # rejoins, cluster returns to 3 members
+make staging-netem-partition NODE=netwatch-3   # node-3 drops off the mesh
+# … wait for eviction (majority sees 2/3) …
+make staging-netem-clear     NODE=netwatch-3   # within ~rejoin_interval_sec → 3/3
 ```
 
-This is a genuine resilience gap surfaced by this harness: there is no periodic
-re-join loop against the seed peers after a node has been evicted. Worth a
-follow-up (a background re-join ticker in `internal/cluster`).
+> History: this gap was originally surfaced by this harness (a node stayed
+> split-brained until restarted) and fixed by making the re-join loop run for the
+> manager's lifetime instead of stopping after the cluster first formed.
 
 ## Also: run the UI e2e against the released bundle (optional)
 
