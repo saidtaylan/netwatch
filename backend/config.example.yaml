@@ -248,6 +248,11 @@ cluster:
   expected_node_count: 3
   min_quorum_ratio:    0.5    # at least floor(3 * 0.5) + 1 = 2 alive nodes required
 
+  # How often a node below target strength re-attempts joining its peers. This
+  # lets a node that was evicted by a network partition rejoin automatically once
+  # connectivity returns, instead of staying split-brained until restart.
+  rejoin_interval_sec: 15     # 0 → default 15s; Join is idempotent + skipped when healthy
+
   # ── Phase 13 — Distributed Probe Ownership ──────────────────────────────────
   # By default the cluster automatically distributes probing: even when every
   # node has the same targets in its config, only `probe_replication_factor`

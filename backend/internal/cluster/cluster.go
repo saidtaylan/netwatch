@@ -57,6 +57,15 @@ type Config struct {
 	// an existing cluster. best-effort — no error if none are reachable.
 	Peers []string `json:"peers,omitempty"`
 
+	// RejoinIntervalSec controls how often the background re-join loop re-checks
+	// membership and, when this node is below target strength, re-attempts
+	// Join(Peers). This recovers a node that was evicted by a prolonged network
+	// partition: once connectivity returns it rejoins on its own instead of
+	// staying split-brained until restart. memberlist's Join is idempotent, and
+	// the loop only calls it while under strength, so it is cheap when healthy.
+	// 0 (default) → 15 seconds.
+	RejoinIntervalSec int `json:"rejoin_interval_sec,omitempty"`
+
 	// Keyring contains base64-encoded AES keys (decoded length must be 16, 24,
 	// or 32 bytes). The first key is used for encryption; all keys are tried for
 	// decryption (supports zero-downtime key rotation). Leave empty to disable
@@ -675,6 +684,9 @@ type Manager struct {
 	// stopConfigSync cancels the runConfigSyncLoop goroutine on Leave().
 	stopConfigSync func()
 
+	// stopRejoin cancels the background re-join goroutine on Leave().
+	stopRejoin func()
+
 	// keyring is the live AES keyring used by memberlist for gossip encryption.
 	// Non-nil only when the cluster was started with at least one key in Config.Keyring.
 	// Used by KeyringAddKey / KeyringUseKey / KeyringRemoveKey for zero-downtime rotation.
@@ -800,31 +812,83 @@ func New(cfg Config) (*Manager, error) {
 	// P1.5: start config-sync loop if enabled.
 	m.startConfigSyncLoop()
 
-	// Background rejoin loop — retries joining peers every 5s while this node
-	// has fewer than 2 members (i.e. it is isolated). Needed when all nodes start
-	// simultaneously and the initial Join() is refused by peers not yet ready.
+	// Background rejoin loop — keeps the node converged on the cluster. It serves
+	// two cases: (1) startup, when all nodes boot together and the initial Join()
+	// is refused by peers not yet listening, and (2) recovery, when a prolonged
+	// network partition causes peers to evict this node — once connectivity
+	// returns it rejoins on its own instead of staying split-brained until a
+	// restart. Unlike the old loop, it does NOT stop after the cluster first
+	// forms; it runs for the manager's lifetime.
 	if len(cfg.Peers) > 0 {
-		go m.runRejoinLoop(cfg.Peers)
+		m.startRejoinLoop(cfg.Peers)
 	}
 
 	return m, nil
 }
 
-// runRejoinLoop retries list.Join every 5 s as long as the node is alone.
-// Stops when the node has more than 1 member or when Leave() is called.
-func (m *Manager) runRejoinLoop(peers []string) {
-	ticker := time.NewTicker(5 * time.Second)
+// rejoinInterval returns the configured re-join cadence, defaulting to 15s.
+func (m *Manager) rejoinInterval() time.Duration {
+	if m.cfg.RejoinIntervalSec > 0 {
+		return time.Duration(m.cfg.RejoinIntervalSec) * time.Second
+	}
+	return 15 * time.Second
+}
+
+// targetStrength is the alive-member count at or above which this node is
+// considered fully converged. It is the expected cluster size when configured,
+// otherwise 2 (this node plus at least one peer). Used to decide when the
+// re-join loop should actively re-attempt Join.
+func (m *Manager) targetStrength() int {
+	if m.cfg.ExpectedNodeCount > 1 {
+		return m.cfg.ExpectedNodeCount
+	}
+	return 2
+}
+
+// startRejoinLoop launches the background re-join goroutine and wires its
+// cancel into Leave().
+func (m *Manager) startRejoinLoop(peers []string) {
+	ctx, cancel := context.WithCancel(context.Background())
+	m.stopRejoin = cancel
+	go m.runRejoinLoop(ctx, peers)
+}
+
+// runRejoinLoop runs for the manager's lifetime. On each tick, while the node
+// sees fewer than targetStrength() alive members, it re-attempts Join(peers).
+// memberlist's Join is idempotent and the call is skipped once the node is at
+// strength, so this is cheap when the cluster is healthy. To avoid log spam it
+// only logs on the under-strength ↔ healthy transition, not per attempt.
+func (m *Manager) runRejoinLoop(ctx context.Context, peers []string) {
+	ticker := time.NewTicker(m.rejoinInterval())
 	defer ticker.Stop()
-	for range ticker.C {
-		if m.list == nil || m.list.NumMembers() > 1 {
+
+	underStrength := false
+	for {
+		select {
+		case <-ctx.Done():
 			return
-		}
-		n, err := m.list.Join(peers)
-		if err != nil {
-			slog.Debug("cluster rejoin attempt failed", "contacted", n, "err", err)
-		} else if n > 0 {
-			slog.Info("cluster rejoined", "contacted", n)
-			return
+		case <-ticker.C:
+			if m.list == nil {
+				continue
+			}
+			under := m.list.NumMembers() < m.targetStrength()
+			if under {
+				if n, err := m.list.Join(peers); err != nil {
+					slog.Debug("cluster re-join attempt failed", "contacted", n, "err", err)
+				}
+			}
+			// Log only on state change so a permanently under-strength cluster
+			// (e.g. a node intentionally scaled down) does not spam the log.
+			if under != underStrength {
+				if under {
+					slog.Warn("[CLUSTER] below target strength — re-joining peers",
+						"members", m.list.NumMembers(), "target", m.targetStrength())
+				} else {
+					slog.Info("[CLUSTER] re-converged to target strength",
+						"members", m.list.NumMembers())
+				}
+				underStrength = under
+			}
 		}
 	}
 }
@@ -1221,6 +1285,10 @@ func (m *Manager) Leave(timeout time.Duration) error {
 	// Stop the config-sync goroutine (P1.5).
 	if m.stopConfigSync != nil {
 		m.stopConfigSync()
+	}
+	// Stop the background re-join goroutine.
+	if m.stopRejoin != nil {
+		m.stopRejoin()
 	}
 	// Cancel any pending recompute so listener callbacks are not invoked
 	// against an engine that is also shutting down.
