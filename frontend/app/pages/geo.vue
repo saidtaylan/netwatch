@@ -10,7 +10,7 @@ import type { GeoLatencySnapshot } from '~/types/api'
 import { fmtLatency } from '~/utils/format'
 
 const api = useApi()
-const { targetList } = useFleet()
+const { targetList, isStandalone } = useFleet()
 
 // One Promise.allSettled per loadGeo call; results indexed by target.id.
 const geoData = ref<Record<string, GeoLatencySnapshot>>({})
@@ -86,7 +86,21 @@ const entries = computed(() =>
       Nodes with latency 0 haven't reported yet (e.g. not currently a designated prober for that target).
     </p>
 
-    <div v-if="entries.length" class="space-y-3">
+    <!-- Standalone: geo latency compares the same target across cluster nodes
+         in different regions. A single standalone node has nothing to compare
+         against, so this view stays empty by design — not an error. -->
+    <div v-if="isStandalone" class="rounded-xl border border-blue-200 dark:border-blue-900/50 bg-blue-50 dark:bg-blue-900/20 px-4 py-6 text-sm text-blue-800 dark:text-blue-300 text-center">
+      <p class="text-2xl mb-2">🌍</p>
+      <p class="font-semibold mb-1">Geo latency needs a cluster</p>
+      <p class="text-blue-700/80 dark:text-blue-300/80 max-w-md mx-auto">
+        This view compares each target's probe latency across nodes in different
+        regions. This node runs standalone (<code class="text-xs">cluster.enabled: false</code>),
+        so there's only one vantage point. Enable clustering and set
+        <code class="text-xs">cluster.region</code> on each node to populate this map.
+      </p>
+    </div>
+
+    <div v-else-if="entries.length" class="space-y-3">
       <div v-for="[id, geo] in entries" :key="id"
         class="bg-white dark:bg-gray-800 rounded-xl border shadow-sm overflow-hidden"
         :class="geo.anomaly ? 'border-orange-300 dark:border-orange-700' : 'border-gray-100 dark:border-gray-700'"

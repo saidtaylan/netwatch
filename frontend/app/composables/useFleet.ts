@@ -69,6 +69,11 @@ export const useFleet = () => {
   const isolated      = computed(() => fleet.data.value?.cluster?.isolated ?? false)
   const memberNames   = computed(() => fleet.data.value?.cluster?.members ?? [])
 
+  // True once the fleet snapshot has loaded and reports no cluster section —
+  // i.e. this node runs with cluster.enabled: false. Used to render graceful
+  // "standalone mode" messaging instead of cluster-specific errors/empties.
+  const isStandalone  = computed(() => fleet.data.value != null && !fleet.data.value.cluster)
+
   // Summary counts
   const counts = computed(() => fleet.data.value?.summary ?? { up: 0, hard_down: 0, soft_down: 0, unknown: 0 })
 
@@ -79,5 +84,5 @@ export const useFleet = () => {
       .map(t => t.id)
   )
 
-  return { fleet, targetList, targetIndex, targetById, quorumHealthy, isolated, memberNames, counts, downTargetIds }
+  return { fleet, targetList, targetIndex, targetById, quorumHealthy, isolated, memberNames, counts, downTargetIds, isStandalone }
 }
