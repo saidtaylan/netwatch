@@ -11,7 +11,7 @@ onMounted(async () => {
   try { version.value = await api.get('/version') } catch {}
 })
 
-const { fleet, quorumHealthy, isolated, counts, downTargetIds } = useFleet()
+const { fleet, quorumHealthy, isolated, counts, downTargetIds, isStandalone } = useFleet()
 // cluster/state.members includes all peers + self → total node count
 const memberCount = computed(() => clusterState.data.value?.members?.length ?? fleet.data.value?.cluster?.alive_count ?? 0)
 // Sort members deterministically (by name) so the list does not flicker
@@ -39,8 +39,18 @@ const totalTargets = computed(() =>
       <span v-if="version" class="text-xs text-gray-400">v{{ version.version }}</span>
     </div>
 
-    <!-- Errors -->
-    <ErrorBanner :error="clusterState.error.value" title="Failed to load cluster state" @retry="clusterState.refresh()" />
+    <!-- Standalone notice — this node runs with cluster.enabled: false, so the
+         cluster endpoints (state, drift, members, geo) have nothing to show.
+         This is expected, not an error. -->
+    <div v-if="isStandalone" class="rounded-xl border border-blue-200 dark:border-blue-900/50 bg-blue-50 dark:bg-blue-900/20 px-4 py-3 text-sm text-blue-800 dark:text-blue-300">
+      <span class="font-semibold">Standalone mode.</span>
+      This node runs with <code class="text-xs">cluster.enabled: false</code>, so it monitors targets on its own —
+      cluster features (peers, quorum, config drift, geo latency) are off. To form a cluster, enable it in
+      <code class="text-xs">config.yaml</code> and add peers.
+    </div>
+
+    <!-- Errors — the cluster-state 503 is expected in standalone, so suppress it there -->
+    <ErrorBanner v-if="!isStandalone" :error="clusterState.error.value" title="Failed to load cluster state" @retry="clusterState.refresh()" />
     <ErrorBanner :error="fleet.error.value" title="Failed to load fleet status" @retry="fleet.refresh()" />
 
     <!-- Status cards -->
@@ -55,8 +65,10 @@ const totalTargets = computed(() =>
         <!-- Cluster nodes -->
         <div class="bg-white dark:bg-gray-800 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-gray-700">
           <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Cluster Nodes</p>
-          <p class="text-2xl font-bold text-gray-900 dark:text-white">{{ memberCount }}</p>
-          <p v-if="isolated" class="text-xs text-orange-500 mt-1">⚠ Isolated mode</p>
+          <p v-if="isStandalone" class="text-2xl font-bold text-gray-400">—</p>
+          <p v-else class="text-2xl font-bold text-gray-900 dark:text-white">{{ memberCount }}</p>
+          <p v-if="isStandalone" class="text-xs text-gray-400 mt-1">Standalone (no cluster)</p>
+          <p v-else-if="isolated" class="text-xs text-orange-500 mt-1">⚠ Isolated mode</p>
           <p v-else-if="quorum === true" class="text-xs text-green-500 mt-1">✓ Quorum healthy</p>
           <p v-else-if="quorum === false" class="text-xs text-red-500 mt-1">✗ Quorum lost</p>
         </div>
@@ -80,10 +92,16 @@ const totalTargets = computed(() =>
         <!-- Config drift -->
         <div class="bg-white dark:bg-gray-800 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-gray-700">
           <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Config Drift</p>
-          <p :class="['text-2xl font-bold', drift ? 'text-yellow-600' : 'text-green-600']">
-            {{ drift ? `${drift} peer${drift > 1 ? 's' : ''}` : 'In sync' }}
-          </p>
-          <NuxtLink :to="{ name: 'config' }" class="text-xs text-blue-500 hover:underline mt-1 block">View →</NuxtLink>
+          <template v-if="isStandalone">
+            <p class="text-2xl font-bold text-gray-400">—</p>
+            <p class="text-xs text-gray-400 mt-1">No peers to compare</p>
+          </template>
+          <template v-else>
+            <p :class="['text-2xl font-bold', drift ? 'text-yellow-600' : 'text-green-600']">
+              {{ drift ? `${drift} peer${drift > 1 ? 's' : ''}` : 'In sync' }}
+            </p>
+            <NuxtLink :to="{ name: 'config' }" class="text-xs text-blue-500 hover:underline mt-1 block">View →</NuxtLink>
+          </template>
         </div>
       </template>
     </div>
@@ -131,11 +149,20 @@ const totalTargets = computed(() =>
       </ul>
     </div>
 
-    <!-- Loading / empty -->
+    <!-- Empty: backend is reachable (fleet loaded, no error) but no targets are
+         configured yet. Distinct from a connection failure, which surfaces via
+         the ErrorBanner above. -->
     <EmptyState
-      v-if="!clusterState.loading.value && !fleet.loading.value && memberCount === 0 && counts.up === 0 && counts.hard_down === 0"
-      title="No data yet"
-      description="Waiting for backend to respond. Check your connection."
+      v-if="!fleet.loading.value && !fleet.error.value && fleet.data.value && totalTargets === 0"
+      title="No targets configured yet"
+      description="Add a target in config.yaml (under `targets:`) or from the Targets page to start monitoring. The agent picks it up on the next reload."
+      icon="🎯"
+    />
+    <!-- Genuine connection failure: fleet never loaded and errored. -->
+    <EmptyState
+      v-else-if="!fleet.loading.value && fleet.error.value && !fleet.data.value"
+      title="Backend not responding"
+      description="Could not reach the backend. Check the URL on the Connect screen and that the agent is running."
       icon="📡"
     />
   </div>
