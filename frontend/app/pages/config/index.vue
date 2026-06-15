@@ -32,6 +32,10 @@ interface AggregateSnapshot {
 
 const api = useApi()
 const ui  = useUIStore()
+// In standalone mode (cluster.enabled:false) the /cluster/* endpoints return
+// 503. Peer config sync is meaningless with no peers, so we hide those parts
+// and show a graceful notice instead of an error.
+const { isStandalone } = useFleet()
 
 const agg = usePolling<AggregateSnapshot>(
   () => api.get<AggregateSnapshot>('/cluster/sync/aggregate'),
@@ -152,6 +156,7 @@ const pagedRows = computed(() => rows.value.slice((page.value - 1) * pageSize, p
 watch(() => rows.value.length, () => { if (page.value > totalPages.value) page.value = totalPages.value })
 
 async function syncNow() {
+  if (isStandalone.value) return   // no peers to sync to
   syncing.value = true
   try {
     await api.post('/cluster/config/sync')
@@ -172,11 +177,23 @@ async function syncNow() {
       <h2 class="text-xl font-bold text-gray-900 dark:text-white">Cluster Sync</h2>
       <button
         @click="syncNow"
-        :disabled="syncing"
-        class="text-sm px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition disabled:opacity-60"
+        :disabled="syncing || isStandalone"
+        :title="isStandalone ? 'No peers — this node runs standalone' : ''"
+        class="text-sm px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition disabled:opacity-60 disabled:cursor-not-allowed"
       >
         {{ syncing ? 'Syncing…' : '↻ Sync shared config to peers' }}
       </button>
+    </div>
+
+    <!-- Standalone: cluster sync compares/pushes config across peers. With no
+         cluster there are no peers, so the /cluster/* endpoints 503 by design.
+         Show a notice instead of an error; the local data counts below still
+         work and are the useful part here. -->
+    <div v-if="isStandalone" class="rounded-xl border border-blue-200 dark:border-blue-900/50 bg-blue-50 dark:bg-blue-900/20 px-4 py-3 text-sm text-blue-800 dark:text-blue-300">
+      <span class="font-semibold">Standalone mode.</span>
+      Config sync compares and pushes shared config across cluster peers. This
+      node runs with <code class="text-xs">cluster.enabled: false</code>, so there
+      are no peers to sync with. The counts below reflect this node's local data.
     </div>
 
     <!-- Replicated data counts: domains that auto-sync via gossip -->
@@ -209,8 +226,8 @@ async function syncNow() {
       </ul>
     </section>
 
-    <!-- Effective shared-config diff per node -->
-    <section class="bg-white dark:bg-gray-800 rounded-xl border shadow-sm"
+    <!-- Effective shared-config diff per node — cluster-only -->
+    <section v-if="!isStandalone" class="bg-white dark:bg-gray-800 rounded-xl border shadow-sm"
       :class="differCount > 0 ? 'border-yellow-300 dark:border-yellow-700' : 'border-gray-100 dark:border-gray-700'"
     >
       <header class="px-4 py-3 border-b border-gray-100 dark:border-gray-700 flex items-start justify-between gap-3">
