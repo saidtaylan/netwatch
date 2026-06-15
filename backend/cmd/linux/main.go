@@ -2590,6 +2590,29 @@ func formatBudget(sec int64) string {
 //  3. Fall back: compare raw token to setup_token (for setup flow)
 //
 // Returns true when the request is authorised as admin.
+// jwtUserStillValid reports whether the user a JWT was issued for still exists
+// and is enabled. A token can outlive its user: the account may have been
+// deleted, or the SQLite DB reset (e.g. `docker compose down -v` then up) while
+// the signing secret (admin.setup_token) stayed the same — so the HMAC
+// signature still verifies even though the user row is gone. Without this check
+// such a token keeps "working" and the UI shows a logged-in session backed by
+// no user. Tokens with no user subject (the synthetic anonymous/setup_token
+// claim minted when no auth is configured) are always treated as valid here.
+func jwtUserStillValid(e *engine.Engine, claims *engine.JWTClaims) bool {
+	if claims == nil || claims.Sub == "" {
+		return true
+	}
+	um := e.UsersMgr()
+	if um == nil {
+		return true
+	}
+	user, found := um.GetByID(claims.Sub)
+	if !found || user.Disabled {
+		return false
+	}
+	return true
+}
+
 func checkAdminAuth(e *engine.Engine, w http.ResponseWriter, r *http.Request) bool {
 	setupToken := e.SetupToken()
 	if setupToken == "" {
@@ -2611,6 +2634,13 @@ func checkAdminAuth(e *engine.Engine, w http.ResponseWriter, r *http.Request) bo
 	// Try JWT verification first
 	claims, err := engine.VerifyJWT(bearerToken, setupToken)
 	if err == nil {
+		// Reject tokens whose user no longer exists (deleted / DB reset).
+		if !jwtUserStillValid(e, claims) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "user no longer exists — please sign in again"})
+			return false
+		}
 		// Valid JWT — check admin role
 		if claims.Role != "admin" {
 			w.Header().Set("Content-Type", "application/json")
@@ -2654,6 +2684,15 @@ func checkJWTAuth(e *engine.Engine, w http.ResponseWriter, r *http.Request) *eng
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return nil
+	}
+	// Reject tokens whose user no longer exists (deleted / DB reset). The
+	// signature can still verify against an unchanged setup_token, so we must
+	// confirm the account is actually present before honouring the session.
+	if !jwtUserStillValid(e, claims) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "user no longer exists — please sign in again"})
 		return nil
 	}
 	return claims
