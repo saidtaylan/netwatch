@@ -1,0 +1,62 @@
+name: Staging smoke — released image, clean runner
+
+# Boots the PUBLISHED container image as a real 3-node cluster on a clean GitHub
+# runner and runs the curl-based acceptance gate (deploy/staging/smoke.sh). This
+# is the "don't trust my laptop" gate: it pulls the same artifact prod pulls and
+# asserts the real failure modes (cluster convergence, REAL_OUTAGE consensus,
+# distributed ownership, stale-JWT rejection, node-kill quorum + rejoin).
+#
+# Run it AFTER the release/​rc image has been published (the release workflow
+# pushes the image first). Trigger from the Actions tab with the version, e.g.
+# 0.1.7-rc.1 (no leading "v").
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Image tag to test (no leading v), e.g. 0.1.7-rc.1'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read   # pull the image from GHCR
+
+jobs:
+  smoke:
+    name: 3-node cluster smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Boot 3-node cluster from the released image
+        working-directory: deploy/staging
+        env:
+          VERSION: ${{ inputs.version }}
+        # Backend services only — the smoke gate is HTTP-level and needs no UI.
+        run: |
+          docker compose -f docker-compose.staging.yml up -d netwatch-1 netwatch-2 netwatch-3
+          echo "Waiting for node-1 to answer…"
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:10240/health && break || sleep 2
+          done
+
+      - name: Run smoke gate
+        run: bash deploy/staging/smoke.sh
+
+      - name: Dump logs on failure
+        if: failure()
+        working-directory: deploy/staging
+        run: docker compose -f docker-compose.staging.yml logs --tail=200
+
+      - name: Tear down
+        if: always()
+        working-directory: deploy/staging
+        run: docker compose -f docker-compose.staging.yml down -v

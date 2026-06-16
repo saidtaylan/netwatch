@@ -1,0 +1,50 @@
+# Staging node 3 of 3. See node-1.yaml for the annotated reference.
+port: "10240"
+node_alias: "netwatch-3"
+state_file: "/var/lib/netwatch/state.json"
+log_path: ""
+timeout: 5
+max_retries: 1
+ticker_interval_sec: 2
+probe_interval_sec: 15
+recovery_probes: 1
+
+admin:
+  setup_token: "staging-shared-secret-0123456789abcdef"
+
+slo:
+  enabled: true
+  retention_days: 7
+  targets:
+    - id: "always-down"
+      target_uptime: 0.99
+      window: "24h"
+
+targets:
+  - id: "node-1-api"
+    type: tcp
+    target: "netwatch-1:10240"
+    name: "node-1 API"
+  - id: "node-2-api"
+    type: tcp
+    target: "netwatch-2:10240"
+    name: "node-2 API"
+  - id: "node-3-api"
+    type: tcp
+    target: "netwatch-3:10240"
+    name: "node-3 API"
+  - id: "always-down"
+    type: tcp
+    target: "127.0.0.1:9"
+    name: "Always down (alert / SLO / scope test)"
+
+cluster:
+  enabled: true
+  node_name: "netwatch-3"
+  bind_addr: "0.0.0.0"
+  bind_port: 7946
+  peers: ["netwatch-1:7946", "netwatch-2:7946"]
+  expected_node_count: 3
+  min_quorum_ratio: 0.5
+  probe_replication_factor: 2
+  zone: "zone-c"
