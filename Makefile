@@ -99,3 +99,29 @@ staging-netem-clear:
 
 staging-down:
 	docker compose -f $(STAGING) down -v
+
+# ── Dev (local code, live development) ────────────────────────────────────────
+# Counterpart to staging: builds the backend from local source and runs the Nuxt
+# dev server with HMR, so your local changes are what runs. Ports are offset
+# (112xx / 3000) so dev runs side by side with staging. See deploy/dev/README.md.
+DEV := deploy/dev/docker-compose.dev.yml
+
+.PHONY: dev-up dev-down dev-logs dev-rebuild dev-status
+
+dev-up:
+	docker compose -f $(DEV) up -d --build
+	@echo "==> Frontend (HMR) → http://localhost:3000  ·  backend node-1 → http://localhost:11240"
+
+dev-rebuild:
+	docker compose -f $(DEV) up -d --build dev-netwatch-1 dev-netwatch-2
+
+dev-status:
+	@curl -fsS localhost:11240/cluster/state 2>/dev/null \
+	  | python3 -c "import sys,json; d=json.load(sys.stdin); print('alive members:', len(d['members'])); [print(' -', m['name'], m['status'], m.get('zone','')) for m in d['members']]" \
+	  || echo "node-1 not ready yet — retry in a few seconds"
+
+dev-logs:
+	docker compose -f $(DEV) logs -f --tail=50
+
+dev-down:
+	docker compose -f $(DEV) down -v

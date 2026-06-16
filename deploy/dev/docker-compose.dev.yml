@@ -1,0 +1,78 @@
+# Local-code development stack — the counterpart to deploy/staging.
+#
+# Unlike staging (which pulls the RELEASED ghcr image + release UI bundle), this
+# BUILDS the backend from ../../backend and runs the Nuxt dev server with HMR
+# from ../../frontend, so your local changes are what runs. Nothing is pulled
+# from a release.
+#
+#   make dev-up        # build + start 2 backend nodes + frontend dev server
+#   make dev-rebuild   # rebuild + restart just the backend (after Go changes)
+#   make dev-logs
+#   make dev-down
+#
+# Frontend (HMR) → http://localhost:3000   (auto-points at http://localhost:11240)
+# Backend node-1 → http://localhost:11240   node-2 → http://localhost:11241
+#
+# Ports are offset (112xx, 3000) so dev can run side by side with staging
+# (102xx, 8080) without clashing.
+services:
+  # One-shot: make each node's state volume writable by the nonroot image user.
+  state-init:
+    image: alpine:latest
+    command: sh -c "chown -R 65532:65532 /s1 /s2"
+    volumes:
+      - s1:/s1
+      - s2:/s2
+    restart: "no"
+
+  dev-netwatch-1:
+    build:
+      context: ../../backend      # local backend source — not a release image
+    container_name: dev-netwatch-1
+    hostname: dev-netwatch-1
+    depends_on:
+      state-init: { condition: service_completed_successfully }
+    ports: ["11240:10240"]
+    cap_add: [NET_RAW]
+    volumes:
+      - ./node-1.yaml:/etc/netwatch/config.yaml:ro
+      - s1:/var/lib/netwatch
+    restart: unless-stopped
+
+  dev-netwatch-2:
+    build:
+      context: ../../backend
+    container_name: dev-netwatch-2
+    hostname: dev-netwatch-2
+    depends_on:
+      state-init: { condition: service_completed_successfully }
+    ports: ["11241:10240"]
+    cap_add: [NET_RAW]
+    volumes:
+      - ./node-2.yaml:/etc/netwatch/config.yaml:ro
+      - s2:/var/lib/netwatch
+    restart: unless-stopped
+
+  # Frontend: Nuxt dev server with hot-module reload, straight off your source.
+  # node_modules and .nuxt live in named volumes so the container's Linux build
+  # never clobbers (or is clobbered by) your host's.
+  dev-ui:
+    image: node:22-alpine
+    container_name: dev-netwatch-ui
+    working_dir: /app
+    command: sh -c "corepack enable && pnpm install && pnpm dev --host 0.0.0.0 --port 3000"
+    environment:
+      - NUXT_PUBLIC_DEFAULT_BACKEND_URL=http://localhost:11240
+      - CHOKIDAR_USEPOLLING=true     # reliable HMR file-watching over bind mounts
+    ports: ["3000:3000"]
+    volumes:
+      - ../../frontend:/app
+      - dev-node-modules:/app/node_modules
+      - dev-nuxt:/app/.nuxt
+    restart: unless-stopped
+
+volumes:
+  s1: {}
+  s2: {}
+  dev-node-modules: {}
+  dev-nuxt: {}

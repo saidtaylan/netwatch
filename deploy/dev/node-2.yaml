@@ -1,0 +1,47 @@
+# Dev node 2 of 2. See node-1.yaml for the annotated reference.
+port: "10240"
+node_alias: "dev-netwatch-2"
+state_file: "/var/lib/netwatch/state.json"
+log_path: ""
+timeout: 5
+max_retries: 1
+ticker_interval_sec: 2
+probe_interval_sec: 15
+recovery_probes: 1
+reload_interval_sec: 15
+
+admin:
+  setup_token: "dev-setup-token-change-me-0001"
+
+slo:
+  enabled: true
+  retention_days: 7
+  targets:
+    - id: "always-down"
+      target_uptime: 0.99
+      window: "24h"
+
+targets:
+  - id: "node-1-api"
+    name: "node-1 API"
+    type: tcp
+    target: "dev-netwatch-1:10240"
+  - id: "node-2-api"
+    name: "node-2 API"
+    type: tcp
+    target: "dev-netwatch-2:10240"
+  - id: "always-down"
+    name: "Always down (dev test)"
+    type: tcp
+    target: "127.0.0.1:9"
+
+cluster:
+  enabled: true
+  node_name: "dev-netwatch-2"
+  bind_addr: "0.0.0.0"
+  bind_port: 7946
+  peers: ["dev-netwatch-1:7946"]
+  expected_node_count: 2
+  min_quorum_ratio: 0.5
+  probe_replication_factor: 2
+  zone: "dev-b"
