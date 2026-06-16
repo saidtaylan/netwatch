@@ -2656,9 +2656,17 @@ func checkAdminAuth(e *engine.Engine, w http.ResponseWriter, r *http.Request) bo
 		return true
 	}
 
+	// The bearer token failed JWT verification (bad signature / expired) and is
+	// not the raw setup_token. This is an authentication problem, not an
+	// authorization one, so answer 401 (not 403): the client should drop the
+	// stale token and sign in again. A common trigger is a token left in the
+	// browser from an earlier run whose admin.setup_token differed. Returning
+	// 403 here would leave the UI "logged in but forbidden" instead of logging
+	// out. (A *valid* token with a non-admin role still gets 403 above.)
+	w.Header().Set("WWW-Authenticate", `Bearer realm="netwatch-admin"`)
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusForbidden)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid or expired token"})
+	w.WriteHeader(http.StatusUnauthorized)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid or expired token — please sign in again"})
 	return false
 }
 

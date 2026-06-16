@@ -21,7 +21,7 @@ onMounted(async () => {
   try { probers.value = await api.get<ProberAssignmentSnapshot>('/cluster/probers') } catch {}
 })
 
-const targetProbers = computed(() => probers.value?.targets?.[id.value] ?? null)
+const targetProbers = computed(() => probers.value?.assignments?.[id.value] ?? null)
 
 // Down/up node split from by_node
 const downNodes = computed(() =>
@@ -167,14 +167,12 @@ const upNodes = computed(() =>
           <span v-if="geo.data.value.anomaly" class="text-xs text-orange-500">⚠ Latency anomaly detected</span>
         </div>
         <div class="space-y-1">
-          <div v-for="n in geo.data.value.by_node" :key="n.node"
-            class="flex items-center gap-3 text-sm"
-            :class="n.anomaly ? 'text-orange-600' : 'text-gray-700 dark:text-gray-300'"
+          <div v-for="n in geo.data.value.by_node" :key="n.node_name"
+            class="flex items-center gap-3 text-sm text-gray-700 dark:text-gray-300"
           >
-            <span class="w-32 truncate font-medium">{{ n.node }}</span>
+            <span class="w-32 truncate font-medium">{{ n.node_name }}</span>
             <span v-if="n.region" class="text-xs text-gray-400 w-20 truncate">{{ n.region }}</span>
-            <span class="ml-auto font-mono text-xs">{{ fmtLatency(n.latency) }}</span>
-            <span v-if="n.anomaly" class="text-xs">⚠</span>
+            <span class="ml-auto font-mono text-xs">{{ n.latency_seconds ? fmtLatency(n.latency_seconds) : '—' }}</span>
           </div>
         </div>
       </div>

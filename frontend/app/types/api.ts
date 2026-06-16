@@ -236,7 +236,10 @@ export interface PeerConfigInfo {
 // ── /cluster/probers ─────────────────────────────────────────────────────────
 
 export interface ProberAssignmentSnapshot {
-  targets: Record<string, TargetProbers>
+  local_node?:         string
+  replication_factor?: number
+  // The backend keys per-target assignments under `assignments` (not `targets`).
+  assignments: Record<string, TargetProbers>
 }
 
 export interface TargetProbers {
@@ -244,7 +247,7 @@ export interface TargetProbers {
   probers:     string[]
   primary?:    string
   probe_from?: string[]
-  candidates:  string[]
+  candidates?: string[]
 }
 
 // ── /cluster/maintenance ─────────────────────────────────────────────────────

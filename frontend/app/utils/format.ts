@@ -20,6 +20,9 @@ export function fmtRelative(iso: string): string {
 
 /** Format latency in seconds → "123ms" or "1.23s" */
 export function fmtLatency(seconds: number): string {
+  // Guard undefined / NaN so a missing latency renders a dash instead of
+  // throwing (undefined.toFixed) and blanking the whole page.
+  if (seconds == null || Number.isNaN(seconds)) return '—'
   const ms = seconds * 1000
   if (ms < 1000) return `${Math.round(ms)}ms`
   return `${seconds.toFixed(2)}s`

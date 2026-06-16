@@ -9,6 +9,10 @@ import type { Page } from '@playwright/test'
 // `target_counts` + `targets` as an object map, which doesn't iterate
 // in useFleet's `for (const t of snapshot.targets)` loop and silently
 // rendered an empty Down Targets section in the e2e test.
+// NOTE: UP targets intentionally omit scope / classification / confidence /
+// affected_apps to mirror the REAL backend — /fleet/status only computes scope
+// classification for targets that are down. The mock used to set these on every
+// target, which hid a crash on the target-detail page for healthy targets.
 const FLEET = {
   node_name: 'e2e-node',
   cluster_enabled: false,
@@ -16,9 +20,8 @@ const FLEET = {
   targets: [
     {
       id: 'api-gateway', name: 'api-gateway', target: '127.0.0.1:8080', type: 'tcp',
-      consensus_state: 'up', scope: 'STANDALONE', classification: 'AMBIGUOUS',
-      confidence: 1, affected_apps: ['payment-app'],
-      by_node: { 'e2e-node': { state: 'up', seq: 3, error_code: '', latency: 0.012 } },
+      consensus_state: 'up',
+      by_node: { 'e2e-node': { state: 'up', seq: 3 } },
     },
     {
       id: 'db-primary', name: 'db-primary', target: '127.0.0.1:5432', type: 'tcp',
@@ -28,9 +31,8 @@ const FLEET = {
     },
     {
       id: 'web-server', name: 'web-server', target: 'https://example.com', type: 'http',
-      consensus_state: 'up', scope: 'STANDALONE', classification: 'AMBIGUOUS',
-      confidence: 1, affected_apps: [],
-      by_node: { 'e2e-node': { state: 'up', seq: 1, error_code: '', latency: 0.055 } },
+      consensus_state: 'up',
+      by_node: { 'e2e-node': { state: 'up', seq: 1 } },
     },
   ],
 }
