@@ -45,7 +45,7 @@ const totalTargets = computed(() =>
     <div v-if="isStandalone" class="rounded-xl border border-blue-200 dark:border-blue-900/50 bg-blue-50 dark:bg-blue-900/20 px-4 py-3 text-sm text-blue-800 dark:text-blue-300">
       <span class="font-semibold">Standalone mode.</span>
       This node runs with <code class="text-xs">cluster.enabled: false</code>, so it monitors targets on its own —
-      cluster features (peers, quorum, config drift, geo latency) are off. To form a cluster, enable it in
+      cluster features (peer sync, quorum, shared-config checks, geo latency) are off. To form a cluster, enable it in
       <code class="text-xs">config.yaml</code> and add peers.
     </div>
 
