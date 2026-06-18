@@ -76,3 +76,6 @@ backend/tests/CLUSTER_REPORT.md
 
 # GIF intermediate frames (regenerate via the live tour spec)
 screenshots/frames/
+
+# pnpm content-addressable store (local cache)
+frontend/.pnpm-store/
