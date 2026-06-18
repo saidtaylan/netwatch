@@ -1,19 +1,14 @@
-# Dev node 1 of 3 — runs as a HOST process (no Docker), built from local source,
-# so backend changes show up after `make dev-restart` and frontend changes are
-# live via `pnpm dev`. Rich demo dataset (varied targets, a dependency chain,
-# apps, SLOs, channels) so the UI is full for screenshots. Shared blocks
-# (notifications / slo / targets / apps) are identical across nodes — only
-# node_name / bind_port / peers / zone differ.
-port: "11240"
-node_alias: "dev-netwatch-1"
-state_file: "/tmp/netwatch-dev/n1/state.json"
-log_path: "/tmp/netwatch-dev/n1/agent.log"
+# Dev node 3 of 3 (host process). See node-1.yaml for the annotated reference.
+port: "11242"
+node_alias: "dev-netwatch-3"
+state_file: "/tmp/netwatch-dev/n3/state.json"
+log_path: "/tmp/netwatch-dev/n3/agent.log"
 timeout: 5
 max_retries: 1
 ticker_interval_sec: 2
 probe_interval_sec: 15
 recovery_probes: 1
-reload_interval_sec: 15        # hot-reload config edits without a restart
+reload_interval_sec: 15
 
 admin:
   setup_token: "dev-setup-token-change-me-0001"
@@ -50,15 +45,12 @@ slo:
     - { id: "dns-resolver",    target_uptime: 0.9995, window: "30d" }
 
 targets:
-  # Infrastructure — UP
   - { id: "node-1-api",  name: "node-1 API",   type: tcp, target: "127.0.0.1:11240" }
   - { id: "node-2-api",  name: "node-2 API",   type: tcp, target: "127.0.0.1:11241" }
   - { id: "node-3-api",  name: "node-3 API",   type: tcp, target: "127.0.0.1:11242" }
   - { id: "dns-resolver", name: "DNS Resolver", type: tcp, target: "1.1.1.1:53" }
-  # Web — UP (external; needs egress)
   - { id: "company-website", name: "Company Website", type: http, target: "https://example.com", options: { expected_status: { in: [200] } } }
   - { id: "public-dns",      name: "Public DNS",      type: dns,  target: "example.com", options: { nameserver: "1.1.1.1:53" } }
-  # Payments stack — a DOWN dependency chain (root-cause + cascade demo)
   - { id: "payments-db", name: "Payments DB",      type: tcp, target: "127.0.0.1:5432" }
   - { id: "payment-api", name: "Payment API",      type: tcp, target: "127.0.0.1:8081", depends_on: ["payments-db"] }
   - { id: "checkout",    name: "Checkout Service", type: tcp, target: "127.0.0.1:8082", depends_on: ["payment-api"] }
@@ -70,11 +62,11 @@ apps:
 
 cluster:
   enabled: true
-  node_name: "dev-netwatch-1"
+  node_name: "dev-netwatch-3"
   bind_addr: "127.0.0.1"
-  bind_port: 7950
-  peers: ["127.0.0.1:7951", "127.0.0.1:7952"]
+  bind_port: 7952
+  peers: ["127.0.0.1:7950", "127.0.0.1:7951"]
   expected_node_count: 3
   min_quorum_ratio: 0.5
-  probe_replication_factor: 3   # all nodes probe everything → full by-node view
-  zone: "dev-a"
+  probe_replication_factor: 3
+  zone: "dev-c"

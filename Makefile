@@ -100,28 +100,34 @@ staging-netem-clear:
 staging-down:
 	docker compose -f $(STAGING) down -v
 
-# ── Dev (local code, live development) ────────────────────────────────────────
-# Counterpart to staging: builds the backend from local source and runs the Nuxt
-# dev server with HMR, so your local changes are what runs. Ports are offset
-# (112xx / 3000) so dev runs side by side with staging. See deploy/dev/README.md.
-DEV := deploy/dev/docker-compose.dev.yml
-
-.PHONY: dev-up dev-down dev-logs dev-rebuild dev-status
+# ── Dev (local code, live development — NO Docker) ────────────────────────────
+# A staging-like 3-node cluster, but run as HOST processes from local source so
+# changes are live: backend reflects after `make dev-restart` (rebuild+relaunch,
+# ~2s); the frontend is `make dev-frontend` (Nuxt dev server, HMR). Ports are
+# offset (112xx backend, 3000 frontend) so dev runs alongside staging.
+# See deploy/dev/README.md.
+.PHONY: dev-up dev-down dev-restart dev-status dev-seed dev-logs dev-frontend
 
 dev-up:
-	docker compose -f $(DEV) up -d --build
-	@echo "==> Frontend (HMR) → http://localhost:3000  ·  backend node-1 → http://localhost:11240"
+	bash deploy/dev/run.sh up
+	@bash deploy/dev/seed.sh || true
+	@echo "==> Backend cluster ready on :11240 / :11241 / :11242"
+	@echo "==> Now run the UI in another terminal:  make dev-frontend  (→ http://localhost:3000)"
 
-dev-rebuild:
-	docker compose -f $(DEV) up -d --build dev-netwatch-1 dev-netwatch-2
+dev-restart:           ## rebuild backend from local source + relaunch (keeps state)
+	bash deploy/dev/run.sh restart
+
+dev-frontend:          ## Nuxt dev server with HMR, pointed at the dev cluster
+	cd frontend && NUXT_PUBLIC_DEFAULT_BACKEND_URL=http://localhost:11240 pnpm dev
+
+dev-seed:
+	bash deploy/dev/seed.sh
 
 dev-status:
-	@curl -fsS localhost:11240/cluster/state 2>/dev/null \
-	  | python3 -c "import sys,json; d=json.load(sys.stdin); print('alive members:', len(d['members'])); [print(' -', m['name'], m['status'], m.get('zone','')) for m in d['members']]" \
-	  || echo "node-1 not ready yet — retry in a few seconds"
+	bash deploy/dev/run.sh status
 
 dev-logs:
-	docker compose -f $(DEV) logs -f --tail=50
+	tail -f /tmp/netwatch-dev/n1/out.log /tmp/netwatch-dev/n2/out.log /tmp/netwatch-dev/n3/out.log
 
 dev-down:
-	docker compose -f $(DEV) down -v
+	bash deploy/dev/run.sh down

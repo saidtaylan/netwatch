@@ -1,8 +1,8 @@
-# Dev node 2 of 2. See node-1.yaml for the annotated reference.
-port: "10240"
+# Dev node 2 of 3 (host process). See node-1.yaml for the annotated reference.
+port: "11241"
 node_alias: "dev-netwatch-2"
-state_file: "/var/lib/netwatch/state.json"
-log_path: ""
+state_file: "/tmp/netwatch-dev/n2/state.json"
+log_path: "/tmp/netwatch-dev/n2/agent.log"
 timeout: 5
 max_retries: 1
 ticker_interval_sec: 2
@@ -13,35 +13,60 @@ reload_interval_sec: 15
 admin:
   setup_token: "dev-setup-token-change-me-0001"
 
+notifications:
+  ops-webhook:
+    type: webhook
+    parameters:
+      url: "https://example.com/hooks/netwatch"
+      format: "generic"
+  sre-mail:
+    type: mail
+    parameters:
+      smtp_host: "smtp.example.com"
+      smtp_port: "587"
+      from: "netwatch@example.com"
+      to: "sre@example.com"
+      tls_mode: "starttls"
+  pager:
+    type: script
+    parameters:
+      script: "/tmp/netwatch-dev/alert.sh"
+default_notify: ["ops-webhook"]
+
 slo:
   enabled: true
-  retention_days: 7
+  retention_days: 90
+  slo_notify: ["sre-mail"]
   targets:
-    - id: "always-down"
-      target_uptime: 0.99
-      window: "24h"
+    - { id: "payments-db",     target_uptime: 0.999,  window: "30d" }
+    - { id: "payment-api",     target_uptime: 0.995,  window: "7d"  }
+    - { id: "checkout",        target_uptime: 0.999,  window: "7d"  }
+    - { id: "company-website", target_uptime: 0.99,   window: "24h" }
+    - { id: "dns-resolver",    target_uptime: 0.9995, window: "30d" }
 
 targets:
-  - id: "node-1-api"
-    name: "node-1 API"
-    type: tcp
-    target: "dev-netwatch-1:10240"
-  - id: "node-2-api"
-    name: "node-2 API"
-    type: tcp
-    target: "dev-netwatch-2:10240"
-  - id: "always-down"
-    name: "Always down (dev test)"
-    type: tcp
-    target: "127.0.0.1:9"
+  - { id: "node-1-api",  name: "node-1 API",   type: tcp, target: "127.0.0.1:11240" }
+  - { id: "node-2-api",  name: "node-2 API",   type: tcp, target: "127.0.0.1:11241" }
+  - { id: "node-3-api",  name: "node-3 API",   type: tcp, target: "127.0.0.1:11242" }
+  - { id: "dns-resolver", name: "DNS Resolver", type: tcp, target: "1.1.1.1:53" }
+  - { id: "company-website", name: "Company Website", type: http, target: "https://example.com", options: { expected_status: { in: [200] } } }
+  - { id: "public-dns",      name: "Public DNS",      type: dns,  target: "example.com", options: { nameserver: "1.1.1.1:53" } }
+  - { id: "payments-db", name: "Payments DB",      type: tcp, target: "127.0.0.1:5432" }
+  - { id: "payment-api", name: "Payment API",      type: tcp, target: "127.0.0.1:8081", depends_on: ["payments-db"] }
+  - { id: "checkout",    name: "Checkout Service", type: tcp, target: "127.0.0.1:8082", depends_on: ["payment-api"] }
+
+apps:
+  - { name: "Payments",       owner_team: "fintech-sre",  uses: ["payments-db", "payment-api", "checkout"], notifications: ["pager"] }
+  - { name: "Web Platform",   owner_team: "platform-eng", uses: ["company-website", "public-dns"] }
+  - { name: "Infrastructure", owner_team: "infra-ops",    uses: ["node-1-api", "node-2-api", "node-3-api", "dns-resolver"] }
 
 cluster:
   enabled: true
   node_name: "dev-netwatch-2"
-  bind_addr: "0.0.0.0"
-  bind_port: 7946
-  peers: ["dev-netwatch-1:7946"]
-  expected_node_count: 2
+  bind_addr: "127.0.0.1"
+  bind_port: 7951
+  peers: ["127.0.0.1:7950", "127.0.0.1:7952"]
+  expected_node_count: 3
   min_quorum_ratio: 0.5
-  probe_replication_factor: 2
+  probe_replication_factor: 3
   zone: "dev-b"

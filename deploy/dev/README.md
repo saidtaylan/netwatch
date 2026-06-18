@@ -1,53 +1,64 @@
-# Dev stack — local code, live development
+# Dev stack — local code, live, multi-node (no Docker)
 
-The development counterpart to [`deploy/staging`](../staging). Where staging
-proves a **released** artifact, this runs **your local code**:
+The development counterpart to [`deploy/staging`](../staging). Staging proves a
+**released** artifact in containers; this runs **your local code** as **host
+processes** so changes are live:
 
-- **Backend** is built from `../../backend` (`build:` in the compose file) — no
-  ghcr image is pulled. After Go changes, `make dev-rebuild`.
-- **Frontend** runs the **Nuxt dev server with HMR** off `../../frontend` — edit
-  a `.vue`/`.ts` file and the browser updates instantly. No release bundle.
+- **Backend** — 3 nodes built from `../../backend` and run on `127.0.0.1` as a
+  real gossip cluster. After a Go change, `make dev-restart` rebuilds and
+  relaunches in ~2s. (Docker is intentionally avoided: a container backend would
+  need an image rebuild on every change.)
+- **Frontend** — `make dev-frontend` runs the Nuxt dev server with HMR, so
+  `.vue`/`.ts` edits hit the browser instantly.
 
-Two backend nodes form a real cluster so you can develop cluster features.
+It ships a **rich, demo-ready dataset** (9 targets across tcp/http/dns, a down
+dependency chain with root-cause, 3 apps with owner teams, 5 SLOs, 3 notification
+channels, plus a seeded maintenance window) so every page is full for
+screenshots.
 
 ## Quick start
 
 ```bash
-make dev-up          # build + start 2 backend nodes + the Nuxt dev server
-make dev-status      # show cluster members
-make dev-down        # stop + wipe volumes
+make dev-up          # build + start the 3-node backend cluster + seed demo data
+make dev-frontend    # in a second terminal: Nuxt dev server with HMR
 ```
 
-- Frontend (HMR) → http://localhost:3000 — the backend URL is pre-filled as
-  `http://localhost:11240`; create your admin on first run.
-- Backend node-1 → http://localhost:11240   node-2 → http://localhost:11241
-
-The first `dev-up` is slower: it compiles the backend image and runs
-`pnpm install` inside the UI container (cached in a named volume afterwards).
+- Frontend → http://localhost:3000 — backend URL is pre-filled as
+  `http://localhost:11240`. On first run go to `/setup` and use the setup token
+  `dev-setup-token-change-me-0001` to create your admin.
+- Backend nodes → http://localhost:11240 / :11241 / :11242
 
 ## The dev loop
 
 | You changed… | Do this |
 |---|---|
 | Frontend (`.vue` / `.ts` / styles) | nothing — HMR reloads automatically |
-| Backend (Go) | `make dev-rebuild` (rebuilds + restarts the two nodes) |
-| A node's `config.yaml` (`node-1.yaml` / `node-2.yaml`) | nothing — `reload_interval_sec` re-reads it within ~15s |
+| Backend (Go) | `make dev-restart` (rebuild + relaunch, keeps state) |
+| A node's `config.yaml` | nothing — `reload_interval_sec` re-reads it within ~15s |
 
 ```bash
-make dev-rebuild     # docker compose up -d --build for the backend services
-make dev-logs        # follow logs
+make dev-status      # cluster members
+make dev-logs        # tail all three node logs
+make dev-seed        # re-seed runtime-only data (the maintenance window)
+make dev-down        # stop all nodes
 ```
+
+## What's in the demo dataset
+
+- **Up**: `node-1/2/3-api`, `dns-resolver` (tcp), `company-website` (http),
+  `public-dns` (dns)
+- **Down chain** (root-cause + cascade): `payments-db` → `payment-api` →
+  `checkout` — all REAL_OUTAGE, root cause resolves to `payments-db`
+- **Apps**: Payments (fintech-sre), Web Platform (platform-eng), Infrastructure
+  (infra-ops)
+- **SLOs**: 5 targets across 24h / 7d / 30d windows
+- **Maintenance**: one window on `company-website` (seeded by `seed.sh`)
+
+The external targets (`company-website`, `public-dns`, `dns-resolver`) need
+outbound internet; without it they simply show as down.
 
 ## Side by side with staging
 
-Dev uses offset host ports (`112xx`, `3000`) while staging uses `102xx` / `8080`,
-so both can run at once. They use separate Docker volumes and networks.
-
-## Notes
-
-- `CHOKIDAR_USEPOLLING=true` makes HMR file-watching reliable over bind mounts
-  (Docker Desktop on macOS/Windows doesn't forward native FS events).
-- The frontend talks to the backend cross-origin (`:3000` → `:11240`); the
-  backend already sends permissive CORS for local development.
-- This stack is for development only. To test what actually ships, use
-  `deploy/staging` (released artifacts) or the curl/netem gates there.
+Dev uses host ports `112xx` / `3000`; staging uses `102xx` / `8080` in Docker.
+They don't collide, so you can run both. Runtime state lives in
+`/tmp/netwatch-dev/` (wiped by `make dev-up`).

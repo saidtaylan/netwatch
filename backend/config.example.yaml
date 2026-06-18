@@ -131,12 +131,11 @@ targets:
 
   # ── ICMP ping ────────────────────────────────────────────────────────────────
   # Requires CAP_NET_RAW or root. Remove on containers without the capability.
+  # ping takes no options; the global `timeout:` applies. (Unknown option keys
+  # are rejected at load time.)
   - name:   "Core Router"
     type:   ping
     target: "10.0.0.1"
-    options:
-      count:          3    # packets per probe
-      timeout_sec:    2
 
   # ── DNS ──────────────────────────────────────────────────────────────────────
   - name:   "Internal DNS"
