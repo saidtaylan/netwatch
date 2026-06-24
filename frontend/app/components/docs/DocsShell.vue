@@ -3,6 +3,21 @@ import { docsNav, docsBySlug } from '~/docs/registry'
 import { renderMarkdown } from '~/composables/useMarkdown'
 
 const props = defineProps<{ slug: string }>()
+const router = useRouter()
+
+// Links inside the rendered markdown are plain <a> (v-html), so a relative link
+// like [Architecture](architecture) would do a native navigation — which 404s
+// from the /docs home (resolves to /architecture). Intercept clicks on internal
+// links and route them to /docs/<slug> via the SPA router instead.
+function onContentClick(e: MouseEvent) {
+  const a = (e.target as HTMLElement).closest('a')
+  if (!a) return
+  const href = a.getAttribute('href') || ''
+  if (!href || /^(https?:|mailto:|#)/.test(href) || a.getAttribute('target') === '_blank') return
+  e.preventDefault()
+  const slug = href.replace(/^\/?(docs\/)?/, '').replace(/\.md$/, '').replace(/[?#].*$/, '')
+  if (slug) router.push({ name: 'docs-slug', params: { slug } })
+}
 
 const page = computed(() => docsBySlug[props.slug])
 const rendered = computed(() =>
@@ -64,7 +79,7 @@ onBeforeUnmount(() => observer?.disconnect())
       <template v-if="page">
         <p class="text-xs uppercase tracking-wide text-gray-400 mb-1">{{ page.category }}</p>
         <!-- eslint-disable-next-line vue/no-v-html -->
-        <div class="docs-content" v-html="rendered.html" />
+        <div class="docs-content" v-html="rendered.html" @click="onContentClick" />
       </template>
       <div v-else class="text-gray-500 py-12">
         <p class="text-lg font-semibold">Page not found</p>

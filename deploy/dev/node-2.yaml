@@ -38,11 +38,12 @@ slo:
   retention_days: 90
   slo_notify: ["sre-mail"]
   targets:
+    - { id: "node-1-api",      target_uptime: 0.999,  window: "7d"  }
+    - { id: "node-2-api",      target_uptime: 0.99,   window: "24h" }
     - { id: "payments-db",     target_uptime: 0.999,  window: "30d" }
     - { id: "payment-api",     target_uptime: 0.995,  window: "7d"  }
     - { id: "checkout",        target_uptime: 0.999,  window: "7d"  }
     - { id: "company-website", target_uptime: 0.99,   window: "24h" }
-    - { id: "dns-resolver",    target_uptime: 0.9995, window: "30d" }
 
 targets:
   - { id: "node-1-api",  name: "node-1 API",   type: tcp, target: "127.0.0.1:11240" }
@@ -68,5 +69,5 @@ cluster:
   peers: ["127.0.0.1:7950", "127.0.0.1:7952"]
   expected_node_count: 3
   min_quorum_ratio: 0.5
-  probe_replication_factor: 3
+  probe_replication_factor: 2
   zone: "dev-b"

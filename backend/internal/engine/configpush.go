@@ -55,9 +55,14 @@ type SharedConfig struct {
 }
 
 // SharedClusterConfig holds the cluster-section fields that must match across nodes.
+//
+// NOTE: `peers` is deliberately NOT here. It is per-node bootstrap data — each
+// node seeds from a different list (the *other* nodes), so syncing it would
+// overwrite every node with the baseline node's peer list and corrupt the
+// cluster topology. Like node_name / bind_port / advertise_addr / state_file,
+// peers is excluded from config sync.
 type SharedClusterConfig struct {
 	Keyring                []string `json:"keyring,omitempty" yaml:"keyring,omitempty"`
-	Peers                  []string `json:"peers,omitempty" yaml:"peers,omitempty"`
 	ExpectedNodeCount      int      `json:"expected_node_count,omitempty" yaml:"expected_node_count,omitempty"`
 	MinQuorumRatio         float64  `json:"min_quorum_ratio,omitempty" yaml:"min_quorum_ratio,omitempty"`
 	ProbeReplicationFactor  int      `json:"probe_replication_factor,omitempty" yaml:"probe_replication_factor,omitempty"`
@@ -137,7 +142,10 @@ func extractSharedMap(m map[string]interface{}) map[string]interface{} {
 	}
 
 	clusterShared := []string{
-		"keyring", "peers", "expected_node_count", "min_quorum_ratio",
+		// NOTE: "peers" is intentionally excluded — it is per-node bootstrap data
+		// (each node seeds from the other nodes), not shared config. Syncing it
+		// would overwrite every node with the baseline's peer list.
+		"keyring", "expected_node_count", "min_quorum_ratio",
 		"probe_replication_factor", "probe_replication_percent", "min_probe_confirmations",
 	}
 	if clusterRaw, ok := m["cluster"]; ok {
@@ -296,7 +304,8 @@ func mergeSharedMap(dst, src map[string]interface{}) {
 		"notifications":   true, "default_notify": true,
 	}
 	clusterShared := map[string]bool{
-		"keyring": true, "peers": true, "expected_node_count": true,
+		// "peers" excluded — per-node bootstrap data, not shared (see above).
+		"keyring": true, "expected_node_count": true,
 		"min_quorum_ratio": true, "probe_replication_factor": true,
 		"probe_replication_percent": true, "min_probe_confirmations": true,
 	}

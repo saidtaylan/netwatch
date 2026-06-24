@@ -9,6 +9,9 @@ export function fmtDurationSec(seconds: number): string {
 
 /** Format ratio 0-1 → "99.90%" */
 export function fmtPercent(ratio: number, decimals = 2): string {
+  // Guard undefined / NaN (e.g. confidence on an up target where the backend
+  // omits it) so we render a dash instead of "NaN%".
+  if (ratio == null || Number.isNaN(ratio)) return '—'
   return `${(ratio * 100).toFixed(decimals)}%`
 }
 

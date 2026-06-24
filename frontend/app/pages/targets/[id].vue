@@ -77,7 +77,7 @@ const upNodes = computed(() =>
             <p class="text-sm font-mono text-gray-500">{{ target.target }}</p>
             <p class="text-xs text-gray-400 mt-0.5">type: {{ target.type }}</p>
           </div>
-          <div class="text-right text-xs text-gray-400 space-y-0.5">
+          <div v-if="target.scope" class="text-right text-xs text-gray-400 space-y-0.5">
             <p>Scope: <span :class="SCOPE_STYLE[target.scope]?.color ?? ''">{{ SCOPE_STYLE[target.scope]?.label }}</span></p>
             <p>Classification: <span :class="CLASS_STYLE[target.classification]?.color ?? ''">{{ CLASS_STYLE[target.classification]?.label }}</span></p>
           </div>
@@ -94,8 +94,9 @@ const upNodes = computed(() =>
         </div>
       </div>
 
-      <!-- Scope / Classification detail -->
-      <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-100 dark:border-gray-700 shadow-sm p-5">
+      <!-- Scope / Classification detail — only meaningful for a down target;
+           the backend omits scope/classification/confidence while it is up. -->
+      <div v-if="target.scope" class="bg-white dark:bg-gray-800 rounded-xl border border-gray-100 dark:border-gray-700 shadow-sm p-5">
         <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-3">Scope Analysis</h3>
         <ScopeClassificationCard
           :scope="target.scope"

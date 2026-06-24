@@ -39,6 +39,15 @@ stop() {
     fi
   done
   pkill -f "$BIN -config" 2>/dev/null || true
+  # Wait for the processes to actually exit before returning. A graceful cluster
+  # leave can take a few seconds, and if we relaunch before the old processes
+  # release their HTTP/gossip ports, the new ones fail to bind. SIGKILL anything
+  # still alive after the grace period.
+  for _ in $(seq 1 20); do
+    pgrep -f "$BIN -config" >/dev/null 2>&1 || break
+    sleep 0.5
+  done
+  pkill -9 -f "$BIN -config" 2>/dev/null || true
   echo "stopped dev cluster"
 }
 
