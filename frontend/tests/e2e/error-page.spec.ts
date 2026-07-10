@@ -12,7 +12,10 @@ test.describe('Error page', () => {
   test('unknown route shows 404 error page', async ({ page }) => {
     await page.goto('/this-route-does-not-exist')
     await expect(page.getByText('404')).toBeVisible({ timeout: 10000 })
-    await expect(page.getByText('Page not found')).toBeVisible()
+    // Scoped to the heading — getByText('Page not found') also matches the
+    // error-detail <pre> block ("Error: Page not found: /this-route-...."),
+    // which is a Playwright strict-mode violation (2 matches).
+    await expect(page.getByRole('heading', { name: 'Page not found' })).toBeVisible()
   })
 
   test('error page has "Go to Cluster Overview" button when authenticated', async ({ page }) => {
