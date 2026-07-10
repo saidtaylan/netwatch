@@ -10,7 +10,18 @@ import type { GeoLatencySnapshot } from '~/types/api'
 import { fmtLatency } from '~/utils/format'
 
 const api = useApi()
-const { targetList, isStandalone } = useFleet()
+const { targetList, targetById, isStandalone } = useFleet()
+
+// A latency of 0 is ambiguous: it means either "this node isn't currently a
+// designated prober for this target" (idle — target may be perfectly healthy)
+// or "the probe ran and failed" (target is down, so there's no round-trip to
+// report). Distinguish using the target's own consensus state so a down target
+// doesn't misleadingly read as "not probing" everywhere.
+function zeroLatencyLabel(targetId: string): string {
+  const t = targetById(targetId)
+  if (t && (t.consensus_state === 'hard_down' || t.consensus_state === 'soft_down')) return '— down'
+  return '— not probing'
+}
 
 // One Promise.allSettled per loadGeo call; results indexed by target.id.
 const geoData = ref<Record<string, GeoLatencySnapshot>>({})
@@ -83,7 +94,8 @@ const entries = computed(() =>
     </div>
     <p class="text-sm text-gray-500">
       Per-node probe latency for every target. Anomaly = any node > 3× the minimum.
-      Nodes with latency 0 haven't reported yet (e.g. not currently a designated prober for that target).
+      Latency 0 means either the node isn't a designated prober for that target ("not probing")
+      or the target is currently down, so there's no round-trip to measure ("down").
     </p>
 
     <!-- Standalone: geo latency compares the same target across cluster nodes
@@ -126,7 +138,7 @@ const entries = computed(() =>
               n.latency_seconds === 0
                 ? 'text-gray-400 italic'
                 : (isOutlier(n, minLatency(geo)) ? 'text-orange-600 font-bold' : 'text-gray-700 dark:text-gray-300')]">
-              {{ n.latency_seconds === 0 ? '— not probing' : fmtLatency(n.latency_seconds) }}
+              {{ n.latency_seconds === 0 ? zeroLatencyLabel(id) : fmtLatency(n.latency_seconds) }}
             </span>
             <span v-if="isOutlier(n, minLatency(geo))" class="text-xs text-orange-500">⚠</span>
           </div>

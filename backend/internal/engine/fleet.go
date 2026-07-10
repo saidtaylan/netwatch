@@ -29,9 +29,10 @@ type FleetCluster struct {
 
 // FleetNodeView is one node's reported state for a target.
 type FleetNodeView struct {
-	State     string `json:"state"`                // up | hard_down | unknown
-	Seq       uint64 `json:"seq"`
-	ErrorCode string `json:"error_code,omitempty"`
+	State     string  `json:"state"` // up | hard_down | unknown
+	Seq       uint64  `json:"seq"`
+	ErrorCode string  `json:"error_code,omitempty"`
+	Latency   float64 `json:"latency,omitempty"` // last measured round-trip in seconds; 0 = not measured
 }
 
 // FleetTarget is one target's entry in the fleet view.
@@ -175,15 +176,21 @@ func (e *Engine) FleetSnapshot() FleetSnapshot {
 		byNode := make(map[string]FleetNodeView)
 		localNodeName := e.clusterNodeName()
 
+		var localLatency float64
+		if v, ok := e.lastLatency.Load(key); ok {
+			localLatency, _ = v.(float64)
+		}
+
 		if localKnown {
 			byNode[localNodeName] = FleetNodeView{
 				State:     localPS.State,
 				Seq:       localPS.Seq,
 				ErrorCode: localPS.ErrorCode,
+				Latency:   localLatency,
 			}
 		}
 		if softDown {
-			byNode[localNodeName] = FleetNodeView{State: "soft_down"}
+			byNode[localNodeName] = FleetNodeView{State: "soft_down", Latency: localLatency}
 		}
 
 		for _, nv := range peerStatesByTarget[key] {
@@ -192,13 +199,15 @@ func (e *Engine) FleetSnapshot() FleetSnapshot {
 			// payload but not propagated to FleetNodeView yet). Future work.
 			_ = nv
 		}
-		// Richer by_node: pull node name from raw peer states.
+		// Richer by_node: pull node name + latency from raw peer states (gossip
+		// payloads carry the reporting node's last measured round-trip).
 		if mgr != nil {
 			for _, p := range mgr.PeerStatesForTarget(key) {
 				byNode[p.NodeName] = FleetNodeView{
 					State:     p.State,
 					Seq:       p.Seq,
 					ErrorCode: p.ErrorCode,
+					Latency:   p.Latency,
 				}
 			}
 		}

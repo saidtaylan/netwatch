@@ -151,6 +151,7 @@ export interface FleetNodeView {
   state:       TargetState
   seq:         number
   error_code?: string
+  latency?:    number  // last measured round-trip in seconds; 0/absent = not measured
 }
 
 // ── /topology ────────────────────────────────────────────────────────────────
